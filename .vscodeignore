@@ -5,3 +5,5 @@ vitest.config.ts
 tsconfig.json
 node_modules/**
 .superpowers/**
+.gitignore
+.gitattributes

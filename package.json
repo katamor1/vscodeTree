@@ -5,12 +5,10 @@
   "version": "0.1.0",
   "publisher": "local",
   "license": "UNLICENSED",
-  "files": [
-    "dist",
-    "resources",
-    "README.md",
-    "package.json"
-  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/katamor1/vscodeTree.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
