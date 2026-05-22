@@ -5,6 +5,7 @@ import { buildFullIndex, updateIndex } from "./analysis/indexer";
 import { reportPaths, readIndex, writeIndex } from "./analysis/store";
 import { writeReviewReport } from "./analysis/report";
 import type { AnalysisIndex, ImpactResult } from "./analysis/types";
+import { normalizeCommandSymbolArg } from "./extension/commandArgs";
 import { ImpactTreeProvider } from "./extension/impactTree";
 import { GraphView } from "./extension/graphView";
 import { readSettings } from "./extension/settings";
@@ -50,7 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showInformationMessage(`VC6 Impact index updated: ${settings.indexPath}`);
       });
     }),
-    vscode.commands.registerCommand("vc6Impact.inspectSelectedSymbol", async (symbolArg?: string) => {
+    vscode.commands.registerCommand("vc6Impact.inspectSelectedSymbol", async (symbolArg?: unknown) => {
       await withErrors(async () => {
         const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
         currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
@@ -58,7 +59,7 @@ export function activate(context: vscode.ExtensionContext): void {
         graphView.show(context, currentImpact);
       });
     }),
-    vscode.commands.registerCommand("vc6Impact.generateReviewReport", async (symbolArg?: string) => {
+    vscode.commands.registerCommand("vc6Impact.generateReviewReport", async (symbolArg?: unknown) => {
       await withErrors(async () => {
         const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
         currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
@@ -70,10 +71,11 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showInformationMessage(`Review report generated: ${paths.markdown}`);
       });
     }),
-    vscode.commands.registerCommand("vc6Impact.openGraph", async (symbolArg?: string) => {
+    vscode.commands.registerCommand("vc6Impact.openGraph", async (symbolArg?: unknown) => {
       await withErrors(async () => {
-        if (!currentImpact || symbolArg) {
-          const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
+        const normalizedArg = normalizeCommandSymbolArg(symbolArg);
+        if (!currentImpact || normalizedArg) {
+          const { index, symbolName, settings } = await loadIndexAndSymbol(context, normalizedArg);
           currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
           treeProvider.setImpact(currentImpact);
         }
@@ -89,19 +91,22 @@ export function deactivate(): void {
 
 async function loadIndexAndSymbol(
   context: vscode.ExtensionContext,
-  symbolArg?: string
+  symbolArg?: unknown
 ): Promise<{ index: AnalysisIndex; symbolName: string; settings: Awaited<ReturnType<typeof readSettings>> }> {
   const settings = await readSettings(context);
   const index = await readIndex(settings.indexPath);
   if (!index) {
     throw new Error(`索引がありません。先に Build Full Index を実行してください: ${settings.indexPath}`);
   }
-  const symbolName = symbolArg || getSelectedSymbol() || (await vscode.window.showInputBox({ prompt: "Inspect symbol name" }));
-  if (!symbolName?.trim()) {
+  const symbolName =
+    normalizeCommandSymbolArg(symbolArg) ??
+    normalizeCommandSymbolArg(getSelectedSymbol()) ??
+    normalizeCommandSymbolArg(await vscode.window.showInputBox({ prompt: "Inspect symbol name" }));
+  if (!symbolName) {
     throw new Error("対象シンボル名が指定されていません。");
   }
   await fs.mkdir(settings.outputDir, { recursive: true });
-  return { index, symbolName: symbolName.trim(), settings };
+  return { index, symbolName, settings };
 }
 
 function getSelectedSymbol(): string | undefined {
