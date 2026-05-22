@@ -1,0 +1,28 @@
+{
+  "threads": [
+    {
+      "threadId": "worker",
+      "entryFunction": "WorkerThread",
+      "priority": "normal",
+      "cycle": "event",
+      "isInterruptLike": false,
+      "notes": "normal worker thread"
+    },
+    {
+      "threadId": "monitor",
+      "entryFunction": "MonitorThread",
+      "priority": "low",
+      "cycle": "100ms",
+      "isInterruptLike": false,
+      "notes": "periodic monitor thread"
+    },
+    {
+      "threadId": "irq",
+      "entryFunction": "InterruptHandler",
+      "priority": "hardware",
+      "cycle": "interrupt",
+      "isInterruptLike": true,
+      "notes": "hardware interrupt-like path"
+    }
+  ]
+}

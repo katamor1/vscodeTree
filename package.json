@@ -1,0 +1,151 @@
+{
+  "name": "vc6-impact-review",
+  "displayName": "VC6 Impact Review",
+  "description": "Visualize global-variable and function impact in large VC6 C/C++ projects without writing to the target source tree.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "files": [
+    "dist",
+    "resources",
+    "README.md",
+    "package.json"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:vc6Impact.buildFullIndex",
+    "onCommand:vc6Impact.updateIndex",
+    "onCommand:vc6Impact.inspectSelectedSymbol",
+    "onCommand:vc6Impact.generateReviewReport",
+    "onCommand:vc6Impact.openGraph",
+    "onView:vc6Impact.explorer"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "VC6 Impact Review",
+      "properties": {
+        "vc6Impact.projectFile": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute or workspace-relative path to the VC6 .dsw or .dsp file. Empty means auto-detect the first .dsw, then .dsp."
+        },
+        "vc6Impact.threadMapFile": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute or workspace-relative JSON/YAML file that maps thread IDs to entry functions."
+        },
+        "vc6Impact.outputDir": {
+          "type": "string",
+          "default": "",
+          "description": "External directory for index and reports. Empty uses VS Code global storage, not the target source tree."
+        },
+        "vc6Impact.excludeGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/Debug/**",
+            "**/Release/**",
+            "**/node_modules/**",
+            "**/.git/**"
+          ],
+          "description": "Glob-like path fragments to exclude while scanning source files."
+        },
+        "vc6Impact.maxGraphDepth": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum call graph depth shown in graph/report views."
+        },
+        "vc6Impact.indexDbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit path to the JSON index DB. Empty stores vc6-impact-index.json under outputDir."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "vc6Impact.buildFullIndex",
+        "title": "VC6 Impact: Build Full Index"
+      },
+      {
+        "command": "vc6Impact.updateIndex",
+        "title": "VC6 Impact: Update Index"
+      },
+      {
+        "command": "vc6Impact.inspectSelectedSymbol",
+        "title": "VC6 Impact: Inspect Selected Symbol"
+      },
+      {
+        "command": "vc6Impact.generateReviewReport",
+        "title": "VC6 Impact: Generate Review Report"
+      },
+      {
+        "command": "vc6Impact.openGraph",
+        "title": "VC6 Impact: Open Graph"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "vc6Impact.inspectSelectedSymbol",
+          "group": "navigation@50"
+        },
+        {
+          "command": "vc6Impact.generateReviewReport",
+          "group": "navigation@51"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "vc6Impact.buildFullIndex",
+          "when": "view == vc6Impact.explorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "vc6Impact.updateIndex",
+          "when": "view == vc6Impact.explorer",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vc6Impact",
+          "title": "VC6 Impact",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "vc6Impact": [
+        {
+          "id": "vc6Impact.explorer",
+          "name": "Impact Review"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "vitest run",
+    "watch": "tsc -watch -p ./",
+    "check": "npm run test && npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
