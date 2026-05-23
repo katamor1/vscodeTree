@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { buildImpact } from "../src/analysis/impact";
 import { assertReadableTargetUnchanged, buildFullIndex, updateIndex, verifySignaturesUnchanged } from "../src/analysis/indexer";
 import { renderMarkdownReport, writeReviewReport } from "../src/analysis/report";
+import { analyzeFileStructure, scanFileStructure } from "../src/analysis/sourceScanner";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const fixtureRoot = path.resolve(__dirname, "fixtures", "vc6-sample");
@@ -31,6 +32,9 @@ describe("hybrid impact index", () => {
     const impact = buildImpact(index, "g_counter");
 
     expect(index.globals.g_counter?.length).toBeGreaterThan(0);
+    expect(index.build.phaseDurationsMs.structureScan).toBeGreaterThanOrEqual(0);
+    expect(index.build.phaseDurationsMs.accessAnalysis).toBeGreaterThanOrEqual(0);
+    expect(index.build.workerCount).toBeGreaterThanOrEqual(1);
     expect(impact.symbolKind).toBe("global");
     expect(impact.accesses.some((access) => access.kind === "write" && access.functionName === "WorkerThread")).toBe(true);
     expect(impact.accesses.some((access) => access.kind === "write" && access.functionName === "InterruptHandler")).toBe(true);
@@ -92,6 +96,68 @@ describe("hybrid impact index", () => {
     expect(updated.build.reusedFiles).toBeGreaterThan(0);
     expect(updated.build.fullRebuildReason).toBeUndefined();
   });
+
+  it("produces the same core index shape with explicit single-worker and auto-worker options", async () => {
+    const singleWorker = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, maxIndexWorkers: 1 });
+    const autoWorker = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, maxIndexWorkers: 2 });
+
+    expect(Object.keys(singleWorker.globals).sort()).toEqual(Object.keys(autoWorker.globals).sort());
+    expect(Object.keys(singleWorker.functions).sort()).toEqual(Object.keys(autoWorker.functions).sort());
+    expect(singleWorker.functions.WorkerThread.accesses).toEqual(autoWorker.functions.WorkerThread.accesses);
+  });
+
+  it("tracks struct member access through direct, array, and pointer-alias expressions", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
+    const counterImpact = buildImpact(index, "g_deviceState.counter");
+    const arrayImpact = buildImpact(index, "g_devices[].status");
+
+    expect(index.memberSymbols["g_deviceState.counter"]?.length).toBeGreaterThan(0);
+    expect(counterImpact.symbolKind).toBe("member");
+    expect(counterImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ functionName: "WorkerThread", kind: "write", variableName: "g_deviceState.counter" }),
+        expect.objectContaining({ functionName: "InterruptHandler", kind: "write", variableName: "g_deviceState.counter" }),
+        expect.objectContaining({ functionName: "MonitorThread", kind: "read", variableName: "g_deviceState.counter" })
+      ])
+    );
+    expect(counterImpact.threadContexts.some((context) => context.threadIds.includes("worker"))).toBe(true);
+    expect(counterImpact.threadContexts.some((context) => context.interruptLikeThreadIds.includes("irq"))).toBe(true);
+    expect(counterImpact.risks.map((risk) => risk.code)).toEqual(
+      expect.arrayContaining(["MULTI_THREAD_WRITE", "CROSS_THREAD_READ_WRITE", "INTERRUPT_CONTEXT"])
+    );
+
+    expect(arrayImpact.symbolKind).toBe("member");
+    expect(arrayImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ functionName: "MonitorThread", kind: "write", variableName: "g_devices[].status" })
+      ])
+    );
+  });
+
+  it("keeps unresolved typed pointer member access as review evidence", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
+    const unresolved = index.functions.PointerMemberUnknown.unresolved;
+
+    expect(unresolved).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "unknown-member-access",
+          variableName: "DEVICE_STATE::mode"
+        })
+      ])
+    );
+  });
+
+  it("renders struct member impact in Japanese Markdown reports", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
+    const impact = buildImpact(index, "g_deviceState.counter");
+    const report = renderMarkdownReport(index, impact);
+
+    expect(report).toContain("- 種別: 構造体メンバ");
+    expect(report).toContain("member `g_deviceState.counter`");
+    expect(report).toContain("WRITE `g_deviceState.counter`");
+    expect(report).toContain("src/main.cpp:");
+  });
 });
 
 describe("function impact", () => {
@@ -112,3 +178,28 @@ async function copyFixtureToTemp(): Promise<string> {
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
 }
+
+describe("source token analysis", () => {
+  it("ignores identifiers inside comments and strings during access analysis", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-token-"));
+    const file = path.join(tempRoot, "token.cpp");
+    await fs.writeFile(
+      file,
+      [
+        "int g_value = 0;",
+        "void TokenCase(void)",
+        "{",
+        "    const char *text = \"g_value++;\";",
+        "    // g_value = 10;",
+        "    g_value++;",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+    const structure = await scanFileStructure(file);
+    const analysis = analyzeFileStructure(structure, new Set(["g_value"]), new Map([["TokenCase", ["TokenCase"]]]));
+
+    expect(analysis.functions[0]?.accesses).toHaveLength(1);
+    expect(analysis.functions[0]?.accesses[0]?.kind).toBe("write");
+  });
+});

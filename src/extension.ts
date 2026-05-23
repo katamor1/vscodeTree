@@ -29,7 +29,9 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         );
         await writeIndex(settings.indexPath, index);
-        treeProvider.setStatus(`Index built: ${index.build.sourceFileCount} files, ${index.build.durationMs} ms`);
+        treeProvider.setStatus(
+          `Index built: ${index.build.sourceFileCount} files, ${index.build.durationMs} ms, workers ${index.build.workerCount}`
+        );
         vscode.window.showInformationMessage(`VC6 Impact index built: ${settings.indexPath}`);
       });
     }),
@@ -46,7 +48,7 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         await writeIndex(settings.indexPath, index);
         treeProvider.setStatus(
-          `Index updated: changed ${index.build.changedFiles.length}, reused ${index.build.reusedFiles}, ${index.build.durationMs} ms`
+          `Index updated: changed ${index.build.changedFiles.length}, reused ${index.build.reusedFiles}, ${index.build.durationMs} ms, workers ${index.build.workerCount}`
         );
         vscode.window.showInformationMessage(`VC6 Impact index updated: ${settings.indexPath}`);
       });
@@ -56,7 +58,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
         currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
         treeProvider.setImpact(currentImpact);
-        graphView.show(context, currentImpact);
+        graphView.show(context, currentImpact, settings.workspaceRoot);
       });
     }),
     vscode.commands.registerCommand("vc6Impact.generateReviewReport", async (symbolArg?: unknown) => {
@@ -79,7 +81,8 @@ export function activate(context: vscode.ExtensionContext): void {
           currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
           treeProvider.setImpact(currentImpact);
         }
-        graphView.show(context, currentImpact);
+        const settings = await readSettings(context);
+        graphView.show(context, currentImpact, settings.workspaceRoot);
       });
     })
   );

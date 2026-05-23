@@ -18,8 +18,11 @@ The extension builds a local JSON index from `.dsw` / `.dsp` files and source fi
 {
   "vc6Impact.projectFile": "path/to/project.dsw",
   "vc6Impact.threadMapFile": "path/to/thread-map.json",
-  "vc6Impact.outputDir": "C:/review-output/vc6-impact"
+  "vc6Impact.outputDir": "C:/review-output/vc6-impact",
+  "vc6Impact.parserMode": "standard"
 }
 ```
 
 If `outputDir` is empty, VS Code global storage is used so the target VC6 source tree remains read-only.
+
+`parserMode` defaults to `standard`. Set it to `custom` to use the isolated implementation under `src/analysis/customParser/` without replacing the standard scanner route.

@@ -39,15 +39,55 @@ export interface GlobalVariable {
   line: number;
   declaration: string;
   isExtern: boolean;
+  typeName?: string;
+  isArray?: boolean;
+  pointerLevel?: number;
+}
+
+export interface StructMemberInfo {
+  name: string;
+  typeName?: string;
+  file: string;
+  line: number;
+  declaration: string;
+  isArray?: boolean;
+  pointerLevel?: number;
+}
+
+export interface StructTypeInfo {
+  name: string;
+  aliases: string[];
+  file: string;
+  line: number;
+  declaration: string;
+  members: StructMemberInfo[];
+}
+
+export interface MemberSymbol {
+  name: string;
+  ownerName: string;
+  ownerTypeName: string;
+  memberName: string;
+  memberPath: string[];
+  file: string;
+  line: number;
+  declaration: string;
+  isArrayOwner?: boolean;
+  pointerOwner?: boolean;
 }
 
 export interface VariableAccess {
   variableName: string;
+  targetName?: string;
+  targetKind?: "global" | "member";
   functionName: string;
   kind: AccessKind;
   location: SourceLocation;
   evidence: string;
   reasons: string[];
+  ownerName?: string;
+  memberName?: string;
+  accessExpression?: string;
 }
 
 export interface UnresolvedEvidence {
@@ -57,7 +97,10 @@ export interface UnresolvedEvidence {
     | "macro"
     | "address-taken"
     | "pointer-write"
-    | "unknown-call";
+    | "unknown-call"
+    | "unknown-member-access"
+    | "ambiguous-member-alias"
+    | "unsupported-member-declaration";
   functionName?: string;
   variableName?: string;
   location: SourceLocation;
@@ -80,6 +123,7 @@ export interface FileAnalysis {
   file: string;
   signature: FileSignature;
   globals: GlobalVariable[];
+  structTypes: StructTypeInfo[];
   functions: FunctionInfo[];
   unresolved: UnresolvedEvidence[];
 }
@@ -100,6 +144,8 @@ export interface AnalysisIndex {
   macros: string[];
   files: FileAnalysis[];
   globals: Record<string, GlobalVariable[]>;
+  structTypes: Record<string, StructTypeInfo>;
+  memberSymbols: Record<string, MemberSymbol[]>;
   functions: Record<string, FunctionInfo>;
   callGraph: Record<string, string[]>;
   calledBy: Record<string, string[]>;
@@ -107,7 +153,10 @@ export interface AnalysisIndex {
   threadReachability: Record<string, ThreadReachability>;
   build: {
     mode: "full" | "update";
+    parserMode: "standard" | "custom";
     durationMs: number;
+    phaseDurationsMs: Record<string, number>;
+    workerCount: number;
     changedFiles: string[];
     reusedFiles: number;
     fullRebuildReason?: string;
@@ -134,7 +183,7 @@ export interface RiskCandidate {
 export interface GraphNode {
   id: string;
   label: string;
-  kind: "target" | "global" | "function" | "thread" | "risk" | "unresolved";
+  kind: "target" | "global" | "member" | "function" | "thread" | "risk" | "unresolved";
 }
 
 export interface GraphEdge {
@@ -145,8 +194,9 @@ export interface GraphEdge {
 
 export interface ImpactResult {
   symbolName: string;
-  symbolKind: "global" | "function" | "unknown";
+  symbolKind: "global" | "member" | "function" | "unknown";
   globals: GlobalVariable[];
+  members: MemberSymbol[];
   functions: FunctionInfo[];
   accesses: VariableAccess[];
   threadContexts: ThreadReachability[];
@@ -163,6 +213,8 @@ export interface BuildOptions {
   projectFile: string;
   threadMapFile?: string;
   excludeGlobs?: string[];
+  maxIndexWorkers?: number;
+  parserMode?: "standard" | "custom";
 }
 
 export interface BuildResult {

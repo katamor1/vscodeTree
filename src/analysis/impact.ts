@@ -5,6 +5,7 @@ import type {
   GraphNode,
   GlobalVariable,
   ImpactResult,
+  MemberSymbol,
   RiskCandidate,
   SourceLocation,
   ThreadReachability,
@@ -14,13 +15,14 @@ import type {
 
 export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth = 4): ImpactResult {
   const globals = index.globals[symbolName] ?? [];
+  const members = index.memberSymbols?.[symbolName] ?? [];
   const selectedFunction = index.functions[symbolName];
-  const symbolKind = globals.length > 0 ? "global" : selectedFunction ? "function" : "unknown";
+  const symbolKind = globals.length > 0 ? "global" : members.length > 0 ? "member" : selectedFunction ? "function" : "unknown";
   const functions = symbolKind === "function" && selectedFunction
     ? collectFunctionNeighborhood(index, selectedFunction.name, maxDepth)
-    : functionsTouchingGlobal(index, symbolName);
-  const accesses = symbolKind === "global"
-    ? functions.flatMap((func) => func.accesses.filter((access) => access.variableName === symbolName))
+    : functionsTouchingSymbol(index, symbolName);
+  const accesses = symbolKind === "global" || symbolKind === "member"
+    ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
     : functions.flatMap((func) => func.accesses);
   const threadContexts = uniqueThreadContexts(
     functions
@@ -34,12 +36,13 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions))
   );
   const risks = buildRisks(symbolName, symbolKind, accesses, threadContexts, unresolved);
-  const graph = buildGraph(symbolName, symbolKind, globals, functions, accesses, threadContexts, risks, unresolved);
+  const graph = buildGraph(symbolName, symbolKind, globals, members, functions, accesses, threadContexts, risks, unresolved);
 
   return {
     symbolName,
     symbolKind,
     globals,
+    members,
     functions,
     accesses,
     threadContexts,
@@ -49,9 +52,9 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
   };
 }
 
-function functionsTouchingGlobal(index: AnalysisIndex, variableName: string): FunctionInfo[] {
+function functionsTouchingSymbol(index: AnalysisIndex, variableName: string): FunctionInfo[] {
   return Object.values(index.functions)
-    .filter((func) => func.accesses.some((access) => access.variableName === variableName))
+    .filter((func) => func.accesses.some((access) => access.variableName === variableName || access.targetName === variableName))
     .sort(byFunctionName);
 }
 
@@ -89,7 +92,7 @@ function buildRisks(
   const readerThreads = new Set(reads.flatMap((access) => threadIdsForFunction(access.functionName, threadContexts)));
   const interruptThreads = threadContexts.flatMap((context) => context.interruptLikeThreadIds);
 
-  if (symbolKind === "global" && writerThreads.size >= 2) {
+  if ((symbolKind === "global" || symbolKind === "member") && writerThreads.size >= 2) {
     risks.push({
       code: "MULTI_THREAD_WRITE",
       severity: "high",
@@ -98,7 +101,7 @@ function buildRisks(
       evidence: writes.map((access) => access.location)
     });
   }
-  if (symbolKind === "global" && writerThreads.size > 0 && readerThreads.size > 0 && unionSize(writerThreads, readerThreads) >= 2) {
+  if ((symbolKind === "global" || symbolKind === "member") && writerThreads.size > 0 && readerThreads.size > 0 && unionSize(writerThreads, readerThreads) >= 2) {
     risks.push({
       code: "CROSS_THREAD_READ_WRITE",
       severity: "warning",
@@ -152,6 +155,7 @@ function buildGraph(
   symbolName: string,
   symbolKind: ImpactResult["symbolKind"],
   globals: GlobalVariable[],
+  members: MemberSymbol[],
   functions: FunctionInfo[],
   accesses: VariableAccess[],
   threadContexts: ThreadReachability[],
@@ -166,6 +170,13 @@ function buildGraph(
     for (const global of globals) {
       const id = `global:${global.name}:${global.file}:${global.line}`;
       addNode(nodes, { id, label: `${global.name}:${global.line}`, kind: "global" });
+      edges.push({ from: `target:${symbolName}`, to: id, label: "decl" });
+    }
+  }
+  if (symbolKind === "member") {
+    for (const member of members) {
+      const id = `member:${member.name}:${member.file}:${member.line}`;
+      addNode(nodes, { id, label: `${member.name}:${member.line}`, kind: "member" });
       edges.push({ from: `target:${symbolName}`, to: id, label: "decl" });
     }
   }

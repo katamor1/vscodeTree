@@ -12,6 +12,8 @@ export interface ExtensionSettings {
   indexPath: string;
   excludeGlobs: string[];
   maxGraphDepth: number;
+  maxIndexWorkers: number;
+  parserMode: "standard" | "custom";
 }
 
 export async function readSettings(context: vscode.ExtensionContext): Promise<ExtensionSettings> {
@@ -49,6 +51,8 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     outputDir,
     indexPath,
     excludeGlobs: config.get<string[]>("excludeGlobs") ?? [],
-    maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4
+    maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4,
+    maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
+    parserMode: config.get<"standard" | "custom">("parserMode") === "custom" ? "custom" : "standard"
   };
 }

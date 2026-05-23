@@ -63,6 +63,22 @@
           "maximum": 20,
           "description": "Maximum call graph depth shown in graph/report views."
         },
+        "vc6Impact.maxIndexWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 64,
+          "description": "Maximum worker threads used while building indexes. 0 means auto (CPU count - 1)."
+        },
+        "vc6Impact.parserMode": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "custom"
+          ],
+          "default": "standard",
+          "description": "Source parser route. standard keeps the existing scanner; custom uses the isolated custom parser implementation."
+        },
         "vc6Impact.indexDbPath": {
           "type": "string",
           "default": "",
@@ -138,7 +154,9 @@
     "compile": "tsc -p ./",
     "test": "vitest run",
     "watch": "tsc -watch -p ./",
-    "check": "npm run test && npm run compile"
+    "check": "npm run test && npm run compile",
+    "bench:index": "node scripts/benchmark-index.js",
+    "samples:enrich-members": "node scripts/enrich-member-samples.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
