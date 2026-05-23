@@ -76,6 +76,33 @@ export interface MemberSymbol {
   pointerOwner?: boolean;
 }
 
+export interface MacroDefinition {
+  name: string;
+  replacement: string;
+  file: string;
+  line: number;
+  declaration: string;
+  isFunctionLike: boolean;
+  isObjectLike: boolean;
+}
+
+export interface MacroAlias {
+  name: string;
+  replacement: string;
+  targetName: string;
+  targetKind: "global" | "member" | "unknown";
+  file: string;
+  line: number;
+  declaration: string;
+}
+
+export interface ParserDiagnostic {
+  backend: "rust";
+  file?: string;
+  severity: "info" | "warning" | "error";
+  message: string;
+}
+
 export interface VariableAccess {
   variableName: string;
   targetName?: string;
@@ -88,6 +115,8 @@ export interface VariableAccess {
   ownerName?: string;
   memberName?: string;
   accessExpression?: string;
+  macroNames?: string[];
+  expandedEvidence?: string;
 }
 
 export interface UnresolvedEvidence {
@@ -124,6 +153,7 @@ export interface FileAnalysis {
   signature: FileSignature;
   globals: GlobalVariable[];
   structTypes: StructTypeInfo[];
+  macroDefinitions: MacroDefinition[];
   functions: FunctionInfo[];
   unresolved: UnresolvedEvidence[];
 }
@@ -146,6 +176,9 @@ export interface AnalysisIndex {
   globals: Record<string, GlobalVariable[]>;
   structTypes: Record<string, StructTypeInfo>;
   memberSymbols: Record<string, MemberSymbol[]>;
+  macroDefinitions: Record<string, MacroDefinition[]>;
+  macroAliases: Record<string, MacroAlias[]>;
+  parserDiagnostics: ParserDiagnostic[];
   functions: Record<string, FunctionInfo>;
   callGraph: Record<string, string[]>;
   calledBy: Record<string, string[]>;
@@ -153,7 +186,7 @@ export interface AnalysisIndex {
   threadReachability: Record<string, ThreadReachability>;
   build: {
     mode: "full" | "update";
-    parserMode: "standard" | "custom";
+    parserMode: "rust";
     durationMs: number;
     phaseDurationsMs: Record<string, number>;
     workerCount: number;
@@ -183,7 +216,7 @@ export interface RiskCandidate {
 export interface GraphNode {
   id: string;
   label: string;
-  kind: "target" | "global" | "member" | "function" | "thread" | "risk" | "unresolved";
+  kind: "target" | "global" | "member" | "macro" | "function" | "thread" | "risk" | "unresolved";
 }
 
 export interface GraphEdge {
@@ -194,9 +227,10 @@ export interface GraphEdge {
 
 export interface ImpactResult {
   symbolName: string;
-  symbolKind: "global" | "member" | "function" | "unknown";
+  symbolKind: "global" | "member" | "macro" | "function" | "unknown";
   globals: GlobalVariable[];
   members: MemberSymbol[];
+  macros: MacroAlias[];
   functions: FunctionInfo[];
   accesses: VariableAccess[];
   threadContexts: ThreadReachability[];
@@ -214,7 +248,6 @@ export interface BuildOptions {
   threadMapFile?: string;
   excludeGlobs?: string[];
   maxIndexWorkers?: number;
-  parserMode?: "standard" | "custom";
 }
 
 export interface BuildResult {

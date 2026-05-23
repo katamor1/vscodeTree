@@ -5,6 +5,7 @@ import type {
   GraphNode,
   GlobalVariable,
   ImpactResult,
+  MacroAlias,
   MemberSymbol,
   RiskCandidate,
   SourceLocation,
@@ -16,14 +17,32 @@ import type {
 export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth = 4): ImpactResult {
   const globals = index.globals[symbolName] ?? [];
   const members = index.memberSymbols?.[symbolName] ?? [];
+  const macros = index.macroAliases?.[symbolName] ?? [];
   const selectedFunction = index.functions[symbolName];
-  const symbolKind = globals.length > 0 ? "global" : members.length > 0 ? "member" : selectedFunction ? "function" : "unknown";
+  const symbolKind = globals.length > 0
+    ? "global"
+    : members.length > 0
+      ? "member"
+      : macros.length > 0
+        ? "macro"
+        : selectedFunction
+          ? "function"
+          : "unknown";
+  const macroTargets = new Set(macros.map((macro) => macro.targetName));
   const functions = symbolKind === "function" && selectedFunction
     ? collectFunctionNeighborhood(index, selectedFunction.name, maxDepth)
-    : functionsTouchingSymbol(index, symbolName);
+    : symbolKind === "macro"
+      ? functionsTouchingMacro(index, symbolName, macroTargets)
+      : functionsTouchingSymbol(index, symbolName);
   const accesses = symbolKind === "global" || symbolKind === "member"
     ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
-    : functions.flatMap((func) => func.accesses);
+    : symbolKind === "macro"
+      ? functions.flatMap((func) => func.accesses.filter((access) =>
+        access.macroNames?.includes(symbolName) ||
+        macroTargets.has(access.targetName ?? access.variableName) ||
+        macroTargets.has(access.variableName)
+      ))
+      : functions.flatMap((func) => func.accesses);
   const threadContexts = uniqueThreadContexts(
     functions
       .map((func) => index.threadReachability[func.name])
@@ -36,13 +55,14 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions))
   );
   const risks = buildRisks(symbolName, symbolKind, accesses, threadContexts, unresolved);
-  const graph = buildGraph(symbolName, symbolKind, globals, members, functions, accesses, threadContexts, risks, unresolved);
+  const graph = buildGraph(symbolName, symbolKind, globals, members, macros, functions, accesses, threadContexts, risks, unresolved);
 
   return {
     symbolName,
     symbolKind,
     globals,
     members,
+    macros,
     functions,
     accesses,
     threadContexts,
@@ -55,6 +75,16 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
 function functionsTouchingSymbol(index: AnalysisIndex, variableName: string): FunctionInfo[] {
   return Object.values(index.functions)
     .filter((func) => func.accesses.some((access) => access.variableName === variableName || access.targetName === variableName))
+    .sort(byFunctionName);
+}
+
+function functionsTouchingMacro(index: AnalysisIndex, macroName: string, targetNames: Set<string>): FunctionInfo[] {
+  return Object.values(index.functions)
+    .filter((func) => func.accesses.some((access) =>
+      access.macroNames?.includes(macroName) ||
+      targetNames.has(access.targetName ?? access.variableName) ||
+      targetNames.has(access.variableName)
+    ))
     .sort(byFunctionName);
 }
 
@@ -92,7 +122,7 @@ function buildRisks(
   const readerThreads = new Set(reads.flatMap((access) => threadIdsForFunction(access.functionName, threadContexts)));
   const interruptThreads = threadContexts.flatMap((context) => context.interruptLikeThreadIds);
 
-  if ((symbolKind === "global" || symbolKind === "member") && writerThreads.size >= 2) {
+  if (isDataSymbol(symbolKind) && writerThreads.size >= 2) {
     risks.push({
       code: "MULTI_THREAD_WRITE",
       severity: "high",
@@ -101,7 +131,7 @@ function buildRisks(
       evidence: writes.map((access) => access.location)
     });
   }
-  if ((symbolKind === "global" || symbolKind === "member") && writerThreads.size > 0 && readerThreads.size > 0 && unionSize(writerThreads, readerThreads) >= 2) {
+  if (isDataSymbol(symbolKind) && writerThreads.size > 0 && readerThreads.size > 0 && unionSize(writerThreads, readerThreads) >= 2) {
     risks.push({
       code: "CROSS_THREAD_READ_WRITE",
       severity: "warning",
@@ -156,6 +186,7 @@ function buildGraph(
   symbolKind: ImpactResult["symbolKind"],
   globals: GlobalVariable[],
   members: MemberSymbol[],
+  macros: MacroAlias[],
   functions: FunctionInfo[],
   accesses: VariableAccess[],
   threadContexts: ThreadReachability[],
@@ -178,6 +209,18 @@ function buildGraph(
       const id = `member:${member.name}:${member.file}:${member.line}`;
       addNode(nodes, { id, label: `${member.name}:${member.line}`, kind: "member" });
       edges.push({ from: `target:${symbolName}`, to: id, label: "decl" });
+    }
+  }
+  if (symbolKind === "macro") {
+    for (const macro of macros) {
+      const id = `macro:${macro.name}:${macro.file}:${macro.line}`;
+      addNode(nodes, { id, label: `${macro.name}:${macro.line}`, kind: "macro" });
+      edges.push({ from: `target:${symbolName}`, to: id, label: "decl" });
+      if (macro.targetName) {
+        const targetId = `macro-target:${macro.targetName}`;
+        addNode(nodes, { id: targetId, label: macro.targetName, kind: macro.targetKind === "member" ? "member" : "global" });
+        edges.push({ from: id, to: targetId, label: "expands-to" });
+      }
     }
   }
 
@@ -253,6 +296,10 @@ function threadIdsForFunction(functionName: string, contexts: ThreadReachability
 
 function unionSize<T>(left: Set<T>, right: Set<T>): number {
   return new Set([...left, ...right]).size;
+}
+
+function isDataSymbol(symbolKind: ImpactResult["symbolKind"]): boolean {
+  return symbolKind === "global" || symbolKind === "member" || symbolKind === "macro";
 }
 
 function addNode(nodes: Map<string, GraphNode>, node: GraphNode): void {

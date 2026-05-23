@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import type { ImpactResult, SourceLocation } from "../analysis/types";
+import { formatIndexStatusLines, type IndexStatusSummary } from "./indexStatus";
 
 type NodeKind = "message" | "risk" | "thread" | "access" | "unresolved" | "function";
+type StatusState = { type: "message"; message: string } | { type: "index"; summary: IndexStatusSummary };
 
 class ImpactItem extends vscode.TreeItem {
   constructor(
@@ -9,11 +11,19 @@ class ImpactItem extends vscode.TreeItem {
     collapsibleState: vscode.TreeItemCollapsibleState,
     public readonly kind: NodeKind,
     public readonly children: ImpactItem[] = [],
-    location?: SourceLocation
+    location?: SourceLocation,
+    description?: string,
+    icon?: string
   ) {
     super(label, collapsibleState);
     this.contextValue = kind;
     this.tooltip = label;
+    if (description) {
+      this.description = description;
+    }
+    if (icon) {
+      this.iconPath = new vscode.ThemeIcon(icon);
+    }
     if (location) {
       this.description = `${location.file}:${location.line}`;
       this.command = {
@@ -29,17 +39,23 @@ export class ImpactTreeProvider implements vscode.TreeDataProvider<ImpactItem> {
   private readonly changed = new vscode.EventEmitter<ImpactItem | undefined | null | void>();
   readonly onDidChangeTreeData = this.changed.event;
   private impact: ImpactResult | undefined;
-  private status = "Build an index, then inspect a symbol.";
+  private status: StatusState = { type: "message", message: "Build an index, then inspect a symbol." };
 
   setStatus(status: string): void {
-    this.status = status;
+    this.status = { type: "message", message: status };
+    this.impact = undefined;
+    this.changed.fire();
+  }
+
+  setIndexStatus(summary: IndexStatusSummary): void {
+    this.status = { type: "index", summary };
     this.impact = undefined;
     this.changed.fire();
   }
 
   setImpact(impact: ImpactResult): void {
     this.impact = impact;
-    this.status = "";
+    this.status = { type: "message", message: "" };
     this.changed.fire();
   }
 
@@ -52,7 +68,12 @@ export class ImpactTreeProvider implements vscode.TreeDataProvider<ImpactItem> {
       return element.children;
     }
     if (!this.impact) {
-      return [new ImpactItem(this.status, vscode.TreeItemCollapsibleState.None, "message")];
+      return this.status.type === "index"
+        ? formatIndexStatusLines(this.status.summary).map(
+            (line) =>
+              new ImpactItem(line.label, vscode.TreeItemCollapsibleState.None, "message", [], undefined, line.description, line.icon)
+          )
+        : [new ImpactItem(this.status.message, vscode.TreeItemCollapsibleState.None, "message", [], undefined, undefined, "info")];
     }
     return [
       new ImpactItem(`Target: ${this.impact.symbolName} (${this.impact.symbolKind})`, vscode.TreeItemCollapsibleState.None, "message"),

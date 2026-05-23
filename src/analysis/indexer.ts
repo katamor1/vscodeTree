@@ -1,9 +1,8 @@
 import * as fs from "node:fs/promises";
-import { scanFileStructureWithCustomParser } from "./customParser/customSourceScanner";
 import { parseVc6Project } from "./vc6ProjectParser";
 import { readThreadMap } from "./threadMap";
-import { analyzeFileStructure, buildMemberAnalysisContext, getFileSignature } from "./sourceScanner";
-import { scanFileStructures, type ScanFileStructuresResult } from "./workerPool";
+import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature } from "./sourceScanner";
+import { analyzeFilesWithRustSidecar } from "./rust/rustSourceScanner";
 import type {
   AnalysisIndex,
   BuildOptions,
@@ -11,7 +10,10 @@ import type {
   FileSignature,
   FunctionInfo,
   GlobalVariable,
+  MacroAlias,
+  MacroDefinition,
   MemberSymbol,
+  ParserDiagnostic,
   StructTypeInfo,
   ThreadDefinition,
   ThreadReachability
@@ -27,18 +29,11 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
   phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
-  const parserMode = resolveParserMode(options);
-  const scanResult = await scanProjectFileStructures(project.sourceFiles, options);
+  const scanResult = await analyzeFilesWithRustSidecar(project.sourceFiles, options.maxIndexWorkers);
   phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
-  phaseStarted = Date.now();
-  const structures = scanResult.structures;
-  const globalNames = new Set(structures.flatMap((file) => file.globals.map((global) => global.name)));
-  const functionNameMap = buildFunctionNameMap(structures.flatMap((file) => file.functions.map((func) => func.name)));
-  const memberContext = buildMemberAnalysisContext(structures);
-  phaseDurationsMs.symbolMap = elapsedSince(phaseStarted);
-  phaseStarted = Date.now();
-  const files = structures.map((structure) => analyzeFileStructure(structure, globalNames, functionNameMap, memberContext));
-  phaseDurationsMs.accessAnalysis = elapsedSince(phaseStarted);
+  Object.assign(phaseDurationsMs, scanResult.phaseDurationsMs);
+  phaseDurationsMs.symbolMap = scanResult.phaseDurationsMs.rustSymbolMap ?? 0;
+  phaseDurationsMs.accessAnalysis = scanResult.phaseDurationsMs.rustAccessAnalysis ?? 0;
 
   return composeIndex({
     mode: "full",
@@ -48,14 +43,14 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
     projectFiles: project.sourceFiles,
     includePaths: project.includePaths,
     macros: project.macros,
-    files,
+    files: scanResult.files,
     threads: threadMap.threads,
-    parserMode,
     changedFiles: project.sourceFiles,
     reusedFiles: 0,
     sourceFileCount: project.sourceFiles.length,
     phaseDurationsMs,
-    workerCount: scanResult.workerCount
+    workerCount: scanResult.workerCount,
+    parserDiagnostics: scanResult.diagnostics
   });
 }
 
@@ -78,18 +73,11 @@ export async function updateIndex(
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
   phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
-  const projectFilesChanged = !sameStringSet(project.sourceFiles, previousIndex.projectFiles);
-  if (projectFilesChanged) {
+
+  if (!sameStringSet(project.sourceFiles, previousIndex.projectFiles)) {
     const index = await buildFullIndex(options);
     index.build.mode = "update";
     index.build.fullRebuildReason = "project-source-list-changed";
-    return index;
-  }
-  const parserMode = resolveParserMode(options);
-  if (previousIndex.build.parserMode !== parserMode) {
-    const index = await buildFullIndex(options);
-    index.build.mode = "update";
-    index.build.fullRebuildReason = "parser-mode-changed";
     return index;
   }
 
@@ -108,7 +96,6 @@ export async function updateIndex(
       macros: project.macros,
       files: previousIndex.files,
       threads: threadMap.threads,
-      parserMode,
       changedFiles,
       reusedFiles: previousIndex.files.length,
       sourceFileCount: project.sourceFiles.length,
@@ -118,104 +105,17 @@ export async function updateIndex(
         symbolMap: 0,
         accessAnalysis: 0
       },
-      workerCount: 0
+      workerCount: 0,
+      parserDiagnostics: previousIndex.parserDiagnostics ?? []
     });
   }
 
-  phaseStarted = Date.now();
-  const scanResult = await scanProjectFileStructures(changedFiles, options);
-  const changedStructures = scanResult.structures;
-  phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
-  phaseStarted = Date.now();
-  const mergedGlobals = mergeSymbolNames(
-    previousIndex.files,
-    changedStructures.map((structure) => ({
-      file: structure.file,
-      globals: structure.globals,
-      functions: []
-    })),
-    "globals"
-  );
-  const mergedFunctions = mergeSymbolNames(
-    previousIndex.files,
-    changedStructures.map((structure) => ({
-      file: structure.file,
-      globals: [],
-      functions: structure.functions.map((func) => ({ name: func.name }))
-    })),
-    "functions"
-  );
-  const changedStructurePaths = new Set(changedStructures.map((structure) => structure.file));
-  const mergedSymbolFiles = [
-    ...previousIndex.files
-      .filter((file) => !changedStructurePaths.has(file.file))
-      .map((file) => ({ globals: file.globals, structTypes: file.structTypes })),
-    ...changedStructures.map((structure) => ({
-      globals: structure.globals,
-      structTypes: structure.structTypes
-    }))
-  ];
-  const memberContext = buildMemberAnalysisContext(mergedSymbolFiles);
-  const mergedMemberSymbols = new Set(memberContext.memberSymbols.keys());
-  const mergedStructSignatures = collectStructTypeSignatures(mergedSymbolFiles);
-  phaseDurationsMs.symbolMap = elapsedSince(phaseStarted);
-
-  const previousGlobalNames = new Set(Object.keys(previousIndex.globals));
-  const previousFunctionNames = new Set(Object.keys(previousIndex.functions));
-  const previousMemberNames = new Set(Object.keys(previousIndex.memberSymbols ?? {}));
-  const previousStructSignatures = collectStructTypeSignatures(previousIndex.files);
-  if (!sameStringSet([...mergedGlobals], [...previousGlobalNames])) {
-    const index = await buildFullIndex(options);
-    index.build.mode = "update";
-    index.build.fullRebuildReason = "global-symbol-set-changed";
-    return index;
-  }
-  if (!sameStringSet([...mergedFunctions], [...previousFunctionNames])) {
-    const index = await buildFullIndex(options);
-    index.build.mode = "update";
-    index.build.fullRebuildReason = "function-symbol-set-changed";
-    return index;
-  }
-  if (!sameStringSet([...mergedMemberSymbols], [...previousMemberNames])) {
-    const index = await buildFullIndex(options);
-    index.build.mode = "update";
-    index.build.fullRebuildReason = "member-symbol-set-changed";
-    return index;
-  }
-  if (!sameStringSet([...mergedStructSignatures], [...previousStructSignatures])) {
-    const index = await buildFullIndex(options);
-    index.build.mode = "update";
-    index.build.fullRebuildReason = "struct-type-set-changed";
-    return index;
-  }
-
-  const globalNames = previousGlobalNames;
-  const functionNameMap = buildFunctionNameMap(previousFunctionNames);
-  phaseStarted = Date.now();
-  const changedAnalyses = changedStructures.map((structure) =>
-    analyzeFileStructure(structure, globalNames, functionNameMap, memberContext)
-  );
-  phaseDurationsMs.accessAnalysis = elapsedSince(phaseStarted);
-  const changedByPath = new Map(changedAnalyses.map((file) => [file.file, file]));
-  const files = previousIndex.files.map((file) => changedByPath.get(file.file) ?? file);
-
-  return composeIndex({
-    mode: "update",
-    started,
-    workspaceRoot: project.workspaceRoot,
-    projectFile: project.projectFile,
-    projectFiles: project.sourceFiles,
-    includePaths: project.includePaths,
-    macros: project.macros,
-    files,
-    threads: threadMap.threads,
-    parserMode,
-    changedFiles,
-    reusedFiles: files.length - changedFiles.length,
-    sourceFileCount: project.sourceFiles.length,
-    phaseDurationsMs,
-    workerCount: scanResult.workerCount
-  });
+  const index = await buildFullIndex(options);
+  index.build.mode = "update";
+  index.build.changedFiles = changedFiles;
+  index.build.reusedFiles = 0;
+  index.build.fullRebuildReason = "rust-native-update-rebuild";
+  return index;
 }
 
 function composeIndex(args: {
@@ -228,18 +128,22 @@ function composeIndex(args: {
   macros: string[];
   files: FileAnalysis[];
   threads: ThreadDefinition[];
-  parserMode: "standard" | "custom";
   changedFiles: string[];
   reusedFiles: number;
   sourceFileCount: number;
   phaseDurationsMs: Record<string, number>;
   workerCount: number;
+  parserDiagnostics: ParserDiagnostic[];
 }): AnalysisIndex {
   const composeStarted = Date.now();
   const globals: Record<string, GlobalVariable[]> = {};
   const memberContext = buildMemberAnalysisContext(args.files);
+  const globalNames = new Set(args.files.flatMap((file) => file.globals.map((global) => global.name)));
+  const macroContext = buildMacroAnalysisContext(args.files, globalNames, memberContext);
   const structTypes: Record<string, StructTypeInfo> = {};
   const memberSymbols: Record<string, MemberSymbol[]> = {};
+  const macroDefinitions: Record<string, MacroDefinition[]> = {};
+  const macroAliases: Record<string, MacroAlias[]> = {};
   const functions: Record<string, FunctionInfo> = {};
   const callGraph: Record<string, string[]> = {};
   const calledBy: Record<string, string[]> = {};
@@ -249,6 +153,12 @@ function composeIndex(args: {
   }
   for (const [memberName, symbols] of memberContext.memberSymbols) {
     memberSymbols[memberName] = symbols;
+  }
+  for (const [macroName, definitions] of macroContext.definitions) {
+    macroDefinitions[macroName] = definitions;
+  }
+  for (const [macroName, aliases] of macroContext.aliases) {
+    macroAliases[macroName] = aliases;
   }
 
   for (const file of args.files) {
@@ -276,6 +186,9 @@ function composeIndex(args: {
     globals,
     structTypes,
     memberSymbols,
+    macroDefinitions,
+    macroAliases,
+    parserDiagnostics: args.parserDiagnostics,
     functions,
     callGraph,
     calledBy,
@@ -283,7 +196,7 @@ function composeIndex(args: {
     threadReachability: buildThreadReachability(args.threads, callGraph),
     build: {
       mode: args.mode,
-      parserMode: args.parserMode,
+      parserMode: "rust",
       durationMs: Date.now() - args.started,
       phaseDurationsMs: {
         ...args.phaseDurationsMs,
@@ -297,28 +210,6 @@ function composeIndex(args: {
   };
   index.build.durationMs = Date.now() - args.started;
   return index;
-}
-
-async function scanProjectFileStructures(
-  files: string[],
-  options: BuildOptions
-): Promise<ScanFileStructuresResult> {
-  if (resolveParserMode(options) !== "custom") {
-    return scanFileStructures(files, options.maxIndexWorkers);
-  }
-  const structures: ScanFileStructuresResult["structures"] = [];
-  for (const file of files) {
-    structures.push(await scanFileStructureWithCustomParser(file));
-  }
-  return {
-    structures,
-    workerCount: 1,
-    usedWorkers: false
-  };
-}
-
-function resolveParserMode(options: BuildOptions): "standard" | "custom" {
-  return options.parserMode === "custom" ? "custom" : "standard";
 }
 
 function buildThreadReachability(
@@ -385,41 +276,6 @@ function sameStringSet(left: string[], right: string[]): boolean {
   return left.every((item) => rightSet.has(item));
 }
 
-function mergeSymbolNames(
-  previousFiles: FileAnalysis[],
-  changedFiles: Array<{ file: string; globals: Array<{ name: string }>; functions: Array<{ name: string }> }>,
-  key: "globals" | "functions"
-): Set<string> {
-  const changedPaths = new Set(changedFiles.map((file) => file.file));
-  const names = new Set<string>();
-  for (const file of previousFiles) {
-    if (changedPaths.has(file.file)) {
-      continue;
-    }
-    for (const item of file[key]) {
-      names.add(item.name);
-    }
-  }
-  for (const file of changedFiles) {
-    for (const item of file[key]) {
-      names.add(item.name);
-    }
-  }
-  return names;
-}
-
-function collectStructTypeSignatures(
-  files: Array<{ structTypes: StructTypeInfo[] }>
-): Set<string> {
-  const signatures = new Set<string>();
-  for (const file of files) {
-    for (const structType of file.structTypes ?? []) {
-      signatures.add(`${structType.name}:${structType.aliases.join("|")}:${structType.members.map((member) => `${member.name}/${member.typeName ?? ""}/${member.pointerLevel ?? 0}/${member.isArray ? "a" : ""}`).join(",")}`);
-    }
-  }
-  return signatures;
-}
-
 export async function assertReadableTargetUnchanged(projectFiles: string[]): Promise<Record<string, FileSignature>> {
   const signatures: Record<string, FileSignature> = {};
   await Promise.all(
@@ -452,23 +308,6 @@ export async function fileExists(file: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function buildFunctionNameMap(functionNames: Iterable<string>): Map<string, string[]> {
-  const map = new Map<string, string[]>();
-  for (const functionName of functionNames) {
-    const simpleName = simplifyFunctionName(functionName);
-    map.set(simpleName, [...(map.get(simpleName) ?? []), functionName]);
-  }
-  for (const names of map.values()) {
-    names.sort();
-  }
-  return map;
-}
-
-function simplifyFunctionName(functionName: string): string {
-  const parts = functionName.split("::");
-  return parts[parts.length - 1] ?? functionName;
 }
 
 function elapsedSince(started: number): number {

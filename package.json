@@ -2,7 +2,7 @@
   "name": "vc6-impact-review",
   "displayName": "VC6 Impact Review",
   "description": "Visualize global-variable and function impact in large VC6 C/C++ projects without writing to the target source tree.",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "publisher": "local",
   "license": "UNLICENSED",
   "repository": {
@@ -16,6 +16,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:vc6Impact.buildFullIndex",
     "onCommand:vc6Impact.updateIndex",
     "onCommand:vc6Impact.inspectSelectedSymbol",
@@ -24,6 +25,13 @@
     "onView:vc6Impact.explorer"
   ],
   "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "resources/**",
+    "native/vc6-impact-rust/target/release/vc6-impact-rust.exe",
+    "README.md",
+    "LICENSE"
+  ],
   "contributes": {
     "configuration": {
       "title": "VC6 Impact Review",
@@ -41,7 +49,7 @@
         "vc6Impact.outputDir": {
           "type": "string",
           "default": "",
-          "description": "External directory for index and reports. Empty uses VS Code global storage, not the target source tree."
+          "description": "Directory for index and reports. Empty uses <workspace>/.vscode/vc6-impact-review and adds it to .git/info/exclude when possible."
         },
         "vc6Impact.excludeGlobs": {
           "type": "array",
@@ -70,15 +78,6 @@
           "maximum": 64,
           "description": "Maximum worker threads used while building indexes. 0 means auto (CPU count - 1)."
         },
-        "vc6Impact.parserMode": {
-          "type": "string",
-          "enum": [
-            "standard",
-            "custom"
-          ],
-          "default": "standard",
-          "description": "Source parser route. standard keeps the existing scanner; custom uses the isolated custom parser implementation."
-        },
         "vc6Impact.indexDbPath": {
           "type": "string",
           "default": "",
@@ -89,23 +88,38 @@
     "commands": [
       {
         "command": "vc6Impact.buildFullIndex",
-        "title": "VC6 Impact: Build Full Index"
+        "title": "Build Full Index",
+        "shortTitle": "Build",
+        "category": "VC6 Impact",
+        "icon": "$(database)"
       },
       {
         "command": "vc6Impact.updateIndex",
-        "title": "VC6 Impact: Update Index"
+        "title": "Update Index",
+        "shortTitle": "Update",
+        "category": "VC6 Impact",
+        "icon": "$(refresh)"
       },
       {
         "command": "vc6Impact.inspectSelectedSymbol",
-        "title": "VC6 Impact: Inspect Selected Symbol"
+        "title": "Inspect Selected Symbol",
+        "shortTitle": "Inspect",
+        "category": "VC6 Impact",
+        "icon": "$(search)"
       },
       {
         "command": "vc6Impact.generateReviewReport",
-        "title": "VC6 Impact: Generate Review Report"
+        "title": "Generate Review Report",
+        "shortTitle": "Report",
+        "category": "VC6 Impact",
+        "icon": "$(file-text)"
       },
       {
         "command": "vc6Impact.openGraph",
-        "title": "VC6 Impact: Open Graph"
+        "title": "Open Graph",
+        "shortTitle": "Graph",
+        "category": "VC6 Impact",
+        "icon": "$(graph)"
       }
     ],
     "menus": {
@@ -137,7 +151,7 @@
         {
           "id": "vc6Impact",
           "title": "VC6 Impact",
-          "icon": "resources/icon.svg"
+          "icon": "resources/activitybar.svg"
         }
       ]
     },
@@ -151,6 +165,7 @@
     }
   },
   "scripts": {
+    "precompile": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "compile": "tsc -p ./",
     "test": "vitest run",
     "watch": "tsc -watch -p ./",

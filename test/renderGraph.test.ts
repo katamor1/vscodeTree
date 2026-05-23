@@ -43,4 +43,14 @@ describe("renderGraphHtml", () => {
     expect(html).toContain("src/main.cpp:");
     expect(html).not.toContain(fixtureRoot.replace(/\\/g, "/"));
   });
+
+  it("renders accesses as wrapped review rows instead of a cramped multi-column table", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, maxIndexWorkers: 1 });
+    const impact = buildImpact(index, "g_counter");
+    const html = renderGraphHtml(impact, { workspaceRoot: fixtureRoot, mode: "standalone" });
+
+    expect(html).toContain('class="access-list"');
+    expect(html).toContain('class="access-card"');
+    expect(html).toContain("access-evidence");
+  });
 });

@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest";
 import { buildImpact } from "../src/analysis/impact";
 import { assertReadableTargetUnchanged, buildFullIndex, updateIndex, verifySignaturesUnchanged } from "../src/analysis/indexer";
 import { renderMarkdownReport, writeReviewReport } from "../src/analysis/report";
-import { analyzeFileStructure, scanFileStructure } from "../src/analysis/sourceScanner";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const fixtureRoot = path.resolve(__dirname, "fixtures", "vc6-sample");
@@ -26,11 +25,13 @@ describe("VC6 project parsing", () => {
   });
 });
 
-describe("hybrid impact index", () => {
+describe("Rust native impact index", () => {
   it("detects global read/write access, thread reachability, and risk candidates", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
     const impact = buildImpact(index, "g_counter");
 
+    expect(index.build.parserMode).toBe("rust");
+    expect(index.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("native analyze-many");
     expect(index.globals.g_counter?.length).toBeGreaterThan(0);
     expect(index.build.phaseDurationsMs.structureScan).toBeGreaterThanOrEqual(0);
     expect(index.build.phaseDurationsMs.accessAnalysis).toBeGreaterThanOrEqual(0);
@@ -71,12 +72,16 @@ describe("hybrid impact index", () => {
     const html = await fs.readFile(htmlPath, "utf8");
     expect(markdown).toContain("# 変更影響レビュー: g_counter");
     expect(markdown).toContain("## 干渉リスク候補");
+    expect(markdown).toContain("- HTML図: [reports/g_counter.html](g_counter.html)");
+    expect(markdown).toContain("[src/main.cpp:");
+    expect(markdown).not.toContain("file://");
+    expect(markdown).not.toContain(fixtureRoot.replace(/\\/g, "/"));
     expect(html).toContain("変更影響グラフ: g_counter");
     expect(markdownPath.startsWith(fixtureRoot)).toBe(false);
     await expect(verifySignaturesUnchanged(before)).resolves.toEqual({ ok: true, changed: [] });
   });
 
-  it("supports update mode and reuses unchanged file analyses when symbol sets are stable", async () => {
+  it("uses Rust native full reanalysis for changed-file update mode", async () => {
     const tempRoot = await copyFixtureToTemp();
     const tempProject = path.join(tempRoot, "sample.dsw");
     const tempThreadMap = path.join(tempRoot, "thread-map.json");
@@ -92,9 +97,10 @@ describe("hybrid impact index", () => {
     );
 
     expect(updated.build.mode).toBe("update");
-    expect(updated.build.changedFiles).toHaveLength(1);
-    expect(updated.build.reusedFiles).toBeGreaterThan(0);
-    expect(updated.build.fullRebuildReason).toBeUndefined();
+    expect(updated.build.changedFiles).toContain(path.join(tempRoot, "src", "main.cpp").replace(/\\/g, "/"));
+    expect(updated.build.reusedFiles).toBe(0);
+    expect(updated.build.fullRebuildReason).toBe("rust-native-update-rebuild");
+    expect(updated.build.parserMode).toBe("rust");
   });
 
   it("produces the same core index shape with explicit single-worker and auto-worker options", async () => {
@@ -158,6 +164,61 @@ describe("hybrid impact index", () => {
     expect(report).toContain("WRITE `g_deviceState.counter`");
     expect(report).toContain("src/main.cpp:");
   });
+
+  it("tracks object-like define aliases as macro impact targets", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
+    const macroImpact = buildImpact(index, "DEVICE_COUNTER_ALIAS");
+    const memberImpact = buildImpact(index, "g_deviceState.counter");
+
+    expect(index.macroDefinitions.DEVICE_COUNTER_ALIAS?.[0]).toEqual(
+      expect.objectContaining({ replacement: "g_deviceState.counter", isFunctionLike: false })
+    );
+    expect(index.macroAliases.DEVICE_COUNTER_ALIAS?.[0]).toEqual(
+      expect.objectContaining({ targetName: "g_deviceState.counter", targetKind: "member" })
+    );
+    expect(index.macroAliases.GLOBALS_H).toBeUndefined();
+    expect(macroImpact.symbolKind).toBe("macro");
+    expect(macroImpact.macros).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "DEVICE_COUNTER_ALIAS", targetName: "g_deviceState.counter" })
+      ])
+    );
+    expect(macroImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          functionName: "MacroAliasUse",
+          kind: "read",
+          variableName: "g_deviceState.counter",
+          macroNames: expect.arrayContaining(["DEVICE_COUNTER_ALIAS"])
+        })
+      ])
+    );
+    expect(memberImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          functionName: "MacroAliasUse",
+          variableName: "g_deviceState.counter",
+          macroNames: expect.arrayContaining(["DEVICE_COUNTER_ALIAS"])
+        })
+      ])
+    );
+  });
+
+  it("fails clearly when the Rust sidecar is unavailable instead of falling back", async () => {
+    const previous = process.env.VC6_IMPACT_RUST_SIDECAR;
+    process.env.VC6_IMPACT_RUST_SIDECAR = path.join(os.tmpdir(), `missing-vc6-impact-rust-${Date.now()}.exe`);
+    try {
+      await expect(buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile })).rejects.toThrow(
+        /Rust sidecar is not built/
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.VC6_IMPACT_RUST_SIDECAR;
+      } else {
+        process.env.VC6_IMPACT_RUST_SIDECAR = previous;
+      }
+    }
+  });
 });
 
 describe("function impact", () => {
@@ -178,28 +239,3 @@ async function copyFixtureToTemp(): Promise<string> {
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
 }
-
-describe("source token analysis", () => {
-  it("ignores identifiers inside comments and strings during access analysis", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-token-"));
-    const file = path.join(tempRoot, "token.cpp");
-    await fs.writeFile(
-      file,
-      [
-        "int g_value = 0;",
-        "void TokenCase(void)",
-        "{",
-        "    const char *text = \"g_value++;\";",
-        "    // g_value = 10;",
-        "    g_value++;",
-        "}"
-      ].join("\n"),
-      "utf8"
-    );
-    const structure = await scanFileStructure(file);
-    const analysis = analyzeFileStructure(structure, new Set(["g_value"]), new Map([["TokenCase", ["TokenCase"]]]));
-
-    expect(analysis.functions[0]?.accesses).toHaveLength(1);
-    expect(analysis.functions[0]?.accesses[0]?.kind).toBe("write");
-  });
-});

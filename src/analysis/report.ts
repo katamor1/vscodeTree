@@ -1,8 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { renderGraphHtml } from "./renderGraph";
+import { reportArtifactDisplayPath, reportDisplayPath, reportRelativeLink } from "./store";
 import type { AnalysisIndex, ImpactResult, SourceLocation } from "./types";
+
+export interface MarkdownReportOptions {
+  markdownPath?: string;
+  htmlPath?: string;
+}
 
 export async function writeReviewReport(
   index: AnalysisIndex,
@@ -12,41 +17,58 @@ export async function writeReviewReport(
 ): Promise<void> {
   await fs.mkdir(path.dirname(markdownPath), { recursive: true });
   await fs.mkdir(path.dirname(htmlPath), { recursive: true });
-  await fs.writeFile(markdownPath, renderMarkdownReport(index, impact, htmlPath), "utf8");
+  await fs.writeFile(markdownPath, renderMarkdownReport(index, impact, { markdownPath, htmlPath }), "utf8");
   await fs.writeFile(htmlPath, renderGraphHtml(impact, { workspaceRoot: index.workspaceRoot, mode: "standalone" }), "utf8");
 }
 
-export function renderMarkdownReport(index: AnalysisIndex, impact: ImpactResult, htmlPath?: string): string {
+export function renderMarkdownReport(
+  index: AnalysisIndex,
+  impact: ImpactResult,
+  options: MarkdownReportOptions | string = {}
+): string {
+  const reportOptions: MarkdownReportOptions = typeof options === "string" ? { htmlPath: options } : options;
   const lines: string[] = [];
   lines.push(`# 変更影響レビュー: ${impact.symbolName}`);
   lines.push("");
   lines.push(`- 種別: ${kindLabel(impact.symbolKind)}`);
   lines.push(`- 生成日時: ${index.generatedAt}`);
-  lines.push(`- 対象プロジェクト: \`${toRelativePath(index.projectFile, index.workspaceRoot)}\``);
+  lines.push(`- 対象プロジェクト: \`${reportDisplayPath(index.workspaceRoot, index.projectFile)}\``);
   lines.push(`- 解析ファイル数: ${index.build.sourceFileCount}`);
   lines.push(`- 索引更新方式: ${index.build.mode}${index.build.fullRebuildReason ? ` (${index.build.fullRebuildReason})` : ""}`);
   lines.push(`- 処理時間: ${index.build.durationMs} ms`);
   lines.push(`- worker数: ${index.build.workerCount}`);
   lines.push(`- phase別時間: ${formatPhaseDurations(index.build.phaseDurationsMs)}`);
-  if (htmlPath) {
-    lines.push(`- HTML図: \`${htmlPath}\``);
+  if (reportOptions.htmlPath) {
+    const outputDir = reportOptions.markdownPath
+      ? path.dirname(path.dirname(reportOptions.markdownPath))
+      : path.dirname(path.dirname(reportOptions.htmlPath));
+    const label = reportArtifactDisplayPath(outputDir, reportOptions.htmlPath);
+    const href = reportOptions.markdownPath
+      ? reportRelativeLink(reportOptions.markdownPath, reportOptions.htmlPath)
+      : label;
+    lines.push(`- HTML図: [${label}](${href})`);
   }
   lines.push("");
 
   lines.push("## 変数/関数");
   if (impact.globals.length > 0) {
     for (const global of impact.globals) {
-      lines.push(`- global \`${global.name}\`: ${formatLocation(global.file, global.line, index.workspaceRoot)} / \`${global.declaration}\``);
+      lines.push(`- global \`${global.name}\`: ${formatLocation(global.file, global.line, index.workspaceRoot, reportOptions.markdownPath)} / \`${global.declaration}\``);
     }
   }
   if (impact.members.length > 0) {
     for (const member of impact.members) {
-      lines.push(`- member \`${member.name}\`: ${formatLocation(member.file, member.line, index.workspaceRoot)} / \`${member.declaration}\``);
+      lines.push(`- member \`${member.name}\`: ${formatLocation(member.file, member.line, index.workspaceRoot, reportOptions.markdownPath)} / \`${member.declaration}\``);
+    }
+  }
+  if (impact.macros.length > 0) {
+    for (const macro of impact.macros) {
+      lines.push(`- macro \`${macro.name}\`: ${formatLocation(macro.file, macro.line, index.workspaceRoot, reportOptions.markdownPath)} / 展開先 \`${macro.targetName}\` / \`${macro.declaration}\``);
     }
   }
   if (impact.symbolKind === "function") {
     for (const func of impact.functions.filter((func) => func.name === impact.symbolName)) {
-      lines.push(`- function \`${func.name}\`: ${formatLocation(func.file, func.startLine, index.workspaceRoot)} / \`${func.signature}\``);
+      lines.push(`- function \`${func.name}\`: ${formatLocation(func.file, func.startLine, index.workspaceRoot, reportOptions.markdownPath)} / \`${func.signature}\``);
     }
   }
   if (impact.symbolKind === "unknown") {
@@ -76,9 +98,16 @@ export function renderMarkdownReport(index: AnalysisIndex, impact: ImpactResult,
         `- ${access.kind.toUpperCase()} \`${access.variableName}\` in \`${access.functionName}\` at ${formatLocation(
           access.location.file,
           access.location.line,
-          index.workspaceRoot
+          index.workspaceRoot,
+          reportOptions.markdownPath
         )}: \`${access.evidence}\``
       );
+      if (access.expandedEvidence && access.expandedEvidence !== access.evidence) {
+        lines.push(`  - 展開後: \`${access.expandedEvidence}\``);
+      }
+      if (access.macroNames?.length) {
+        lines.push(`  - macro: ${access.macroNames.map((name) => `\`${name}\``).join(", ")}`);
+      }
     }
   }
   lines.push("");
@@ -90,7 +119,7 @@ export function renderMarkdownReport(index: AnalysisIndex, impact: ImpactResult,
     for (const risk of impact.risks) {
       lines.push(`- [${risk.severity}] ${risk.title} (${risk.code})`);
       lines.push(`  - ${risk.detail}`);
-      lines.push(`  - 根拠: ${formatEvidence(risk.evidence, index.workspaceRoot)}`);
+      lines.push(`  - 根拠: ${formatEvidence(risk.evidence, index.workspaceRoot, reportOptions.markdownPath)}`);
     }
   }
   lines.push("");
@@ -101,7 +130,7 @@ export function renderMarkdownReport(index: AnalysisIndex, impact: ImpactResult,
   } else {
     for (const item of impact.unresolved) {
       lines.push(
-        `- ${item.kind}: ${formatLocation(item.location.file, item.location.line, index.workspaceRoot)} / ${item.note} / \`${item.evidence}\``
+        `- ${item.kind}: ${formatLocation(item.location.file, item.location.line, index.workspaceRoot, reportOptions.markdownPath)} / ${item.note} / \`${item.evidence}\``
       );
     }
   }
@@ -121,20 +150,23 @@ function kindLabel(kind: ImpactResult["symbolKind"]): string {
   if (kind === "member") {
     return "構造体メンバ";
   }
+  if (kind === "macro") {
+    return "macro alias";
+  }
   if (kind === "function") {
     return "関数";
   }
   return "未特定";
 }
 
-function formatEvidence(locations: SourceLocation[], workspaceRoot: string): string {
+function formatEvidence(locations: SourceLocation[], workspaceRoot: string, markdownPath?: string): string {
   const unique = new Map<string, SourceLocation>();
   for (const location of locations) {
     unique.set(`${location.file}:${location.line}`, location);
   }
   return [...unique.values()]
     .slice(0, 12)
-    .map((location) => formatLocation(location.file, location.line, workspaceRoot))
+    .map((location) => formatLocation(location.file, location.line, workspaceRoot, markdownPath))
     .join(", ");
 }
 
@@ -147,15 +179,10 @@ function formatPhaseDurations(phases: Record<string, number> | undefined): strin
     .join(", ");
 }
 
-function formatLocation(file: string, line: number, workspaceRoot: string): string {
-  const label = `${toRelativePath(file, workspaceRoot)}:${line}`;
-  const href = `${pathToFileURL(file).toString()}#L${line}`;
+function formatLocation(file: string, line: number, workspaceRoot: string, markdownPath?: string): string {
+  const label = `${reportDisplayPath(workspaceRoot, file)}:${line}`;
+  const href = markdownPath
+    ? reportRelativeLink(markdownPath, file, line)
+    : `${reportDisplayPath(workspaceRoot, file)}#L${line}`;
   return `[${label}](${href})`;
-}
-
-function toRelativePath(file: string, workspaceRoot: string): string {
-  const relative = path.relative(workspaceRoot, file);
-  return relative && !relative.startsWith("..") && !path.isAbsolute(relative)
-    ? relative.replace(/\\/g, "/")
-    : file.replace(/\\/g, "/");
 }

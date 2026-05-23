@@ -18,6 +18,7 @@ unsigned long WorkerThread(void *param)
     DEVICE_STATE *pState = &g_deviceState;
     g_counter++;
     pState->counter++;
+    MacroAliasUse(pState);
     CommonUpdate();
     return 0;
 }
@@ -41,6 +42,11 @@ void PointerAlias(void)
 {
     int *p = &g_mode;
     *p = 4;
+}
+
+void MacroAliasUse(DEVICE_STATE *pState)
+{
+    pState->DEVICE_MODE_MEMBER = DEVICE_COUNTER_ALIAS;
 }
 
 void PointerMemberUnknown(DEVICE_STATE *pState)

@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as vscode from "vscode";
 import { buildImpact } from "./analysis/impact";
 import { buildFullIndex, updateIndex } from "./analysis/indexer";
-import { reportPaths, readIndex, writeIndex } from "./analysis/store";
+import { ensureArtifactIgnored, reportPaths, readIndex, writeIndex } from "./analysis/store";
 import { writeReviewReport } from "./analysis/report";
 import type { AnalysisIndex, ImpactResult } from "./analysis/types";
 import { normalizeCommandSymbolArg } from "./extension/commandArgs";
@@ -28,10 +28,14 @@ export function activate(context: vscode.ExtensionContext): void {
             return buildFullIndex(settings);
           }
         );
+        await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
         await writeIndex(settings.indexPath, index);
-        treeProvider.setStatus(
-          `Index built: ${index.build.sourceFileCount} files, ${index.build.durationMs} ms, workers ${index.build.workerCount}`
-        );
+        treeProvider.setIndexStatus({
+          action: "built",
+          sourceFileCount: index.build.sourceFileCount,
+          durationMs: index.build.durationMs,
+          workerCount: index.build.workerCount
+        });
         vscode.window.showInformationMessage(`VC6 Impact index built: ${settings.indexPath}`);
       });
     }),
@@ -46,10 +50,16 @@ export function activate(context: vscode.ExtensionContext): void {
             return updateIndex(settings, previous);
           }
         );
+        await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
         await writeIndex(settings.indexPath, index);
-        treeProvider.setStatus(
-          `Index updated: changed ${index.build.changedFiles.length}, reused ${index.build.reusedFiles}, ${index.build.durationMs} ms, workers ${index.build.workerCount}`
-        );
+        treeProvider.setIndexStatus({
+          action: "updated",
+          sourceFileCount: index.build.sourceFileCount,
+          changedFileCount: index.build.changedFiles.length,
+          reusedFileCount: index.build.reusedFiles,
+          durationMs: index.build.durationMs,
+          workerCount: index.build.workerCount
+        });
         vscode.window.showInformationMessage(`VC6 Impact index updated: ${settings.indexPath}`);
       });
     }),
@@ -67,6 +77,7 @@ export function activate(context: vscode.ExtensionContext): void {
         currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
         treeProvider.setImpact(currentImpact);
         const paths = reportPaths(settings.outputDir, symbolName);
+        await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
         await writeReviewReport(index, currentImpact, paths.markdown, paths.html);
         const document = await vscode.workspace.openTextDocument(paths.markdown);
         await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside);

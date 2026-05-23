@@ -38,6 +38,7 @@ async function main() {
   const memory = process.memoryUsage();
   console.log(JSON.stringify({
     sample: args.sample || "small",
+    parserEngine: "rust-native",
     wallMs: Math.round(performance.now() - started),
     reportedDurationMs: index.build.durationMs,
     phaseDurationsMs: index.build.phaseDurationsMs,
@@ -47,6 +48,7 @@ async function main() {
     structTypes: Object.keys(index.structTypes).length,
     memberSymbols: Object.keys(index.memberSymbols).length,
     functions: Object.keys(index.functions).length,
+    macros: Object.keys(index.macroAliases || {}).length,
     threads: index.threads.length,
     reachability: Object.keys(index.threadReachability).length,
     rssMb: Math.round(memory.rss / 1024 / 1024),

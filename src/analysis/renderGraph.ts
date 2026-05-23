@@ -36,13 +36,22 @@ export function renderGraphHtml(impact: ImpactResult, options: RenderGraphOption
     .metric .value { display: block; margin-top: 2px; font-size: 18px; font-weight: 700; }
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: start; }
     .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 6px; padding: 12px; min-width: 0; overflow: hidden; }
-    .section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; align-items: start; }
+    .section-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: start; }
     .table-wrap { width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     th, td { border-bottom: 1px solid #e5e7eb; padding: 7px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
     th { color: #475569; font-weight: 600; font-size: 12px; }
     tr:last-child td { border-bottom: 0; }
     code, .code { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+    .access-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .access-card { border: 1px solid #e5e7eb; border-radius: 6px; background: #fff; padding: 10px; min-width: 0; }
+    .access-card-head { display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(130px, auto); gap: 8px; align-items: start; }
+    .access-function { font-weight: 700; overflow-wrap: anywhere; }
+    .access-location { text-align: right; min-width: 0; }
+    .access-fields { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 5px 10px; margin: 8px 0 0; }
+    .access-fields dt { color: #64748b; font-size: 12px; }
+    .access-fields dd { margin: 0; overflow-wrap: anywhere; }
+    .access-evidence { line-height: 1.45; }
     .kind { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; background: #f8fafc; white-space: nowrap; }
     .kind.write, .severity-high { border-color: #fb923c; background: #ffedd5; }
     .kind.read, .severity-info { border-color: #38bdf8; background: #e0f2fe; }
@@ -56,7 +65,8 @@ export function renderGraphHtml(impact: ImpactResult, options: RenderGraphOption
     @media (prefers-color-scheme: dark) {
       body { background: #111827; color: #e5e7eb; }
       .subtitle, .empty, .metric .label { color: #cbd5e1; }
-      .panel, .metric { background: #1f2937; border-color: #374151; }
+      .panel, .metric, .access-card { background: #1f2937; border-color: #374151; }
+      .access-fields dt { color: #cbd5e1; }
       th, td { border-bottom-color: #374151; }
       .location-link { color: #7dd3fc; }
       details summary { color: #e5e7eb; }
@@ -72,7 +82,7 @@ export function renderGraphHtml(impact: ImpactResult, options: RenderGraphOption
         <p class="subtitle">候補可視化です。安全性やリアルタイム順序は断定しません。</p>
       </div>
       <div class="summary-grid">
-        ${metric("Declarations", impact.globals.length + impact.members.length + targetFunctions.length)}
+        ${metric("Declarations", impact.globals.length + impact.members.length + impact.macros.length + targetFunctions.length)}
         ${metric("Accesses", impact.accesses.length)}
         ${metric("Risks", impact.risks.length)}
         ${metric("Unresolved", impact.unresolved.length)}
@@ -135,6 +145,10 @@ function renderDeclarations(
       (member) =>
         `<tr><td class="code">${escapeHtml(member.name)}</td><td>${locationAction({ file: member.file, line: member.line }, options)}</td><td class="code">${escapeHtml(member.declaration)}</td></tr>`
     ),
+    ...impact.macros.map(
+      (macro) =>
+        `<tr><td class="code">${escapeHtml(macro.name)}</td><td>${locationAction({ file: macro.file, line: macro.line }, options)}</td><td class="code">${escapeHtml(`${macro.declaration} => ${macro.targetName}`)}</td></tr>`
+    ),
     ...targetFunctions.map(
       (func) =>
         `<tr><td class="code">${escapeHtml(func.name)}</td><td>${locationAction({ file: func.file, line: func.startLine }, options)}</td><td class="code">${escapeHtml(func.signature)}</td></tr>`
@@ -144,11 +158,27 @@ function renderDeclarations(
 }
 
 function renderAccesses(impact: ImpactResult, options: RenderGraphOptions): string {
-  const rows = impact.accesses.map(
-    (access) =>
-      `<tr><td><span class="kind ${escapeHtml(access.kind)}">${escapeHtml(access.kind.toUpperCase())}</span></td><td class="code">${escapeHtml(access.variableName)}</td><td class="code">${escapeHtml(access.functionName)}</td><td>${locationAction(access.location, options)}</td><td class="code">${escapeHtml(access.evidence)}</td></tr>`
-  );
-  return renderTable(["Kind", "Variable", "Function", "Location", "Evidence"], rows, "read/write候補はありません。");
+  if (impact.accesses.length === 0) {
+    return `<p class="empty">read/write候補はありません。</p>`;
+  }
+  return `<div class="access-list">${impact.accesses
+    .map((access) => {
+      const evidence = access.expandedEvidence ? `${access.evidence} => ${access.expandedEvidence}` : access.evidence;
+      const macro = access.macroNames?.length ? `<dt>Macro</dt><dd>${escapeHtml(access.macroNames.join(", "))}</dd>` : "";
+      return `<article class="access-card">
+        <div class="access-card-head">
+          <span class="kind ${escapeHtml(access.kind)}">${escapeHtml(access.kind.toUpperCase())}</span>
+          <span class="code access-function">${escapeHtml(access.functionName)}</span>
+          <span class="access-location">${locationAction(access.location, options)}</span>
+        </div>
+        <dl class="access-fields">
+          <dt>Target</dt><dd class="code">${escapeHtml(access.variableName)}</dd>
+          <dt>Evidence</dt><dd class="code access-evidence">${escapeHtml(evidence)}</dd>
+          ${macro}
+        </dl>
+      </article>`;
+    })
+    .join("\n")}</div>`;
 }
 
 function renderThreadContexts(impact: ImpactResult): string {

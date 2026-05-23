@@ -1,8 +1,7 @@
-import * as path from "node:path";
 import * as vscode from "vscode";
 import { findDefaultProjectFile } from "../analysis/vc6ProjectParser";
 import { normalizePath, resolveMaybeRelative } from "../analysis/pathUtils";
-import { resolveIndexPath } from "../analysis/store";
+import { resolveArtifactRoot, resolveIndexPath } from "../analysis/store";
 
 export interface ExtensionSettings {
   workspaceRoot: string;
@@ -13,7 +12,6 @@ export interface ExtensionSettings {
   excludeGlobs: string[];
   maxGraphDepth: number;
   maxIndexWorkers: number;
-  parserMode: "standard" | "custom";
 }
 
 export async function readSettings(context: vscode.ExtensionContext): Promise<ExtensionSettings> {
@@ -35,7 +33,7 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
   const outputDirSetting = config.get<string>("outputDir") ?? "";
   const outputDir = outputDirSetting.trim()
     ? resolveMaybeRelative(workspaceRoot, outputDirSetting)
-    : normalizePath(path.join(context.globalStorageUri.fsPath, path.basename(workspaceRoot)));
+    : resolveArtifactRoot(workspaceRoot);
   const indexPath = resolveIndexPath(
     outputDir,
     config.get<string>("indexDbPath")?.trim()
@@ -52,7 +50,6 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     indexPath,
     excludeGlobs: config.get<string[]>("excludeGlobs") ?? [],
     maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4,
-    maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
-    parserMode: config.get<"standard" | "custom">("parserMode") === "custom" ? "custom" : "standard"
+    maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0
   };
 }
