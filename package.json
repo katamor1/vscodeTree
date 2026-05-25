@@ -191,7 +191,8 @@
     "watch": "tsc -watch -p ./",
     "check": "npm run test && npm run compile",
     "bench:index": "node scripts/benchmark-index.js",
-    "samples:enrich-members": "node scripts/enrich-member-samples.js"
+    "samples:enrich-members": "node scripts/enrich-member-samples.js",
+    "samples:stress-large": "node scripts/stress-large-sample.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
