@@ -80,7 +80,7 @@ export async function readIndex(indexPath: string): Promise<AnalysisIndex | unde
 
 export async function writeIndex(indexPath: string, index: AnalysisIndex): Promise<void> {
   await fs.mkdir(path.dirname(indexPath), { recursive: true });
-  await fs.writeFile(indexPath, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+  await fs.writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
 }
 
 export function reportPaths(outputDir: string, symbolName: string): { markdown: string; html: string } {

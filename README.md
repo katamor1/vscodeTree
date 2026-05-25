@@ -9,8 +9,10 @@ The extension builds a local JSON index from `.dsw` / `.dsp` files and source fi
 The production build uses only the bundled Rust native sidecar:
 
 - Normal indexing always calls `native/vc6-impact-rust` with `analyze-many`.
+- `analyze-many` uses the low-memory native path by default: pass 1 collects symbol summaries, pass 2 analyzes bounded batches and writes JSON through `--output`.
 - Alternative parser switching is not part of the production command surface.
 - If the Rust sidecar is missing, indexing fails clearly instead of falling back to a TypeScript parser.
+- Source and project file decoding defaults to automatic fallback: UTF-8 BOM, UTF-8, then CP932.
 
 ## Commands
 
@@ -32,11 +34,15 @@ The extension also activates on `onStartupFinished`, so after reload the command
 {
   "vc6Impact.projectFile": "path/to/project.dsw",
   "vc6Impact.threadMapFile": "path/to/thread-map.json",
-  "vc6Impact.outputDir": ""
+  "vc6Impact.outputDir": "",
+  "vc6Impact.projectEncoding": "auto",
+  "vc6Impact.sourceEncoding": "auto"
 }
 ```
 
 If `outputDir` is empty, artifacts are written to `.vscode/vc6-impact-review/`. Reports are overwritten per symbol under `reports/`.
+
+`projectEncoding` applies to `.dsw` / `.dsp`; `sourceEncoding` applies to C/C++ files scanned by the Rust sidecar. Use `auto` unless a project must be forced to `utf8` or `cp932`.
 
 ## Development Checks
 

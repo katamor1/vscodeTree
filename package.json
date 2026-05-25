@@ -82,6 +82,26 @@
           "type": "string",
           "default": "",
           "description": "Optional explicit path to the JSON index DB. Empty stores vc6-impact-index.json under outputDir."
+        },
+        "vc6Impact.projectEncoding": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "utf8",
+            "cp932"
+          ],
+          "default": "auto",
+          "description": "Encoding for VC6 .dsw/.dsp project files. auto tries UTF-8 BOM, UTF-8, then CP932."
+        },
+        "vc6Impact.sourceEncoding": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "utf8",
+            "cp932"
+          ],
+          "default": "auto",
+          "description": "Encoding for C/C++ source files scanned by the Rust sidecar. auto tries UTF-8 BOM, UTF-8, then CP932."
         }
       }
     },

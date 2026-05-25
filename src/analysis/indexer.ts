@@ -23,13 +23,13 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs);
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
   phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
-  const scanResult = await analyzeFilesWithRustSidecar(project.sourceFiles, options.maxIndexWorkers);
+  const scanResult = await analyzeFilesWithRustSidecar(project.sourceFiles, options.maxIndexWorkers, options.sourceEncoding ?? "auto");
   phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   Object.assign(phaseDurationsMs, scanResult.phaseDurationsMs);
   phaseDurationsMs.symbolMap = scanResult.phaseDurationsMs.rustSymbolMap ?? 0;
@@ -68,7 +68,7 @@ export async function updateIndex(
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs);
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -138,7 +138,12 @@ function composeIndex(args: {
   const composeStarted = Date.now();
   const globals: Record<string, GlobalVariable[]> = {};
   const memberContext = buildMemberAnalysisContext(args.files);
-  const globalNames = new Set(args.files.flatMap((file) => file.globals.map((global) => global.name)));
+  const globalNames = new Set<string>();
+  for (const file of args.files) {
+    for (const global of file.globals) {
+      globalNames.add(global.name);
+    }
+  }
   const macroContext = buildMacroAnalysisContext(args.files, globalNames, memberContext);
   const structTypes: Record<string, StructTypeInfo> = {};
   const memberSymbols: Record<string, MemberSymbol[]> = {};

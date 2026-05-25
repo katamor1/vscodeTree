@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ensureArtifactIgnored, reportPaths, resolveArtifactRoot, reportRelativeLink } from "../src/analysis/store";
+import { ensureArtifactIgnored, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
+import type { AnalysisIndex } from "../src/analysis/types";
 
 describe("artifact storage policy", () => {
   it("defaults artifacts under .vscode/vc6-impact-review", async () => {
@@ -53,4 +54,49 @@ describe("artifact storage policy", () => {
 
     expect(reportRelativeLink(reportPath, sourcePath, 8)).toBe("../../../src/main.cpp#L8");
   });
+
+  it("writes compact index JSON by default", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+
+    await writeIndex(indexPath, minimalIndex());
+
+    const text = await fs.readFile(indexPath, "utf8");
+    expect(text).not.toContain("\n  ");
+    expect(JSON.parse(text).version).toBe(1);
+  });
 });
+
+function minimalIndex(): AnalysisIndex {
+  return {
+    version: 1,
+    generatedAt: "2026-05-26T00:00:00.000Z",
+    workspaceRoot: "C:/tmp/project",
+    projectFile: "C:/tmp/project/sample.dsw",
+    projectFiles: [],
+    includePaths: [],
+    macros: [],
+    files: [],
+    globals: {},
+    structTypes: {},
+    memberSymbols: {},
+    macroDefinitions: {},
+    macroAliases: {},
+    parserDiagnostics: [],
+    functions: {},
+    callGraph: {},
+    calledBy: {},
+    threads: [],
+    threadReachability: {},
+    build: {
+      mode: "full",
+      parserMode: "rust",
+      durationMs: 0,
+      phaseDurationsMs: {},
+      workerCount: 0,
+      changedFiles: [],
+      reusedFiles: 0,
+      sourceFileCount: 0
+    }
+  };
+}

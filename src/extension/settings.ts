@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { findDefaultProjectFile } from "../analysis/vc6ProjectParser";
 import { normalizePath, resolveMaybeRelative } from "../analysis/pathUtils";
 import { resolveArtifactRoot, resolveIndexPath } from "../analysis/store";
+import { normalizeTextEncoding, type TextEncoding } from "../analysis/textEncoding";
 
 export interface ExtensionSettings {
   workspaceRoot: string;
@@ -12,6 +13,8 @@ export interface ExtensionSettings {
   excludeGlobs: string[];
   maxGraphDepth: number;
   maxIndexWorkers: number;
+  projectEncoding: TextEncoding;
+  sourceEncoding: TextEncoding;
 }
 
 export async function readSettings(context: vscode.ExtensionContext): Promise<ExtensionSettings> {
@@ -50,6 +53,8 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     indexPath,
     excludeGlobs: config.get<string[]>("excludeGlobs") ?? [],
     maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4,
-    maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0
+    maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
+    projectEncoding: normalizeTextEncoding(config.get<string>("projectEncoding"), "auto"),
+    sourceEncoding: normalizeTextEncoding(config.get<string>("sourceEncoding"), "auto")
   };
 }

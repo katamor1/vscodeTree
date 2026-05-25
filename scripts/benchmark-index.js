@@ -43,6 +43,9 @@ async function main() {
     reportedDurationMs: index.build.durationMs,
     phaseDurationsMs: index.build.phaseDurationsMs,
     workerCount: index.build.workerCount,
+    nativeBatchSize: index.build.phaseDurationsMs.rustBatchSize ?? 0,
+    nativeOutputMb: roundMb(index.build.phaseDurationsMs.rustOutputBytes ?? 0),
+    nativePeakRssMb: roundMb(index.build.phaseDurationsMs.rustPeakRssBytes ?? 0),
     sourceFileCount: index.build.sourceFileCount,
     globals: Object.keys(index.globals).length,
     structTypes: Object.keys(index.structTypes).length,
@@ -54,6 +57,10 @@ async function main() {
     rssMb: Math.round(memory.rss / 1024 / 1024),
     heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024)
   }, null, 2));
+}
+
+function roundMb(bytes) {
+  return Math.round((Number(bytes) / 1024 / 1024) * 10) / 10;
 }
 
 function parseArgs(argv) {

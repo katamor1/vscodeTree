@@ -248,6 +248,8 @@ export interface BuildOptions {
   threadMapFile?: string;
   excludeGlobs?: string[];
   maxIndexWorkers?: number;
+  projectEncoding?: "auto" | "utf8" | "cp932";
+  sourceEncoding?: "auto" | "utf8" | "cp932";
 }
 
 export interface BuildResult {

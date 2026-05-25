@@ -1,23 +1,27 @@
+use encoding_rs::SHIFT_JIS;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
+use sysinfo::System;
 use tree_sitter::Parser;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileSignature {
     size: u64,
     mtime_ms: f64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SourceLocation {
     file: String,
@@ -25,7 +29,7 @@ struct SourceLocation {
     text: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GlobalVariable {
     name: String,
@@ -38,7 +42,7 @@ struct GlobalVariable {
     pointer_level: Option<usize>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MacroDefinition {
     name: String,
@@ -50,7 +54,7 @@ struct MacroDefinition {
     is_object_like: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StructMemberInfo {
     name: String,
@@ -62,7 +66,7 @@ struct StructMemberInfo {
     pointer_level: Option<usize>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StructTypeInfo {
     name: String,
@@ -73,7 +77,7 @@ struct StructTypeInfo {
     members: Vec<StructMemberInfo>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BodyLine {
     line: usize,
@@ -83,7 +87,7 @@ struct BodyLine {
     call_identifiers: Vec<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FunctionStructure {
     name: String,
@@ -94,7 +98,7 @@ struct FunctionStructure {
     body_lines: Vec<BodyLine>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UnresolvedEvidence {
     kind: String,
@@ -105,7 +109,7 @@ struct UnresolvedEvidence {
     note: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileStructure {
     file: String,
@@ -117,7 +121,31 @@ struct FileStructure {
     unresolved: Vec<UnresolvedEvidence>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Clone)]
+struct FunctionSummary {
+    name: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct FileSummary {
+    file: String,
+    signature: FileSignature,
+    globals: Vec<GlobalVariable>,
+    struct_types: Vec<StructTypeInfo>,
+    macro_definitions: Vec<MacroDefinition>,
+    functions: Vec<FunctionSummary>,
+    unresolved: Vec<UnresolvedEvidence>,
+    decode_info: DecodeInfo,
+}
+
+#[derive(Clone)]
+struct DecodeInfo {
+    used_encoding: &'static str,
+    lossy: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct VariableAccess {
     variable_name: String,
@@ -135,7 +163,7 @@ struct VariableAccess {
     expanded_evidence: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FunctionInfo {
     name: String,
@@ -148,7 +176,7 @@ struct FunctionInfo {
     unresolved: Vec<UnresolvedEvidence>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileAnalysis {
     file: String,
@@ -160,7 +188,7 @@ struct FileAnalysis {
     unresolved: Vec<UnresolvedEvidence>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ParserDiagnostic {
     backend: String,
@@ -169,7 +197,7 @@ struct ParserDiagnostic {
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeAnalysisResult {
     files: Vec<FileAnalysis>,
@@ -182,6 +210,17 @@ struct NativeAnalysisResult {
 struct AnalyzeOptions {
     workers: Option<usize>,
     tree_sitter_diagnostics: bool,
+    output: Option<String>,
+    batch_size: usize,
+    legacy_in_memory: bool,
+    encoding: SourceEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceEncoding {
+    Auto,
+    Utf8,
+    Cp932,
 }
 
 struct NativeContext {
@@ -261,14 +300,14 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
     if args.len() == 3 && args[1] == "scan-file" {
         let file = normalize_path(&args[2]);
-        let structure = scan_file(&file, true)?;
+        let structure = scan_file(&file, true, SourceEncoding::Auto)?;
         serde_json::to_writer(std::io::stdout().lock(), &structure).map_err(|error| error.to_string())?;
         return Ok(());
     }
     if args.len() == 3 && args[1] == "scan-many" {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
         let files: Vec<String> = serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
-        let structures = scan_many(files, None, false)?;
+        let structures = scan_many(files, None, false, SourceEncoding::Auto)?;
         serde_json::to_writer(std::io::stdout().lock(), &structures).map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -276,17 +315,26 @@ fn main() -> Result<(), String> {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
         let files: Vec<String> = serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
         let options = parse_analyze_options(&args[3..])?;
-        let result = analyze_many(files, options)?;
-        serde_json::to_writer(std::io::stdout().lock(), &result).map_err(|error| error.to_string())?;
+        if options.legacy_in_memory {
+            let output = options.output.clone();
+            let result = analyze_many_legacy(files, options)?;
+            write_json_result(output.as_deref(), &result)?;
+        } else {
+            write_low_memory_result(files, options)?;
+        }
         return Ok(());
     }
-    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--tree-sitter-diagnostics]".to_string())
+    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--encoding <auto|utf8|cp932>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
 }
 
 fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
     let mut options = AnalyzeOptions {
         workers: None,
         tree_sitter_diagnostics: false,
+        output: None,
+        batch_size: 256,
+        legacy_in_memory: false,
+        encoding: SourceEncoding::Auto,
     };
     let mut index = 0usize;
     while index < args.len() {
@@ -304,13 +352,45 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
                 options.tree_sitter_diagnostics = true;
                 index += 1;
             }
+            "--output" => {
+                options.output = Some(args.get(index + 1).ok_or_else(|| "--output requires a value".to_string())?.clone());
+                index += 2;
+            }
+            "--batch-size" => {
+                let value = args.get(index + 1).ok_or_else(|| "--batch-size requires a value".to_string())?;
+                options.batch_size = value.parse::<usize>().map_err(|_| format!("invalid --batch-size value: {value}"))?.max(1);
+                index += 2;
+            }
+            "--encoding" => {
+                let value = args.get(index + 1).ok_or_else(|| "--encoding requires a value".to_string())?;
+                options.encoding = parse_source_encoding(value)?;
+                index += 2;
+            }
+            "--legacy-in-memory" => {
+                options.legacy_in_memory = true;
+                index += 1;
+            }
             other => return Err(format!("unknown analyze-many option: {other}")),
         }
     }
     Ok(options)
 }
 
-fn scan_many(files: Vec<String>, requested_workers: Option<usize>, tree_sitter_diagnostics: bool) -> Result<Vec<FileStructure>, String> {
+fn parse_source_encoding(value: &str) -> Result<SourceEncoding, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Ok(SourceEncoding::Auto),
+        "utf8" | "utf-8" => Ok(SourceEncoding::Utf8),
+        "cp932" | "shift_jis" | "shift-jis" | "windows-31j" => Ok(SourceEncoding::Cp932),
+        other => Err(format!("invalid --encoding value: {other}")),
+    }
+}
+
+fn scan_many(
+    files: Vec<String>,
+    requested_workers: Option<usize>,
+    tree_sitter_diagnostics: bool,
+    encoding: SourceEncoding,
+) -> Result<Vec<FileStructure>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -326,7 +406,7 @@ fn scan_many(files: Vec<String>, requested_workers: Option<usize>, tree_sitter_d
             thread::spawn(move || -> Result<Vec<(usize, FileStructure)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
-                    results.push((index, scan_file(&normalize_path(&file), tree_sitter_diagnostics)?));
+                    results.push((index, scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?));
                 }
                 Ok(results)
             })
@@ -338,6 +418,41 @@ fn scan_many(files: Vec<String>, requested_workers: Option<usize>, tree_sitter_d
     }
     indexed.sort_by_key(|(index, _)| *index);
     Ok(indexed.into_iter().map(|(_, structure)| structure).collect())
+}
+
+fn scan_many_summaries(
+    files: Vec<String>,
+    requested_workers: Option<usize>,
+    tree_sitter_diagnostics: bool,
+    encoding: SourceEncoding,
+) -> Result<Vec<FileSummary>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = effective_worker_count(files.len(), requested_workers);
+    let mut chunks: Vec<Vec<(usize, String)>> = vec![Vec::new(); worker_count];
+    for (index, file) in files.into_iter().enumerate() {
+        chunks[index % worker_count].push((index, file));
+    }
+    let handles: Vec<_> = chunks
+        .into_iter()
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            thread::spawn(move || -> Result<Vec<(usize, FileSummary)>, String> {
+                let mut results = Vec::with_capacity(chunk.len());
+                for (index, file) in chunk {
+                    results.push((index, scan_file_summary(&normalize_path(&file), tree_sitter_diagnostics, encoding)?));
+                }
+                Ok(results)
+            })
+        })
+        .collect();
+    let mut indexed = Vec::new();
+    for handle in handles {
+        indexed.extend(handle.join().map_err(|_| "rust sidecar summary worker panicked".to_string())??);
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, summary)| summary).collect())
 }
 
 fn effective_worker_count(file_count: usize, requested_workers: Option<usize>) -> usize {
@@ -354,12 +469,19 @@ fn effective_worker_count(file_count: usize, requested_workers: Option<usize>) -
         .min(file_count)
 }
 
-fn analyze_many(files: Vec<String>, options: AnalyzeOptions) -> Result<NativeAnalysisResult, String> {
+fn current_rss_bytes() -> Option<u128> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = System::new();
+    system.refresh_process(pid);
+    system.process(pid).map(|process| process.memory() as u128)
+}
+
+fn analyze_many_legacy(files: Vec<String>, options: AnalyzeOptions) -> Result<NativeAnalysisResult, String> {
     let total_started = Instant::now();
     let worker_count = effective_worker_count(files.len(), options.workers);
     let mut metrics = HashMap::new();
     let scan_started = Instant::now();
-    let structures = scan_many(files, Some(worker_count), options.tree_sitter_diagnostics)?;
+    let structures = scan_many(files, Some(worker_count), options.tree_sitter_diagnostics, options.encoding)?;
     metrics.insert("readMaskDeclarationScan".to_string(), scan_started.elapsed().as_millis());
 
     let symbol_started = Instant::now();
@@ -377,11 +499,140 @@ fn analyze_many(files: Vec<String>, options: AnalyzeOptions) -> Result<NativeAna
             backend: "rust".to_string(),
             file: None,
             severity: "info".to_string(),
-            message: format!("native analyze-many completed with {worker_count} worker(s)"),
+            message: format!("legacy in-memory analyze-many completed with {worker_count} worker(s)"),
         }],
         metrics,
         worker_count,
     })
+}
+
+fn write_json_result<T: Serialize>(output: Option<&str>, result: &T) -> Result<(), String> {
+    if let Some(output_path) = output {
+        let file = File::create(output_path).map_err(|error| error.to_string())?;
+        let mut writer = io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, result).map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
+    } else {
+        serde_json::to_writer(io::stdout().lock(), result).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_low_memory_result(files: Vec<String>, options: AnalyzeOptions) -> Result<(), String> {
+    if let Some(output_path) = options.output.clone() {
+        let file = File::create(output_path).map_err(|error| error.to_string())?;
+        let mut writer = io::BufWriter::new(file);
+        analyze_many_low_memory_to_writer(files, options, &mut writer)?;
+        writer.flush().map_err(|error| error.to_string())?;
+    } else {
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        analyze_many_low_memory_to_writer(files, options, &mut writer)?;
+    }
+    Ok(())
+}
+
+fn analyze_many_low_memory_to_writer<W: Write>(
+    files: Vec<String>,
+    options: AnalyzeOptions,
+    writer: &mut W,
+) -> Result<(), String> {
+    let total_started = Instant::now();
+    let worker_count = effective_worker_count(files.len(), options.workers);
+    let batch_size = options.batch_size.max(1);
+    let mut metrics: HashMap<String, u128> = HashMap::new();
+    metrics.insert("fileCount".to_string(), files.len() as u128);
+    metrics.insert("workerCount".to_string(), worker_count as u128);
+    metrics.insert("batchSize".to_string(), batch_size as u128);
+    let mut peak_rss = current_rss_bytes().unwrap_or(0);
+
+    let scan_started = Instant::now();
+    let summaries = scan_many_summaries(
+        files.clone(),
+        Some(worker_count),
+        options.tree_sitter_diagnostics,
+        options.encoding,
+    )?;
+    peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
+    metrics.insert("readMaskDeclarationScan".to_string(), scan_started.elapsed().as_millis());
+
+    let symbol_started = Instant::now();
+    let context = build_native_context_from_summaries(&summaries);
+    peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
+    metrics.insert("symbolMap".to_string(), symbol_started.elapsed().as_millis());
+
+    let mut diagnostics = encoding_diagnostics(&summaries);
+    diagnostics.insert(0, ParserDiagnostic {
+        backend: "rust".to_string(),
+        file: None,
+        severity: "info".to_string(),
+        message: format!("low-memory analyze-many completed with {worker_count} worker(s), batch size {batch_size}"),
+    });
+
+    let access_started = Instant::now();
+    let mut counting = CountingWriter::new(writer);
+    counting.write_all(b"{\"files\":[").map_err(|error| error.to_string())?;
+    let mut first_file = true;
+    for batch in files.chunks(batch_size) {
+        let structures = scan_many(
+            batch.to_vec(),
+            Some(worker_count.min(batch.len().max(1))),
+            options.tree_sitter_diagnostics,
+            options.encoding,
+        )?;
+        let analyses = analyze_structures(structures, &context, worker_count)?;
+        for analysis in analyses {
+            if !first_file {
+                counting.write_all(b",").map_err(|error| error.to_string())?;
+            }
+            serde_json::to_writer(&mut counting, &analysis).map_err(|error| error.to_string())?;
+            first_file = false;
+        }
+        peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
+    }
+    metrics.insert("accessAnalysis".to_string(), access_started.elapsed().as_millis());
+    metrics.insert("totalNative".to_string(), total_started.elapsed().as_millis());
+    metrics.insert("peakRssBytes".to_string(), peak_rss);
+    metrics.insert("outputBytes".to_string(), counting.bytes_written() as u128);
+
+    counting.write_all(b"],\"diagnostics\":").map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut counting, &diagnostics).map_err(|error| error.to_string())?;
+    counting.write_all(b",\"metrics\":").map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut counting, &metrics).map_err(|error| error.to_string())?;
+    counting
+        .write_all(format!(",\"workerCount\":{worker_count}}}").as_bytes())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    bytes_written: usize,
+}
+
+impl<'a, W: Write> CountingWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn analyze_structures(
@@ -489,6 +740,111 @@ fn build_native_context(files: &[FileStructure]) -> NativeContext {
         known_member_names,
         macro_aliases,
     }
+}
+
+fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
+    let mut global_names = HashSet::new();
+    let mut function_name_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut struct_types: HashMap<String, StructTypeInfo> = HashMap::new();
+    let mut known_member_names = HashSet::new();
+
+    for file in files {
+        for global in &file.globals {
+            global_names.insert(global.name.clone());
+        }
+        for func in &file.functions {
+            function_name_map
+                .entry(simplify_function_name(&func.name))
+                .or_default()
+                .push(func.name.clone());
+        }
+        for struct_type in &file.struct_types {
+            for type_name in std::iter::once(&struct_type.name).chain(struct_type.aliases.iter()) {
+                if !type_name.is_empty() && !struct_types.contains_key(type_name) {
+                    struct_types.insert(type_name.clone(), struct_type.clone());
+                }
+            }
+            for member in &struct_type.members {
+                known_member_names.insert(member.name.clone());
+            }
+        }
+    }
+    for names in function_name_map.values_mut() {
+        names.sort();
+    }
+
+    let mut global_types = HashMap::new();
+    for file in files {
+        for global in &file.globals {
+            if let Some(type_name) = &global.type_name {
+                if let Some(type_info) = struct_types.get(type_name) {
+                    global_types.insert(
+                        global.name.clone(),
+                        GlobalTypeInfo {
+                            global: global.clone(),
+                            type_info: type_info.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut macro_aliases: HashMap<String, Vec<MacroAliasInfo>> = HashMap::new();
+    let member_symbols = build_member_symbol_names(&global_types, &struct_types);
+    for file in files {
+        for definition in &file.macro_definitions {
+            if let Some(alias) = resolve_macro_alias_native(definition, &global_names, &member_symbols) {
+                macro_aliases.entry(alias.name.clone()).or_default().push(alias);
+            }
+        }
+    }
+
+    let mut known_type_names: Vec<String> = struct_types.keys().cloned().collect();
+    known_type_names.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+
+    NativeContext {
+        global_names,
+        function_name_map,
+        struct_types,
+        global_types,
+        known_type_names,
+        known_member_names,
+        macro_aliases,
+    }
+}
+
+fn encoding_diagnostics(summaries: &[FileSummary]) -> Vec<ParserDiagnostic> {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut lossy_files = Vec::new();
+    for summary in summaries {
+        *counts.entry(summary.decode_info.used_encoding).or_insert(0) += 1;
+        if summary.decode_info.lossy {
+            lossy_files.push(summary.file.clone());
+        }
+    }
+    let mut keys: Vec<_> = counts.keys().copied().collect();
+    keys.sort();
+    let usage = keys
+        .into_iter()
+        .map(|key| format!("{key}={}", counts.get(key).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut diagnostics = vec![ParserDiagnostic {
+        backend: "rust".to_string(),
+        file: None,
+        severity: "info".to_string(),
+        message: format!("source encoding usage: {usage}; lossy={}", lossy_files.len()),
+    }];
+    if let Some(first_lossy) = lossy_files.first() {
+        diagnostics.push(ParserDiagnostic {
+            backend: "rust".to_string(),
+            file: Some(first_lossy.clone()),
+            severity: "warning".to_string(),
+            message: format!("{} source file(s) required lossy CP932 decoding", lossy_files.len()),
+        });
+    }
+    diagnostics
 }
 
 fn build_member_symbol_names(
@@ -1456,8 +1812,38 @@ fn alias_key(alias: &PointerAlias) -> String {
 }
 
 
-fn scan_file(file: &str, tree_sitter_diagnostics: bool) -> Result<FileStructure, String> {
-    let text = fs::read_to_string(file).map_err(|error| error.to_string())?;
+fn scan_file(file: &str, tree_sitter_diagnostics: bool, encoding: SourceEncoding) -> Result<FileStructure, String> {
+    Ok(scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?.0)
+}
+
+fn scan_file_summary(file: &str, tree_sitter_diagnostics: bool, encoding: SourceEncoding) -> Result<FileSummary, String> {
+    let (structure, decode_info) = scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?;
+    let functions = structure
+        .functions
+        .iter()
+        .map(|function| FunctionSummary {
+            name: function.name.clone(),
+        })
+        .collect();
+    Ok(FileSummary {
+        file: structure.file,
+        signature: structure.signature,
+        globals: structure.globals,
+        struct_types: structure.struct_types,
+        macro_definitions: structure.macro_definitions,
+        functions,
+        unresolved: structure.unresolved,
+        decode_info,
+    })
+}
+
+fn scan_file_with_decode(
+    file: &str,
+    tree_sitter_diagnostics: bool,
+    encoding: SourceEncoding,
+) -> Result<(FileStructure, DecodeInfo), String> {
+    let decoded = read_source_text(file, encoding)?;
+    let text = decoded.text;
     let signature = file_signature(file)?;
     let masked_lines = mask_lines(&text);
     let raw_lines: Vec<&str> = text.lines().collect();
@@ -1491,15 +1877,78 @@ fn scan_file(file: &str, tree_sitter_diagnostics: bool) -> Result<FileStructure,
     let functions = parse_functions(file, &raw_lines, &masked_lines);
     let globals = parse_globals(file, &raw_lines, &masked_lines, &functions);
 
-    Ok(FileStructure {
-        file: file.to_string(),
-        signature,
-        globals,
-        struct_types,
-        macro_definitions,
-        functions,
-        unresolved,
-    })
+    Ok((
+        FileStructure {
+            file: file.to_string(),
+            signature,
+            globals,
+            struct_types,
+            macro_definitions,
+            functions,
+            unresolved,
+        },
+        decoded.info,
+    ))
+}
+
+struct DecodedSource {
+    text: String,
+    info: DecodeInfo,
+}
+
+fn read_source_text(file: &str, encoding: SourceEncoding) -> Result<DecodedSource, String> {
+    let bytes = fs::read(file).map_err(|error| error.to_string())?;
+    decode_source_bytes(&bytes, encoding).map_err(|error| format!("{file}: {error}"))
+}
+
+fn decode_source_bytes(bytes: &[u8], encoding: SourceEncoding) -> Result<DecodedSource, String> {
+    match encoding {
+        SourceEncoding::Auto => {
+            if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+                let text = std::str::from_utf8(&bytes[3..]).map_err(|error| error.to_string())?.to_string();
+                return Ok(DecodedSource {
+                    text,
+                    info: DecodeInfo {
+                        used_encoding: "utf8-bom",
+                        lossy: false,
+                    },
+                });
+            }
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return Ok(DecodedSource {
+                    text: text.to_string(),
+                    info: DecodeInfo {
+                        used_encoding: "utf8",
+                        lossy: false,
+                    },
+                });
+            }
+            Ok(decode_cp932(bytes))
+        }
+        SourceEncoding::Utf8 => {
+            let body = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) { &bytes[3..] } else { bytes };
+            let text = std::str::from_utf8(body).map_err(|error| error.to_string())?.to_string();
+            Ok(DecodedSource {
+                text,
+                info: DecodeInfo {
+                    used_encoding: if body.len() == bytes.len() { "utf8" } else { "utf8-bom" },
+                    lossy: false,
+                },
+            })
+        }
+        SourceEncoding::Cp932 => Ok(decode_cp932(bytes)),
+    }
+}
+
+fn decode_cp932(bytes: &[u8]) -> DecodedSource {
+    let (text, _, had_errors) = SHIFT_JIS.decode(bytes);
+    DecodedSource {
+        text: text.into_owned(),
+        info: DecodeInfo {
+            used_encoding: "cp932",
+            lossy: had_errors,
+        },
+    }
 }
 
 fn file_signature(file: &str) -> Result<FileSignature, String> {
@@ -2056,12 +2505,9 @@ mod tests {
     #[test]
     fn native_analysis_detects_globals_members_macros_and_unresolved() {
         let file = write_temp_source("native_fixture.cpp", &fixture_source());
-        let result = analyze_many(
+        let result = analyze_many_legacy(
             vec![file],
-            AnalyzeOptions {
-                workers: Some(1),
-                tree_sitter_diagnostics: false,
-            },
+            test_options(256, true),
         )
         .expect("native analysis should succeed");
         let analysis = result.files.first().expect("file analysis");
@@ -2087,24 +2533,83 @@ mod tests {
     fn native_analysis_worker_count_does_not_change_result() {
         let first = write_temp_source("native_fixture_one.cpp", &fixture_source());
         let second = write_temp_source("native_fixture_two.cpp", &fixture_source());
-        let single = analyze_many(
+        let single = analyze_many_legacy(
             vec![first.clone(), second.clone()],
-            AnalyzeOptions {
-                workers: Some(1),
-                tree_sitter_diagnostics: false,
-            },
+            test_options(256, true),
         )
         .expect("single worker analysis");
-        let auto = analyze_many(
+        let auto = analyze_many_legacy(
             vec![first, second],
             AnalyzeOptions {
                 workers: None,
-                tree_sitter_diagnostics: false,
+                ..test_options(256, true)
             },
         )
         .expect("auto worker analysis");
 
         assert_eq!(summarize(&single.files), summarize(&auto.files));
+    }
+
+    #[test]
+    fn analyze_options_accept_output_batch_encoding_and_legacy_flags() {
+        let args = vec![
+            "--workers".to_string(),
+            "2".to_string(),
+            "--output".to_string(),
+            "out.json".to_string(),
+            "--batch-size".to_string(),
+            "7".to_string(),
+            "--encoding".to_string(),
+            "cp932".to_string(),
+            "--legacy-in-memory".to_string(),
+        ];
+
+        let options = parse_analyze_options(&args).expect("options should parse");
+
+        assert_eq!(options.workers, Some(2));
+        assert_eq!(options.output.as_deref(), Some("out.json"));
+        assert_eq!(options.batch_size, 7);
+        assert_eq!(options.encoding, SourceEncoding::Cp932);
+        assert!(options.legacy_in_memory);
+    }
+
+    #[test]
+    fn cp932_source_decodes_and_analyzes_global_access() {
+        let source = encode_cp932("// 日本語\r\nint g_cp932_counter;\r\nvoid Worker(void) { g_cp932_counter++; }\r\n");
+        let file = write_temp_source_bytes("cp932_fixture.cpp", &source);
+        let result = analyze_many_legacy(
+            vec![file],
+            AnalyzeOptions {
+                workers: Some(1),
+                tree_sitter_diagnostics: false,
+                output: None,
+                batch_size: 256,
+                legacy_in_memory: true,
+                encoding: SourceEncoding::Auto,
+            },
+        )
+        .expect("cp932 source should analyze");
+        let analysis = result.files.first().expect("file analysis");
+
+        assert!(analysis.globals.iter().any(|global| global.name == "g_cp932_counter"));
+        assert!(analysis
+            .functions
+            .iter()
+            .any(|func| func.name == "Worker" && func.accesses.iter().any(|access| access.variable_name == "g_cp932_counter")));
+    }
+
+    #[test]
+    fn low_memory_analysis_matches_legacy_for_fixture_and_batch_size_one() {
+        let first = write_temp_source("low_memory_one.cpp", &fixture_source());
+        let second = write_temp_source("low_memory_two.cpp", &fixture_source());
+        let files = vec![first, second];
+        let legacy = analyze_many_legacy(files.clone(), test_options(256, true)).expect("legacy analysis");
+
+        let mut output = Vec::new();
+        analyze_many_low_memory_to_writer(files, test_options(1, false), &mut output).expect("low memory analysis");
+        let low_memory: NativeAnalysisResult = serde_json::from_slice(&output).expect("low memory json");
+
+        assert_eq!(summarize(&legacy.files), summarize(&low_memory.files));
     }
 
     #[test]
@@ -2124,6 +2629,30 @@ mod tests {
         let file = dir.join(name);
         fs::write(&file, text).expect("write source");
         normalize_path(file.to_string_lossy().as_ref())
+    }
+
+    fn write_temp_source_bytes(name: &str, bytes: &[u8]) -> String {
+        let dir = std::env::temp_dir().join(format!("vc6-impact-rust-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join(name);
+        fs::write(&file, bytes).expect("write source");
+        normalize_path(file.to_string_lossy().as_ref())
+    }
+
+    fn encode_cp932(text: &str) -> Vec<u8> {
+        let (encoded, _, _) = SHIFT_JIS.encode(text);
+        encoded.into_owned()
+    }
+
+    fn test_options(batch_size: usize, legacy_in_memory: bool) -> AnalyzeOptions {
+        AnalyzeOptions {
+            workers: Some(1),
+            tree_sitter_diagnostics: false,
+            output: None,
+            batch_size,
+            legacy_in_memory,
+            encoding: SourceEncoding::Auto,
+        }
     }
 
     fn fixture_source() -> String {

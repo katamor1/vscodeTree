@@ -31,7 +31,7 @@ describe("Rust native impact index", () => {
     const impact = buildImpact(index, "g_counter");
 
     expect(index.build.parserMode).toBe("rust");
-    expect(index.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("native analyze-many");
+    expect(index.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("low-memory analyze-many");
     expect(index.globals.g_counter?.length).toBeGreaterThan(0);
     expect(index.build.phaseDurationsMs.structureScan).toBeGreaterThanOrEqual(0);
     expect(index.build.phaseDurationsMs.accessAnalysis).toBeGreaterThanOrEqual(0);

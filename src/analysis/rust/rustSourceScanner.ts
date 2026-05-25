@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizePath } from "../pathUtils";
+import type { TextEncoding } from "../textEncoding";
 import type { FileAnalysis, ParserDiagnostic } from "../types";
 
 const execFileAsync = promisify(execFile);
@@ -25,7 +26,8 @@ export class RustSidecarUnavailableError extends Error {
 
 export async function analyzeFilesWithRustSidecar(
   files: string[],
-  maxIndexWorkers = 0
+  maxIndexWorkers = 0,
+  sourceEncoding: TextEncoding = "auto"
 ): Promise<RustNativeAnalysisResult> {
   const sidecar = await findRustSidecarExecutable();
   if (!sidecar) {
@@ -38,15 +40,29 @@ export async function analyzeFilesWithRustSidecar(
     message: `rust sidecar detected: ${sidecar}`
   }];
   const listPath = path.join(os.tmpdir(), `vc6-impact-rust-files-${process.pid}-${Date.now()}.json`);
+  const outputPath = path.join(os.tmpdir(), `vc6-impact-rust-output-${process.pid}-${Date.now()}.json`);
   try {
     await fs.writeFile(listPath, JSON.stringify(files), "utf8");
     const workerArg = maxIndexWorkers > 0 ? String(Math.floor(maxIndexWorkers)) : "auto";
-    const { stdout } = await execFileAsync(sidecar, ["analyze-many", listPath, "--workers", workerArg], {
+    await execFileAsync(sidecar, [
+      "analyze-many",
+      listPath,
+      "--workers",
+      workerArg,
+      "--output",
+      outputPath,
+      "--encoding",
+      sourceEncoding,
+      "--batch-size",
+      "256"
+    ], {
       windowsHide: true,
       timeout: Math.max(30000, files.length * 250),
-      maxBuffer: 512 * 1024 * 1024
+      maxBuffer: 16 * 1024 * 1024
     });
-    const parsed = JSON.parse(stdout) as {
+    const outputText = await fs.readFile(outputPath, "utf8");
+    const outputBytes = (await fs.stat(outputPath)).size;
+    const parsed = JSON.parse(outputText) as {
       files: FileAnalysis[];
       diagnostics?: ParserDiagnostic[];
       metrics?: Record<string, number>;
@@ -62,7 +78,11 @@ export async function analyzeFilesWithRustSidecar(
         rustReadMaskDeclarationScan: parsed.metrics?.readMaskDeclarationScan ?? 0,
         rustSymbolMap: parsed.metrics?.symbolMap ?? 0,
         rustAccessAnalysis: parsed.metrics?.accessAnalysis ?? 0,
-        rustTotalNative: parsed.metrics?.totalNative ?? 0
+        rustTotalNative: parsed.metrics?.totalNative ?? 0,
+        rustFileCount: parsed.metrics?.fileCount ?? files.length,
+        rustBatchSize: parsed.metrics?.batchSize ?? 256,
+        rustOutputBytes: parsed.metrics?.outputBytes ?? outputBytes,
+        rustPeakRssBytes: parsed.metrics?.peakRssBytes ?? 0
       }
     };
   } catch (error) {
@@ -74,6 +94,7 @@ export async function analyzeFilesWithRustSidecar(
     throw error;
   } finally {
     await fs.rm(listPath, { force: true }).catch(() => undefined);
+    await fs.rm(outputPath, { force: true }).catch(() => undefined);
   }
 }
 
