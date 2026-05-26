@@ -140,6 +140,34 @@ describe("Rust native impact index", () => {
     );
   });
 
+  it("keeps member impact unresolved evidence scoped to exact target or direct parent", async () => {
+    const sample2 = await createSample2ImpactFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: sample2.root,
+      projectFile: sample2.projectFile,
+      threadMapFile: sample2.threadMapFile,
+      maxIndexWorkers: 1
+    });
+    const impact = buildImpact(index, "PTR_GBL->sub3.sample_value1");
+    const unresolvedNames = impact.unresolved.map((item) => item.variableName);
+    const unresolvedEvidence = impact.unresolved.map((item) => item.evidence);
+
+    expect(impact.symbolKind).toBe("member");
+    expect(impact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variableName: "PTR_GBL->sub3.sample_value1", kind: "read" }),
+        expect.objectContaining({ variableName: "PTR_GBL->sub3.sample_value1", kind: "write" })
+      ])
+    );
+    expect(unresolvedNames).toContain("PTR_GBL->sub3");
+    expect(unresolvedEvidence).toContain("thread_sub1ptr(&PTR_GBL->sub3);");
+    expect(unresolvedNames).not.toContain("subLocal");
+    expect(unresolvedNames).not.toContain("PTR_GBL->sub2.sample_value2");
+    expect(unresolvedNames).not.toContain("PTR_GBL->sub3.sample_value3");
+    expect(unresolvedEvidence).not.toContain("PTR_GBL->sub4.subsub_ptr = &subLocal;");
+    expect(unresolvedEvidence).not.toContain("subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;");
+  });
+
   it("keeps unresolved typed pointer member access as review evidence", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
     const unresolved = index.functions.PointerMemberUnknown.unresolved;
@@ -238,4 +266,87 @@ async function copyFixtureToTemp(): Promise<string> {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-fixture-"));
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
+}
+
+async function createSample2ImpactFixture(): Promise<{ root: string; projectFile: string; threadMapFile: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-sample2-impact-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  const projectFile = path.join(root, "sample2_base.dsw");
+  const threadMapFile = path.join(root, "thread-map.json");
+  await fs.writeFile(
+    projectFile,
+    'Microsoft Developer Studio Workspace File, Format Version 6.00\r\nProject: "sample2_base"=".\\sample2_base.dsp" - Package Owner=<4>\r\n',
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "sample2_base.dsp"),
+    [
+      '# Microsoft Developer Studio Project File - Name="sample2_base" - Package Owner=<4>',
+      '# ADD CPP /nologo /W3 /I ".\\src" /D "WIN32" /D "PERF_SAMPLE2_BASE" /D "_DEBUG" /c',
+      '# Begin Source File',
+      'SOURCE=.\\src\\main.c',
+      '# End Source File',
+      '# Begin Source File',
+      'SOURCE=.\\src\\header.h',
+      '# End Source File',
+      '# Begin Source File',
+      'SOURCE=.\\src\\api.c',
+      '# End Source File',
+      ''
+    ].join("\r\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    threadMapFile,
+    JSON.stringify({
+      threads: [
+        { threadId: "main", entryFunction: "thread_main_entry" },
+        { threadId: "worker3", entryFunction: "thread3_entry", isInterruptLike: true }
+      ]
+    }),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "header.h"),
+    [
+      "typedef struct tagSampleSubSub { int sample_value1; int sample_value2; int sample_value3; } SAMPLE_SUBSUB;",
+      "typedef struct tagSampleSub4 { SAMPLE_SUBSUB *subsub_ptr; } SAMPLE_SUB4;",
+      "typedef struct tagSampleMain { SAMPLE_SUBSUB sub1; SAMPLE_SUBSUB sub2; SAMPLE_SUBSUB sub3; SAMPLE_SUB4 sub4; } SAMPLE_MAIN;",
+      "typedef struct tagSampleSubPtr { int *sample_value1; int *sample_value2; int *sample_value3; } SAMPLE_SUBPTR;",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "api.c"),
+    [
+      '#include "header.h"',
+      "extern SAMPLE_MAIN* PTR_GBL;",
+      "int api_major3_sub1(int minor) { return PTR_GBL->sub3.sample_value1 + minor; }",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "main.c"),
+    [
+      '#include "header.h"',
+      "SAMPLE_SUBSUB subLocal = {0};",
+      "SAMPLE_MAIN* PTR_GBL = 0;",
+      "void thread_sub1ptr(SAMPLE_SUBSUB *ptr) { ptr->sample_value1++; }",
+      "void thread_main_entry(void) {",
+      "    SAMPLE_SUBPTR subPtr;",
+      "    PTR_GBL->sub4.subsub_ptr = &subLocal;",
+      "    subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;",
+      "    subPtr.sample_value3 = &PTR_GBL->sub3.sample_value3;",
+      "    PTR_GBL->sub3.sample_value1++;",
+      "}",
+      "void thread3_entry(void) {",
+      "    thread_sub1ptr(&PTR_GBL->sub3);",
+      "}",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  return { root, projectFile, threadMapFile };
 }

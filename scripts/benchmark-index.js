@@ -18,6 +18,16 @@ const samples = {
     root: "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample",
     project: "large_sample.dsw",
     threadMap: "thread-map.json"
+  },
+  "sample2-base": {
+    root: "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample2-base",
+    project: "sample2_base.dsw",
+    threadMap: "thread-map.json"
+  },
+  "sample2-scale": {
+    root: "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample2-scale-7000",
+    project: "sample2_scale.dsw",
+    threadMap: "thread-map.json"
   }
 };
 
@@ -36,7 +46,7 @@ async function main() {
     maxIndexWorkers: args.workers === undefined ? 0 : Number(args.workers)
   });
   const memory = process.memoryUsage();
-  console.log(JSON.stringify({
+  const report = {
     sample: args.sample || "small",
     parserEngine: "rust-native",
     wallMs: Math.round(performance.now() - started),
@@ -56,7 +66,13 @@ async function main() {
     reachability: Object.keys(index.threadReachability).length,
     rssMb: Math.round(memory.rss / 1024 / 1024),
     heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024)
-  }, null, 2));
+  };
+  const text = `${JSON.stringify(report, null, 2)}\n`;
+  if (args.output) {
+    await fs.mkdir(path.dirname(path.resolve(args.output)), { recursive: true });
+    await fs.writeFile(args.output, text, "utf8");
+  }
+  console.log(text.trimEnd());
 }
 
 function roundMb(bytes) {
@@ -72,6 +88,8 @@ function parseArgs(argv) {
       result.sample = argv[++index];
     } else if (arg === "--workers") {
       result.workers = argv[++index];
+    } else if (arg === "--output") {
+      result.output = argv[++index];
     } else if (!arg.startsWith("-")) {
       positional.push(arg);
     }

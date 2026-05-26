@@ -135,6 +135,7 @@ struct FileSummary {
     struct_types: Vec<StructTypeInfo>,
     macro_definitions: Vec<MacroDefinition>,
     functions: Vec<FunctionSummary>,
+    parameter_member_accesses: HashMap<String, Vec<ParameterMemberAccessTemplate>>,
     unresolved: Vec<UnresolvedEvidence>,
     decode_info: DecodeInfo,
 }
@@ -226,11 +227,20 @@ enum SourceEncoding {
 struct NativeContext {
     global_names: HashSet<String>,
     function_name_map: HashMap<String, Vec<String>>,
+    parameter_member_accesses: HashMap<String, Vec<ParameterMemberAccessTemplate>>,
     struct_types: HashMap<String, StructTypeInfo>,
     global_types: HashMap<String, GlobalTypeInfo>,
     known_type_names: Vec<String>,
     known_member_names: HashSet<String>,
     macro_aliases: HashMap<String, Vec<MacroAliasInfo>>,
+}
+
+#[derive(Clone)]
+struct ParameterMemberAccessTemplate {
+    parameter_index: usize,
+    member_path: Vec<String>,
+    kind: String,
+    member_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -264,6 +274,7 @@ struct MemberExpression {
     owner_name: String,
     owner_indexed: bool,
     first_connector: String,
+    connectors: Vec<String>,
     member_path: Vec<String>,
     start: usize,
     end: usize,
@@ -278,21 +289,34 @@ struct ResolvedMemberExpression {
     unresolved_note: String,
 }
 
-static DEFINE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*#\s*define\s+([A-Za-z_]\w*)(\s*\([^)]*\))?\s*(.*)$").unwrap());
+struct DirectCall {
+    name: String,
+    arguments: Vec<String>,
+}
+
+static DEFINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*#\s*define\s+([A-Za-z_]\w*)(\s*\([^)]*\))?\s*(.*)$").unwrap()
+});
 static TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:struct|class)\s+([A-Za-z_]\w*)").unwrap());
 static TYPEDEF_ALIAS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$").unwrap());
-static MEMBER_DECLARATOR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:\*|\s|^)([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*(?::\s*\d+)?$").unwrap());
-static FUNCTION_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([~A-Za-z_]\w*(?:::[~A-Za-z_]\w*)?)\s*\([^(){};]*\)\s*(?:const)?\s*$").unwrap());
+static MEMBER_DECLARATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\*|\s|^)([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*(?::\s*\d+)?$").unwrap()
+});
+static FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([~A-Za-z_]\w*(?:::[~A-Za-z_]\w*)?)\s*\([^(){};]*\)\s*(?:const)?\s*$").unwrap()
+});
 static GLOBAL_DECLARATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:\*|\s|^)([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*$").unwrap());
 static INLINE_ASM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(__asm|asm)\b").unwrap());
 static FUNCTION_POINTER_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(\s*\*\s*[A-Za-z_]\w*\s*\)\s*\(").unwrap());
+static FUNCTION_POINTER_TABLE_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\[[^\]]*\]\s*\)\s*\([^;{}]*\)\s*=").unwrap()
+});
+static ADDRESS_OF_FUNCTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"&\s*([A-Za-z_]\w*)").unwrap());
 static POINTER_WRITE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\*\s*[A-Za-z_]\w*\s*=").unwrap());
 
@@ -301,19 +325,23 @@ fn main() -> Result<(), String> {
     if args.len() == 3 && args[1] == "scan-file" {
         let file = normalize_path(&args[2]);
         let structure = scan_file(&file, true, SourceEncoding::Auto)?;
-        serde_json::to_writer(std::io::stdout().lock(), &structure).map_err(|error| error.to_string())?;
+        serde_json::to_writer(std::io::stdout().lock(), &structure)
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     if args.len() == 3 && args[1] == "scan-many" {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
-        let files: Vec<String> = serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
+        let files: Vec<String> =
+            serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
         let structures = scan_many(files, None, false, SourceEncoding::Auto)?;
-        serde_json::to_writer(std::io::stdout().lock(), &structures).map_err(|error| error.to_string())?;
+        serde_json::to_writer(std::io::stdout().lock(), &structures)
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "analyze-many" {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
-        let files: Vec<String> = serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
+        let files: Vec<String> =
+            serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
         let options = parse_analyze_options(&args[3..])?;
         if options.legacy_in_memory {
             let output = options.output.clone();
@@ -340,11 +368,18 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
     while index < args.len() {
         match args[index].as_str() {
             "--workers" => {
-                let value = args.get(index + 1).ok_or_else(|| "--workers requires a value".to_string())?;
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--workers requires a value".to_string())?;
                 options.workers = if value.eq_ignore_ascii_case("auto") || value == "0" {
                     None
                 } else {
-                    Some(value.parse::<usize>().map_err(|_| format!("invalid --workers value: {value}"))?.max(1))
+                    Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid --workers value: {value}"))?
+                            .max(1),
+                    )
                 };
                 index += 2;
             }
@@ -353,16 +388,27 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
                 index += 1;
             }
             "--output" => {
-                options.output = Some(args.get(index + 1).ok_or_else(|| "--output requires a value".to_string())?.clone());
+                options.output = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--output requires a value".to_string())?
+                        .clone(),
+                );
                 index += 2;
             }
             "--batch-size" => {
-                let value = args.get(index + 1).ok_or_else(|| "--batch-size requires a value".to_string())?;
-                options.batch_size = value.parse::<usize>().map_err(|_| format!("invalid --batch-size value: {value}"))?.max(1);
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--batch-size requires a value".to_string())?;
+                options.batch_size = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --batch-size value: {value}"))?
+                    .max(1);
                 index += 2;
             }
             "--encoding" => {
-                let value = args.get(index + 1).ok_or_else(|| "--encoding requires a value".to_string())?;
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--encoding requires a value".to_string())?;
                 options.encoding = parse_source_encoding(value)?;
                 index += 2;
             }
@@ -406,7 +452,10 @@ fn scan_many(
             thread::spawn(move || -> Result<Vec<(usize, FileStructure)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
-                    results.push((index, scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?));
+                    results.push((
+                        index,
+                        scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?,
+                    ));
                 }
                 Ok(results)
             })
@@ -414,10 +463,17 @@ fn scan_many(
         .collect();
     let mut indexed = Vec::new();
     for handle in handles {
-        indexed.extend(handle.join().map_err(|_| "rust sidecar worker panicked".to_string())??);
+        indexed.extend(
+            handle
+                .join()
+                .map_err(|_| "rust sidecar worker panicked".to_string())??,
+        );
     }
     indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed.into_iter().map(|(_, structure)| structure).collect())
+    Ok(indexed
+        .into_iter()
+        .map(|(_, structure)| structure)
+        .collect())
 }
 
 fn scan_many_summaries(
@@ -441,7 +497,14 @@ fn scan_many_summaries(
             thread::spawn(move || -> Result<Vec<(usize, FileSummary)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
-                    results.push((index, scan_file_summary(&normalize_path(&file), tree_sitter_diagnostics, encoding)?));
+                    results.push((
+                        index,
+                        scan_file_summary(
+                            &normalize_path(&file),
+                            tree_sitter_diagnostics,
+                            encoding,
+                        )?,
+                    ));
                 }
                 Ok(results)
             })
@@ -449,7 +512,11 @@ fn scan_many_summaries(
         .collect();
     let mut indexed = Vec::new();
     for handle in handles {
-        indexed.extend(handle.join().map_err(|_| "rust sidecar summary worker panicked".to_string())??);
+        indexed.extend(
+            handle
+                .join()
+                .map_err(|_| "rust sidecar summary worker panicked".to_string())??,
+        );
     }
     indexed.sort_by_key(|(index, _)| *index);
     Ok(indexed.into_iter().map(|(_, summary)| summary).collect())
@@ -476,22 +543,42 @@ fn current_rss_bytes() -> Option<u128> {
     system.process(pid).map(|process| process.memory() as u128)
 }
 
-fn analyze_many_legacy(files: Vec<String>, options: AnalyzeOptions) -> Result<NativeAnalysisResult, String> {
+fn analyze_many_legacy(
+    files: Vec<String>,
+    options: AnalyzeOptions,
+) -> Result<NativeAnalysisResult, String> {
     let total_started = Instant::now();
     let worker_count = effective_worker_count(files.len(), options.workers);
     let mut metrics = HashMap::new();
     let scan_started = Instant::now();
-    let structures = scan_many(files, Some(worker_count), options.tree_sitter_diagnostics, options.encoding)?;
-    metrics.insert("readMaskDeclarationScan".to_string(), scan_started.elapsed().as_millis());
+    let structures = scan_many(
+        files,
+        Some(worker_count),
+        options.tree_sitter_diagnostics,
+        options.encoding,
+    )?;
+    metrics.insert(
+        "readMaskDeclarationScan".to_string(),
+        scan_started.elapsed().as_millis(),
+    );
 
     let symbol_started = Instant::now();
     let context = build_native_context(&structures);
-    metrics.insert("symbolMap".to_string(), symbol_started.elapsed().as_millis());
+    metrics.insert(
+        "symbolMap".to_string(),
+        symbol_started.elapsed().as_millis(),
+    );
 
     let access_started = Instant::now();
     let files = analyze_structures(structures, &context, worker_count)?;
-    metrics.insert("accessAnalysis".to_string(), access_started.elapsed().as_millis());
-    metrics.insert("totalNative".to_string(), total_started.elapsed().as_millis());
+    metrics.insert(
+        "accessAnalysis".to_string(),
+        access_started.elapsed().as_millis(),
+    );
+    metrics.insert(
+        "totalNative".to_string(),
+        total_started.elapsed().as_millis(),
+    );
 
     Ok(NativeAnalysisResult {
         files,
@@ -499,7 +586,9 @@ fn analyze_many_legacy(files: Vec<String>, options: AnalyzeOptions) -> Result<Na
             backend: "rust".to_string(),
             file: None,
             severity: "info".to_string(),
-            message: format!("legacy in-memory analyze-many completed with {worker_count} worker(s)"),
+            message: format!(
+                "legacy in-memory analyze-many completed with {worker_count} worker(s)"
+            ),
         }],
         metrics,
         worker_count,
@@ -554,12 +643,18 @@ fn analyze_many_low_memory_to_writer<W: Write>(
         options.encoding,
     )?;
     peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
-    metrics.insert("readMaskDeclarationScan".to_string(), scan_started.elapsed().as_millis());
+    metrics.insert(
+        "readMaskDeclarationScan".to_string(),
+        scan_started.elapsed().as_millis(),
+    );
 
     let symbol_started = Instant::now();
     let context = build_native_context_from_summaries(&summaries);
     peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
-    metrics.insert("symbolMap".to_string(), symbol_started.elapsed().as_millis());
+    metrics.insert(
+        "symbolMap".to_string(),
+        symbol_started.elapsed().as_millis(),
+    );
 
     let mut diagnostics = encoding_diagnostics(&summaries);
     diagnostics.insert(0, ParserDiagnostic {
@@ -571,7 +666,9 @@ fn analyze_many_low_memory_to_writer<W: Write>(
 
     let access_started = Instant::now();
     let mut counting = CountingWriter::new(writer);
-    counting.write_all(b"{\"files\":[").map_err(|error| error.to_string())?;
+    counting
+        .write_all(b"{\"files\":[")
+        .map_err(|error| error.to_string())?;
     let mut first_file = true;
     for batch in files.chunks(batch_size) {
         let structures = scan_many(
@@ -583,21 +680,33 @@ fn analyze_many_low_memory_to_writer<W: Write>(
         let analyses = analyze_structures(structures, &context, worker_count)?;
         for analysis in analyses {
             if !first_file {
-                counting.write_all(b",").map_err(|error| error.to_string())?;
+                counting
+                    .write_all(b",")
+                    .map_err(|error| error.to_string())?;
             }
             serde_json::to_writer(&mut counting, &analysis).map_err(|error| error.to_string())?;
             first_file = false;
         }
         peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
     }
-    metrics.insert("accessAnalysis".to_string(), access_started.elapsed().as_millis());
-    metrics.insert("totalNative".to_string(), total_started.elapsed().as_millis());
+    metrics.insert(
+        "accessAnalysis".to_string(),
+        access_started.elapsed().as_millis(),
+    );
+    metrics.insert(
+        "totalNative".to_string(),
+        total_started.elapsed().as_millis(),
+    );
     metrics.insert("peakRssBytes".to_string(), peak_rss);
     metrics.insert("outputBytes".to_string(), counting.bytes_written() as u128);
 
-    counting.write_all(b"],\"diagnostics\":").map_err(|error| error.to_string())?;
+    counting
+        .write_all(b"],\"diagnostics\":")
+        .map_err(|error| error.to_string())?;
     serde_json::to_writer(&mut counting, &diagnostics).map_err(|error| error.to_string())?;
-    counting.write_all(b",\"metrics\":").map_err(|error| error.to_string())?;
+    counting
+        .write_all(b",\"metrics\":")
+        .map_err(|error| error.to_string())?;
     serde_json::to_writer(&mut counting, &metrics).map_err(|error| error.to_string())?;
     counting
         .write_all(format!(",\"workerCount\":{worker_count}}}").as_bytes())
@@ -643,7 +752,8 @@ fn analyze_structures(
     if structures.is_empty() {
         return Ok(Vec::new());
     }
-    let mut chunks: Vec<Vec<(usize, FileStructure)>> = vec![Vec::new(); worker_count.max(1).min(structures.len())];
+    let mut chunks: Vec<Vec<(usize, FileStructure)>> =
+        vec![Vec::new(); worker_count.max(1).min(structures.len())];
     for (index, structure) in structures.into_iter().enumerate() {
         let target = index % chunks.len();
         chunks[target].push((index, structure));
@@ -656,14 +766,20 @@ fn analyze_structures(
                 scope.spawn(move || -> Vec<(usize, FileAnalysis)> {
                     chunk
                         .into_iter()
-                        .map(|(index, structure)| (index, analyze_file_structure_native(structure, context)))
+                        .map(|(index, structure)| {
+                            (index, analyze_file_structure_native(structure, context))
+                        })
                         .collect()
                 })
             })
             .collect();
         let mut indexed = Vec::new();
         for handle in handles {
-            indexed.extend(handle.join().map_err(|_| "rust native analysis worker panicked".to_string())?);
+            indexed.extend(
+                handle
+                    .join()
+                    .map_err(|_| "rust native analysis worker panicked".to_string())?,
+            );
         }
         indexed.sort_by_key(|(index, _)| *index);
         Ok(indexed.into_iter().map(|(_, file)| file).collect())
@@ -722,8 +838,13 @@ fn build_native_context(files: &[FileStructure]) -> NativeContext {
     let member_symbols = build_member_symbol_names(&global_types, &struct_types);
     for file in files {
         for definition in &file.macro_definitions {
-            if let Some(alias) = resolve_macro_alias_native(definition, &global_names, &member_symbols) {
-                macro_aliases.entry(alias.name.clone()).or_default().push(alias);
+            if let Some(alias) =
+                resolve_macro_alias_native(definition, &global_names, &member_symbols)
+            {
+                macro_aliases
+                    .entry(alias.name.clone())
+                    .or_default()
+                    .push(alias);
             }
         }
     }
@@ -731,15 +852,19 @@ fn build_native_context(files: &[FileStructure]) -> NativeContext {
     let mut known_type_names: Vec<String> = struct_types.keys().cloned().collect();
     known_type_names.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
 
-    NativeContext {
+    let mut context = NativeContext {
         global_names,
         function_name_map,
+        parameter_member_accesses: HashMap::new(),
         struct_types,
         global_types,
         known_type_names,
         known_member_names,
         macro_aliases,
-    }
+    };
+    context.parameter_member_accesses =
+        build_parameter_member_access_templates_from_structures(files);
+    context
 }
 
 fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
@@ -772,6 +897,15 @@ fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
     for names in function_name_map.values_mut() {
         names.sort();
     }
+    let mut parameter_member_accesses: HashMap<String, Vec<ParameterMemberAccessTemplate>> =
+        HashMap::new();
+    for file in files {
+        for (function_name, templates) in &file.parameter_member_accesses {
+            parameter_member_accesses
+                .entry(function_name.clone())
+                .or_insert_with(|| templates.clone());
+        }
+    }
 
     let mut global_types = HashMap::new();
     for file in files {
@@ -794,8 +928,13 @@ fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
     let member_symbols = build_member_symbol_names(&global_types, &struct_types);
     for file in files {
         for definition in &file.macro_definitions {
-            if let Some(alias) = resolve_macro_alias_native(definition, &global_names, &member_symbols) {
-                macro_aliases.entry(alias.name.clone()).or_default().push(alias);
+            if let Some(alias) =
+                resolve_macro_alias_native(definition, &global_names, &member_symbols)
+            {
+                macro_aliases
+                    .entry(alias.name.clone())
+                    .or_default()
+                    .push(alias);
             }
         }
     }
@@ -806,12 +945,95 @@ fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
     NativeContext {
         global_names,
         function_name_map,
+        parameter_member_accesses,
         struct_types,
         global_types,
         known_type_names,
         known_member_names,
         macro_aliases,
     }
+}
+
+fn build_parameter_member_access_templates_from_structures(
+    files: &[FileStructure],
+) -> HashMap<String, Vec<ParameterMemberAccessTemplate>> {
+    let mut templates = HashMap::new();
+    for file in files {
+        let file_templates =
+            build_parameter_member_access_templates_from_functions(&file.functions);
+        for (function_name, items) in file_templates {
+            templates.entry(function_name).or_insert(items);
+        }
+    }
+    templates
+}
+
+fn build_parameter_member_access_templates_from_functions(
+    functions: &[FunctionStructure],
+) -> HashMap<String, Vec<ParameterMemberAccessTemplate>> {
+    let mut result = HashMap::new();
+    for function in functions {
+        let parameter_names = parameter_names_from_signature(&function.signature);
+        if parameter_names.is_empty() {
+            continue;
+        }
+        let parameter_index_by_name: HashMap<String, usize> = parameter_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect();
+        let mut function_templates = Vec::new();
+        for body_line in &function.body_lines {
+            for expression in extract_member_expressions(&body_line.masked) {
+                let Some(parameter_index) =
+                    parameter_index_by_name.get(&expression.owner_name).copied()
+                else {
+                    continue;
+                };
+                let (kind, _) = classify_access(&body_line.masked, &expression.expression);
+                let member_path = expression.member_path.clone();
+                function_templates.push(ParameterMemberAccessTemplate {
+                    parameter_index,
+                    member_path,
+                    kind,
+                    member_name: expression.member_path.last().cloned(),
+                });
+            }
+        }
+        if !function_templates.is_empty() {
+            result.insert(function.name.clone(), function_templates);
+        }
+    }
+    result
+}
+
+fn parameter_names_from_signature(signature: &str) -> Vec<String> {
+    let Some(start) = signature.find('(') else {
+        return Vec::new();
+    };
+    let Some(end) = signature.rfind(')') else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let params = signature[start + 1..end].trim();
+    if params.is_empty() || params == "void" {
+        return Vec::new();
+    }
+    split_top_level_commas(params)
+        .into_iter()
+        .filter_map(|param| {
+            let declarator = param.split('=').next().unwrap_or("").trim();
+            identifiers(declarator)
+                .into_iter()
+                .filter(|name| {
+                    !is_keyword(name)
+                        && !matches!(name.as_str(), "const" | "volatile" | "register" | "static")
+                })
+                .last()
+        })
+        .collect()
 }
 
 fn encoding_diagnostics(summaries: &[FileSummary]) -> Vec<ParserDiagnostic> {
@@ -834,14 +1056,20 @@ fn encoding_diagnostics(summaries: &[FileSummary]) -> Vec<ParserDiagnostic> {
         backend: "rust".to_string(),
         file: None,
         severity: "info".to_string(),
-        message: format!("source encoding usage: {usage}; lossy={}", lossy_files.len()),
+        message: format!(
+            "source encoding usage: {usage}; lossy={}",
+            lossy_files.len()
+        ),
     }];
     if let Some(first_lossy) = lossy_files.first() {
         diagnostics.push(ParserDiagnostic {
             backend: "rust".to_string(),
             file: Some(first_lossy.clone()),
             severity: "warning".to_string(),
-            message: format!("{} source file(s) required lossy CP932 decoding", lossy_files.len()),
+            message: format!(
+                "{} source file(s) required lossy CP932 decoding",
+                lossy_files.len()
+            ),
         });
     }
     diagnostics
@@ -858,8 +1086,33 @@ fn build_member_symbol_names(
         } else {
             global_type.global.name.clone()
         };
-        let separator = if global_type.global.pointer_level.unwrap_or(0) > 0 { "->" } else { "." };
-        append_member_symbol_names(&mut symbols, &owner_name, separator, "", &global_type.type_info, struct_types, 0);
+        let separator = if global_type.global.pointer_level.unwrap_or(0) > 0 {
+            "->"
+        } else {
+            "."
+        };
+        append_member_symbol_names(
+            &mut symbols,
+            &owner_name,
+            separator,
+            "",
+            &global_type.type_info,
+            struct_types,
+            0,
+        );
+        if global_type.global.pointer_level.unwrap_or(0) > 0
+            && !global_type.global.is_array.unwrap_or(false)
+        {
+            append_member_symbol_names(
+                &mut symbols,
+                &format!("{}[]", global_type.global.name),
+                "->",
+                "",
+                &global_type.type_info,
+                struct_types,
+                0,
+            );
+        }
     }
     symbols
 }
@@ -884,8 +1137,20 @@ fn append_member_symbol_names(
         };
         symbols.insert(format!("{owner_name}{separator}{member_path}"));
         if member.pointer_level.unwrap_or(0) == 0 {
-            if let Some(nested_type) = member.type_name.as_ref().and_then(|type_name| struct_types.get(type_name)) {
-                append_member_symbol_names(symbols, owner_name, separator, &member_path, nested_type, struct_types, depth + 1);
+            if let Some(nested_type) = member
+                .type_name
+                .as_ref()
+                .and_then(|type_name| struct_types.get(type_name))
+            {
+                append_member_symbol_names(
+                    symbols,
+                    owner_name,
+                    separator,
+                    &member_path,
+                    nested_type,
+                    struct_types,
+                    depth + 1,
+                );
             }
         }
     }
@@ -896,14 +1161,23 @@ fn resolve_macro_alias_native(
     global_names: &HashSet<String>,
     member_symbols: &HashSet<String>,
 ) -> Option<MacroAliasInfo> {
-    if definition.is_function_like || definition.replacement.is_empty() || is_header_guard_macro(definition) {
+    if definition.is_function_like
+        || definition.replacement.is_empty()
+        || is_header_guard_macro(definition)
+    {
         return None;
     }
     let replacement = definition.replacement.trim();
     if !is_simple_macro_replacement(replacement) {
         return None;
     }
-    if !global_names.contains(replacement) && !member_symbols.contains(replacement) && replacement.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+    if !global_names.contains(replacement)
+        && !member_symbols.contains(replacement)
+        && replacement
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+    {
         return None;
     }
     Some(MacroAliasInfo {
@@ -912,7 +1186,10 @@ fn resolve_macro_alias_native(
     })
 }
 
-fn analyze_file_structure_native(structure: FileStructure, context: &NativeContext) -> FileAnalysis {
+fn analyze_file_structure_native(
+    structure: FileStructure,
+    context: &NativeContext,
+) -> FileAnalysis {
     let functions = structure
         .functions
         .iter()
@@ -936,6 +1213,7 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
     let mut local_types = parse_function_parameter_types(&func.signature, context);
     let mut pointer_aliases: HashMap<String, PointerAlias> = HashMap::new();
     let mut ambiguous_aliases: HashSet<String> = HashSet::new();
+    let function_pointer_tables = local_function_pointer_tables(func, context);
 
     for body_line in &func.body_lines {
         let expansion = expand_macro_line(&body_line.masked, context);
@@ -987,7 +1265,13 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
         }
 
         for expression in &member_expressions {
-            let Some(resolved) = resolve_member_expression(expression, context, &local_types, &pointer_aliases, &ambiguous_aliases) else {
+            let Some(resolved) = resolve_member_expression(
+                expression,
+                context,
+                &local_types,
+                &pointer_aliases,
+                &ambiguous_aliases,
+            ) else {
                 continue;
             };
             let (kind, reasons) = classify_access(&masked, &expression.expression);
@@ -1035,7 +1319,9 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
         }
 
         for variable_name in identifiers(&masked) {
-            if !context.global_names.contains(&variable_name) || !contains_word(&masked_without_members, &variable_name) {
+            if !context.global_names.contains(&variable_name)
+                || !contains_word(&masked_without_members, &variable_name)
+            {
                 continue;
             }
             let (kind, reasons) = classify_access(&masked_without_members, &variable_name);
@@ -1067,6 +1353,51 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
             }
         }
 
+        for direct_call in direct_calls(&masked) {
+            let Some(functions) = context.function_name_map.get(&direct_call.name) else {
+                continue;
+            };
+            for function_name in functions {
+                if function_name == &func.name {
+                    continue;
+                }
+                let Some(templates) = context.parameter_member_accesses.get(function_name) else {
+                    continue;
+                };
+                for template in templates {
+                    let Some(argument) = direct_call.arguments.get(template.parameter_index) else {
+                        continue;
+                    };
+                    let Some((owner_name, first_connector)) = resolve_call_argument_owner(
+                        argument,
+                        context,
+                        &local_types,
+                        &pointer_aliases,
+                        &ambiguous_aliases,
+                    ) else {
+                        continue;
+                    };
+                    let target_name =
+                        append_member_path(&owner_name, &first_connector, &template.member_path);
+                    accesses.push(VariableAccess {
+                        variable_name: target_name.clone(),
+                        target_name: Some(target_name.clone()),
+                        target_kind: Some("member".to_string()),
+                        function_name: func.name.clone(),
+                        kind: template.kind.clone(),
+                        location: location(&func.file, body_line.line, raw),
+                        evidence: raw.trim().to_string(),
+                        expanded_evidence: expanded_evidence(raw, &masked),
+                        reasons: vec!["call-argument-alias".to_string()],
+                        owner_name: Some(owner_name),
+                        member_name: template.member_name.clone(),
+                        access_expression: Some(argument.trim().to_string()),
+                        macro_names: macro_names_option(&macro_names),
+                    });
+                }
+            }
+        }
+
         for simple_name in call_identifiers(&masked) {
             if let Some(functions) = context.function_name_map.get(&simple_name) {
                 for function_name in functions {
@@ -1074,6 +1405,12 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                         calls.insert(function_name.clone());
                     }
                 }
+            }
+        }
+        for function_name in function_pointer_table_call_targets(&masked, &function_pointer_tables)
+        {
+            if function_name != func.name {
+                calls.insert(function_name);
             }
         }
     }
@@ -1090,6 +1427,101 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
         accesses,
         unresolved,
     }
+}
+
+fn local_function_pointer_tables(
+    func: &FunctionStructure,
+    context: &NativeContext,
+) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    let mut active: Option<(String, Vec<String>)> = None;
+    for body_line in &func.body_lines {
+        let line = body_line.masked.as_str();
+        if let Some((name, targets)) = active.as_mut() {
+            targets.extend(addressed_known_functions(line, context));
+            if line.contains(';') {
+                let mut completed = Vec::new();
+                std::mem::swap(targets, &mut completed);
+                result.insert(name.clone(), unique(completed));
+                active = None;
+            }
+            continue;
+        }
+        let Some(captures) = FUNCTION_POINTER_TABLE_DECL_RE.captures(line) else {
+            continue;
+        };
+        let Some(name) = captures.get(1).map(|item| item.as_str().to_string()) else {
+            continue;
+        };
+        let initializer = captures
+            .get(0)
+            .map(|item| &line[item.end()..])
+            .unwrap_or("");
+        let mut targets = addressed_known_functions(initializer, context);
+        if initializer.contains(';') {
+            result.insert(name, unique(targets));
+        } else {
+            active = Some((name, {
+                let mut seed = Vec::new();
+                std::mem::swap(&mut targets, &mut seed);
+                seed
+            }));
+        }
+    }
+    result.retain(|_, targets| !targets.is_empty());
+    result
+}
+
+fn addressed_known_functions(text: &str, context: &NativeContext) -> Vec<String> {
+    let mut result = Vec::new();
+    for captures in ADDRESS_OF_FUNCTION_RE.captures_iter(text) {
+        let Some(simple_name) = captures.get(1).map(|item| item.as_str()) else {
+            continue;
+        };
+        if let Some(functions) = context.function_name_map.get(simple_name) {
+            result.extend(functions.iter().cloned());
+        }
+    }
+    result
+}
+
+fn function_pointer_table_call_targets(
+    line: &str,
+    tables: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut result = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !is_ident_start(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < bytes.len() && is_ident_continue(bytes[index]) {
+            index += 1;
+        }
+        let name = &line[start..index];
+        let Some(targets) = tables.get(name) else {
+            continue;
+        };
+        let mut lookahead = index;
+        skip_ascii_space(line, &mut lookahead);
+        if lookahead >= bytes.len() || bytes[lookahead] != b'[' {
+            continue;
+        }
+        let close_bracket = skip_bracket(line, lookahead);
+        if close_bracket <= lookahead + 1 || close_bracket > line.len() {
+            continue;
+        }
+        lookahead = close_bracket;
+        skip_ascii_space(line, &mut lookahead);
+        if lookahead < bytes.len() && bytes[lookahead] == b'(' {
+            result.extend(targets.iter().cloned());
+        }
+    }
+    unique(result)
 }
 
 fn is_header_guard_macro(definition: &MacroDefinition) -> bool {
@@ -1178,7 +1610,10 @@ fn replace_word(line: &str, word: &str, replacement: &str) -> String {
     output
 }
 
-fn parse_function_parameter_types(signature: &str, context: &NativeContext) -> HashMap<String, LocalTypeInfo> {
+fn parse_function_parameter_types(
+    signature: &str,
+    context: &NativeContext,
+) -> HashMap<String, LocalTypeInfo> {
     let mut local_types = HashMap::new();
     let Some(start) = signature.find('(') else {
         return local_types;
@@ -1215,7 +1650,9 @@ fn register_local_types_and_aliases(
     ambiguous_aliases: &mut HashSet<String>,
 ) {
     for statement in line.split(';') {
-        if let Some((name, type_name, pointer_level, initializer)) = parse_typed_declarator(statement, context) {
+        if let Some((name, type_name, pointer_level, initializer)) =
+            parse_typed_declarator(statement, context)
+        {
             local_types.insert(
                 name.clone(),
                 LocalTypeInfo {
@@ -1238,7 +1675,10 @@ fn register_local_types_and_aliases(
         }
     }
 
-    let snapshot: Vec<(String, LocalTypeInfo)> = local_types.iter().map(|(name, info)| (name.clone(), info.clone())).collect();
+    let snapshot: Vec<(String, LocalTypeInfo)> = local_types
+        .iter()
+        .map(|(name, info)| (name.clone(), info.clone()))
+        .collect();
     for (name, local_type) in snapshot {
         if local_type.pointer_level == 0 {
             continue;
@@ -1259,7 +1699,10 @@ fn register_local_types_and_aliases(
     }
 }
 
-fn parse_typed_declarator(text: &str, context: &NativeContext) -> Option<(String, String, usize, Option<String>)> {
+fn parse_typed_declarator(
+    text: &str,
+    context: &NativeContext,
+) -> Option<(String, String, usize, Option<String>)> {
     let before_semicolon = text.split(';').next().unwrap_or("").trim();
     if before_semicolon.is_empty() {
         return None;
@@ -1271,9 +1714,12 @@ fn parse_typed_declarator(text: &str, context: &NativeContext) -> Option<(String
         };
         let before = compact[..type_pos].trim();
         if !before.is_empty()
-            && !before
-                .split_whitespace()
-                .all(|token| matches!(token, "const" | "volatile" | "static" | "register" | "struct" | "class"))
+            && !before.split_whitespace().all(|token| {
+                matches!(
+                    token,
+                    "const" | "volatile" | "static" | "register" | "struct" | "class"
+                )
+            })
         {
             continue;
         }
@@ -1288,7 +1734,9 @@ fn parse_typed_declarator(text: &str, context: &NativeContext) -> Option<(String
         let pointer_level = rest.chars().filter(|ch| *ch == '*').count();
         let mut index = 0usize;
         while index < rest.len()
-            && (rest.as_bytes()[index].is_ascii_whitespace() || rest.as_bytes()[index] == b'*' || rest.as_bytes()[index] == b'&')
+            && (rest.as_bytes()[index].is_ascii_whitespace()
+                || rest.as_bytes()[index] == b'*'
+                || rest.as_bytes()[index] == b'&')
         {
             index += 1;
         }
@@ -1299,7 +1747,12 @@ fn parse_typed_declarator(text: &str, context: &NativeContext) -> Option<(String
             }
             skip_ascii_space(rest, &mut index);
             if index == rest.len() && !is_keyword(&name) {
-                return Some((name, type_name.clone(), pointer_level, initializer.filter(|value| !value.is_empty())));
+                return Some((
+                    name,
+                    type_name.clone(),
+                    pointer_level,
+                    initializer.filter(|value| !value.is_empty()),
+                ));
             }
         }
     }
@@ -1314,7 +1767,9 @@ fn set_pointer_alias_from_initializer(
     pointer_aliases: &mut HashMap<String, PointerAlias>,
     ambiguous_aliases: &mut HashSet<String>,
 ) {
-    let Some(resolved) = resolve_pointer_initializer(initializer, expected_type_name, context, pointer_aliases) else {
+    let Some(resolved) =
+        resolve_pointer_initializer(initializer, expected_type_name, context, pointer_aliases)
+    else {
         pointer_aliases.remove(pointer_name);
         ambiguous_aliases.insert(pointer_name.to_string());
         return;
@@ -1354,7 +1809,11 @@ fn resolve_pointer_initializer(
                     } else {
                         name
                     },
-                    owner_type_name: global_type.global.type_name.clone().unwrap_or_else(|| expected_type_name.to_string()),
+                    owner_type_name: global_type
+                        .global
+                        .type_name
+                        .clone()
+                        .unwrap_or_else(|| expected_type_name.to_string()),
                     is_array_owner: global_type.global.is_array.unwrap_or(false) || indexed,
                     pointer_owner: false,
                 });
@@ -1374,7 +1833,11 @@ fn resolve_pointer_initializer(
                 {
                     return Some(PointerAlias {
                         owner_name: source_name,
-                        owner_type_name: global_type.global.type_name.clone().unwrap_or_else(|| expected_type_name.to_string()),
+                        owner_type_name: global_type
+                            .global
+                            .type_name
+                            .clone()
+                            .unwrap_or_else(|| expected_type_name.to_string()),
                         is_array_owner: false,
                         pointer_owner: true,
                     });
@@ -1391,11 +1854,11 @@ fn extract_member_expressions(line: &str) -> Vec<MemberExpression> {
     let mut index = 0usize;
     while index < bytes.len() {
         let start = index;
-        let Some(owner) = read_identifier(line, &mut index) else {
+        let Some((owner, owner_start, mut owner_indexed)) = read_member_owner(line, &mut index)
+        else {
             index += 1;
             continue;
         };
-        let mut owner_indexed = false;
         skip_ascii_space(line, &mut index);
         if index < bytes.len() && bytes[index] == b'[' {
             owner_indexed = true;
@@ -1413,11 +1876,14 @@ fn extract_member_expressions(line: &str) -> Vec<MemberExpression> {
             continue;
         };
         let mut member_path = Vec::new();
+        let mut connectors = Vec::new();
+        let mut next_connector = first_connector.to_string();
         loop {
             skip_ascii_space(line, &mut index);
             let Some(member) = read_identifier(line, &mut index) else {
                 break;
             };
+            connectors.push(next_connector.clone());
             member_path.push(member);
             skip_ascii_space(line, &mut index);
             if index < bytes.len() && bytes[index] == b'[' {
@@ -1426,25 +1892,52 @@ fn extract_member_expressions(line: &str) -> Vec<MemberExpression> {
             }
             if line[index..].starts_with("->") {
                 index += 2;
+                next_connector = "->".to_string();
             } else if index < bytes.len() && bytes[index] == b'.' {
                 index += 1;
+                next_connector = ".".to_string();
             } else {
                 break;
             }
         }
         if !member_path.is_empty() {
             expressions.push(MemberExpression {
-                expression: line[start..index].trim().to_string(),
+                expression: line[owner_start..index].trim().to_string(),
                 owner_name: owner,
                 owner_indexed,
                 first_connector: first_connector.to_string(),
+                connectors,
                 member_path,
-                start,
+                start: owner_start,
                 end: index,
             });
         }
     }
     expressions
+}
+
+fn read_member_owner(line: &str, index: &mut usize) -> Option<(String, usize, bool)> {
+    let bytes = line.as_bytes();
+    if *index >= bytes.len() {
+        return None;
+    }
+    let start = *index;
+    if bytes[*index] == b'(' {
+        let close = skip_bracket(line, *index);
+        if close <= *index + 1 || close > line.len() {
+            return None;
+        }
+        let inner = line[*index + 1..close - 1].trim();
+        let mut inner_index = 0usize;
+        let owner = read_identifier(inner, &mut inner_index)?;
+        let rest = inner[inner_index..].trim();
+        if rest.is_empty() {
+            return None;
+        }
+        *index = close;
+        return Some((owner, start, true));
+    }
+    read_identifier(line, index).map(|owner| (owner, start, false))
 }
 
 fn resolve_member_expression(
@@ -1460,13 +1953,19 @@ fn resolve_member_expression(
         if global_type.global.pointer_level.unwrap_or(0) > 0 {
             return None;
         }
-        let owner_name = if global_type.global.is_array.unwrap_or(false) || expression.owner_indexed {
+        let owner_name = if global_type.global.is_array.unwrap_or(false) || expression.owner_indexed
+        {
             format!("{}[]", expression.owner_name)
         } else {
             expression.owner_name.clone()
         };
-        let target_name = canonical_member_name(&owner_name, ".", &expression.member_path);
-        if !member_path_exists(&global_type.type_info, &expression.member_path, &context.struct_types) {
+        let target_name =
+            canonical_member_name(&owner_name, &expression.connectors, &expression.member_path);
+        if !member_path_exists(
+            &global_type.type_info,
+            &expression.member_path,
+            &context.struct_types,
+        ) {
             return Some(ResolvedMemberExpression {
                 access_target_name: None,
                 owner_name: Some(owner_name),
@@ -1492,15 +1991,25 @@ fn resolve_member_expression(
             owner_name: Some(expression.owner_name.clone()),
             member_name,
             unresolved_kind: Some("ambiguous-member-alias".to_string()),
-            unresolved_name: Some(canonical_member_name(&expression.owner_name, "->", &expression.member_path)),
-            unresolved_note: "ポインタ別名の代入先が複数候補になったため、メンバ更新先を断定していません。".to_string(),
+            unresolved_name: Some(canonical_member_name(
+                &expression.owner_name,
+                &expression.connectors,
+                &expression.member_path,
+            )),
+            unresolved_note:
+                "ポインタ別名の代入先が複数候補になったため、メンバ更新先を断定していません。"
+                    .to_string(),
         });
     }
 
     if let Some(alias) = pointer_aliases.get(&expression.owner_name) {
         let separator = if alias.pointer_owner { "->" } else { "." };
         return Some(ResolvedMemberExpression {
-            access_target_name: Some(canonical_member_name(&alias.owner_name, separator, &expression.member_path)),
+            access_target_name: Some(canonical_member_name_with_first_connector(
+                &alias.owner_name,
+                separator,
+                expression,
+            )),
             owner_name: Some(alias.owner_name.clone()),
             member_name,
             unresolved_kind: None,
@@ -1511,9 +2020,19 @@ fn resolve_member_expression(
 
     if let Some(global_type) = context.global_types.get(&expression.owner_name) {
         if global_type.global.pointer_level.unwrap_or(0) > 0 {
+            let owner_name =
+                if global_type.global.is_array.unwrap_or(false) || expression.owner_indexed {
+                    format!("{}[]", expression.owner_name)
+                } else {
+                    expression.owner_name.clone()
+                };
             return Some(ResolvedMemberExpression {
-                access_target_name: Some(canonical_member_name(&expression.owner_name, "->", &expression.member_path)),
-                owner_name: Some(expression.owner_name.clone()),
+                access_target_name: Some(canonical_member_name(
+                    &owner_name,
+                    &expression.connectors,
+                    &expression.member_path,
+                )),
+                owner_name: Some(owner_name),
                 member_name,
                 unresolved_kind: None,
                 unresolved_name: None,
@@ -1534,15 +2053,76 @@ fn resolve_member_expression(
         });
     }
 
-    if member_name.as_ref().is_some_and(|name| context.known_member_names.contains(name)) {
+    if member_name
+        .as_ref()
+        .is_some_and(|name| context.known_member_names.contains(name))
+    {
         return Some(ResolvedMemberExpression {
             access_target_name: None,
             owner_name: Some(expression.owner_name.clone()),
             member_name,
             unresolved_kind: Some("unknown-member-access".to_string()),
-            unresolved_name: Some(canonical_member_name(&expression.owner_name, "->", &expression.member_path)),
+            unresolved_name: Some(canonical_member_name(
+                &expression.owner_name,
+                &expression.connectors,
+                &expression.member_path,
+            )),
             unresolved_note: "ポインタの型と参照先を静的に断定していません。".to_string(),
         });
+    }
+    None
+}
+
+fn resolve_call_argument_owner(
+    argument: &str,
+    context: &NativeContext,
+    local_types: &HashMap<String, LocalTypeInfo>,
+    pointer_aliases: &HashMap<String, PointerAlias>,
+    ambiguous_aliases: &HashSet<String>,
+) -> Option<(String, String)> {
+    let mut value = argument.trim();
+    let mut address_taken = false;
+    while let Some(rest) = value.strip_prefix('&') {
+        address_taken = true;
+        value = rest.trim();
+    }
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(expression) = extract_member_expressions(value)
+        .into_iter()
+        .find(|expression| expression.start == 0 && expression.end == value.len())
+    {
+        let resolved = resolve_member_expression(
+            &expression,
+            context,
+            local_types,
+            pointer_aliases,
+            ambiguous_aliases,
+        )?;
+        return resolved
+            .access_target_name
+            .map(|target_name| (target_name, ".".to_string()));
+    }
+
+    let mut index = 0usize;
+    let name = read_identifier(value, &mut index)?;
+    skip_ascii_space(value, &mut index);
+    if index != value.len() {
+        return None;
+    }
+    if let Some(alias) = pointer_aliases.get(&name) {
+        return Some((
+            alias.owner_name.clone(),
+            if alias.pointer_owner { "->" } else { "." }.to_string(),
+        ));
+    }
+    if let Some(global_type) = context.global_types.get(&name) {
+        if address_taken || global_type.global.pointer_level.unwrap_or(0) == 0 {
+            return Some((name, ".".to_string()));
+        }
+        return Some((name, "->".to_string()));
     }
     None
 }
@@ -1554,11 +2134,18 @@ fn member_path_exists(
 ) -> bool {
     let mut current_type: Option<&StructTypeInfo> = Some(type_info);
     for (index, member_name) in member_path.iter().enumerate() {
-        let Some(member) = current_type.and_then(|item| item.members.iter().find(|candidate| &candidate.name == member_name)) else {
+        let Some(member) = current_type.and_then(|item| {
+            item.members
+                .iter()
+                .find(|candidate| &candidate.name == member_name)
+        }) else {
             return false;
         };
         if index < member_path.len() - 1 {
-            current_type = member.type_name.as_ref().and_then(|type_name| struct_types.get(type_name));
+            current_type = member
+                .type_name
+                .as_ref()
+                .and_then(|type_name| struct_types.get(type_name));
             if current_type.is_none() {
                 return false;
             }
@@ -1567,8 +2154,37 @@ fn member_path_exists(
     true
 }
 
-fn canonical_member_name(owner_name: &str, separator: &str, member_path: &[String]) -> String {
-    format!("{owner_name}{separator}{}", member_path.join("."))
+fn canonical_member_name(
+    owner_name: &str,
+    connectors: &[String],
+    member_path: &[String],
+) -> String {
+    let mut name = owner_name.to_string();
+    for (index, member) in member_path.iter().enumerate() {
+        let connector = connectors.get(index).map(String::as_str).unwrap_or(".");
+        name.push_str(connector);
+        name.push_str(member);
+    }
+    name
+}
+
+fn canonical_member_name_with_first_connector(
+    owner_name: &str,
+    first_connector: &str,
+    expression: &MemberExpression,
+) -> String {
+    let mut connectors = expression.connectors.clone();
+    if let Some(first) = connectors.first_mut() {
+        *first = first_connector.to_string();
+    }
+    canonical_member_name(owner_name, &connectors, &expression.member_path)
+}
+
+fn append_member_path(owner_name: &str, first_connector: &str, member_path: &[String]) -> String {
+    let connectors = std::iter::once(first_connector.to_string())
+        .chain(std::iter::repeat(".".to_string()).take(member_path.len().saturating_sub(1)))
+        .collect::<Vec<_>>();
+    canonical_member_name(owner_name, &connectors, member_path)
 }
 
 fn canonical_type_member_name(type_name: &str, member_path: &[String]) -> String {
@@ -1614,7 +2230,11 @@ fn is_increment_or_decrement(line: &str, variable_name: &str) -> bool {
     for start in word_positions(line, variable_name) {
         let before = line[..start].trim_end();
         let after = line[start + variable_name.len()..].trim_start();
-        if before.ends_with("++") || before.ends_with("--") || after.starts_with("++") || after.starts_with("--") {
+        if before.ends_with("++")
+            || before.ends_with("--")
+            || after.starts_with("++")
+            || after.starts_with("--")
+        {
             return true;
         }
     }
@@ -1629,7 +2249,9 @@ fn is_assignment_target(line: &str, variable_name: &str) -> bool {
             let end = skip_bracket(rest, 0);
             rest = rest[end..].trim_start();
         }
-        for op in ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "="] {
+        for op in [
+            "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "=",
+        ] {
             if rest.starts_with(op) {
                 if op == "=" && rest.starts_with("==") {
                     continue;
@@ -1721,8 +2343,14 @@ fn find_simple_assignment(line: &str, name: &str) -> Option<(usize, String)> {
     for start in word_positions(line, name) {
         let mut index = start + name.len();
         skip_ascii_space(line, &mut index);
-        if index < line.len() && line.as_bytes()[index] == b'=' && !line[index..].starts_with("==") {
-            let value = line[index + 1..].split(';').next().unwrap_or("").trim().to_string();
+        if index < line.len() && line.as_bytes()[index] == b'=' && !line[index..].starts_with("==")
+        {
+            let value = line[index + 1..]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             return Some((start, value));
         }
     }
@@ -1811,12 +2439,19 @@ fn alias_key(alias: &PointerAlias) -> String {
     )
 }
 
-
-fn scan_file(file: &str, tree_sitter_diagnostics: bool, encoding: SourceEncoding) -> Result<FileStructure, String> {
+fn scan_file(
+    file: &str,
+    tree_sitter_diagnostics: bool,
+    encoding: SourceEncoding,
+) -> Result<FileStructure, String> {
     Ok(scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?.0)
 }
 
-fn scan_file_summary(file: &str, tree_sitter_diagnostics: bool, encoding: SourceEncoding) -> Result<FileSummary, String> {
+fn scan_file_summary(
+    file: &str,
+    tree_sitter_diagnostics: bool,
+    encoding: SourceEncoding,
+) -> Result<FileSummary, String> {
     let (structure, decode_info) = scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?;
     let functions = structure
         .functions
@@ -1832,6 +2467,9 @@ fn scan_file_summary(file: &str, tree_sitter_diagnostics: bool, encoding: Source
         struct_types: structure.struct_types,
         macro_definitions: structure.macro_definitions,
         functions,
+        parameter_member_accesses: build_parameter_member_access_templates_from_functions(
+            &structure.functions,
+        ),
         unresolved: structure.unresolved,
         decode_info,
     })
@@ -1905,7 +2543,9 @@ fn decode_source_bytes(bytes: &[u8], encoding: SourceEncoding) -> Result<Decoded
     match encoding {
         SourceEncoding::Auto => {
             if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-                let text = std::str::from_utf8(&bytes[3..]).map_err(|error| error.to_string())?.to_string();
+                let text = std::str::from_utf8(&bytes[3..])
+                    .map_err(|error| error.to_string())?
+                    .to_string();
                 return Ok(DecodedSource {
                     text,
                     info: DecodeInfo {
@@ -1926,12 +2566,22 @@ fn decode_source_bytes(bytes: &[u8], encoding: SourceEncoding) -> Result<Decoded
             Ok(decode_cp932(bytes))
         }
         SourceEncoding::Utf8 => {
-            let body = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) { &bytes[3..] } else { bytes };
-            let text = std::str::from_utf8(body).map_err(|error| error.to_string())?.to_string();
+            let body = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+                &bytes[3..]
+            } else {
+                bytes
+            };
+            let text = std::str::from_utf8(body)
+                .map_err(|error| error.to_string())?
+                .to_string();
             Ok(DecodedSource {
                 text,
                 info: DecodeInfo {
-                    used_encoding: if body.len() == bytes.len() { "utf8" } else { "utf8-bom" },
+                    used_encoding: if body.len() == bytes.len() {
+                        "utf8"
+                    } else {
+                        "utf8-bom"
+                    },
                     lossy: false,
                 },
             })
@@ -1975,10 +2625,18 @@ fn parse_macros(
         if let Some(captures) = DEFINE_RE.captures(masked) {
             let name = captures.get(1).unwrap().as_str().to_string();
             let is_function_like = captures.get(2).is_some();
-            let raw = raw_lines.get(index).copied().unwrap_or("").trim().to_string();
+            let raw = raw_lines
+                .get(index)
+                .copied()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             macros.push(MacroDefinition {
                 name,
-                replacement: captures.get(3).map(|item| item.as_str().trim().to_string()).unwrap_or_default(),
+                replacement: captures
+                    .get(3)
+                    .map(|item| item.as_str().trim().to_string())
+                    .unwrap_or_default(),
                 file: file.to_string(),
                 line: index + 1,
                 declaration: raw.clone(),
@@ -2004,7 +2662,11 @@ fn parse_macros(
     macros
 }
 
-fn parse_struct_types(file: &str, raw_lines: &[&str], masked_lines: &[String]) -> Vec<StructTypeInfo> {
+fn parse_struct_types(
+    file: &str,
+    raw_lines: &[&str],
+    masked_lines: &[String],
+) -> Vec<StructTypeInfo> {
     let mut structs = Vec::new();
     let mut index = 0usize;
     while index < masked_lines.len() {
@@ -2042,18 +2704,30 @@ fn parse_struct_types(file: &str, raw_lines: &[&str], masked_lines: &[String]) -
     structs
 }
 
-fn parse_struct_block(file: &str, line: usize, masked_block: &str, raw_block: &str) -> Option<StructTypeInfo> {
+fn parse_struct_block(
+    file: &str,
+    line: usize,
+    masked_block: &str,
+    raw_block: &str,
+) -> Option<StructTypeInfo> {
     let open = masked_block.find('{')?;
     let close = masked_block.rfind('}')?;
     if close <= open {
         return None;
     }
-    let header = masked_block[..open].split_whitespace().collect::<Vec<_>>().join(" ");
+    let header = masked_block[..open]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if !(header.contains("struct") || header.contains("class")) {
         return None;
     }
     let body = &masked_block[open + 1..close];
-    let tail = masked_block[close + 1..].split(';').next().unwrap_or("").trim();
+    let tail = masked_block[close + 1..]
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
     let tag_name = TAG_RE
         .captures(&header)
         .and_then(|captures| captures.get(1).map(|item| item.as_str().to_string()));
@@ -2108,11 +2782,17 @@ fn parse_struct_members(file: &str, start_line: usize, body: &str) -> Vec<Struct
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        if normalized.is_empty() || normalized.contains('(') || normalized.contains(')') || normalized.contains('{') {
+        if normalized.is_empty()
+            || normalized.contains('(')
+            || normalized.contains(')')
+            || normalized.contains('{')
+        {
             continue;
         }
         let parts = split_top_level_commas(&normalized);
-        let base_type = parts.first().and_then(|part| type_name_from_declarator(part));
+        let base_type = parts
+            .first()
+            .and_then(|part| type_name_from_declarator(part));
         for part in parts {
             if let Some(captures) = MEMBER_DECLARATOR_RE.captures(&part) {
                 let name = captures.get(1).unwrap().as_str();
@@ -2134,7 +2814,11 @@ fn parse_struct_members(file: &str, start_line: usize, body: &str) -> Vec<Struct
     members
 }
 
-fn parse_functions(file: &str, raw_lines: &[&str], masked_lines: &[String]) -> Vec<FunctionStructure> {
+fn parse_functions(
+    file: &str,
+    raw_lines: &[&str],
+    masked_lines: &[String],
+) -> Vec<FunctionStructure> {
     let mut functions = Vec::new();
     let mut pending = String::new();
     let mut pending_start = 1usize;
@@ -2165,7 +2849,10 @@ fn parse_functions(file: &str, raw_lines: &[&str], masked_lines: &[String]) -> V
         }
         pending = format!("{} {}", pending, trimmed).trim().to_string();
         if let Some(open) = pending.find('{') {
-            let signature = pending[..open].replace(char::is_whitespace, " ").trim().to_string();
+            let signature = pending[..open]
+                .replace(char::is_whitespace, " ")
+                .trim()
+                .to_string();
             if let Some(name) = function_name(&signature) {
                 let mut func = FunctionStructure {
                     name,
@@ -2200,7 +2887,10 @@ fn parse_globals(
     masked_lines: &[String],
     functions: &[FunctionStructure],
 ) -> Vec<GlobalVariable> {
-    let function_ranges: Vec<(usize, usize)> = functions.iter().map(|func| (func.start_line, func.end_line)).collect();
+    let function_ranges: Vec<(usize, usize)> = functions
+        .iter()
+        .map(|func| (func.start_line, func.end_line))
+        .collect();
     let mut globals = Vec::new();
     let mut pending = String::new();
     let mut pending_line = 1usize;
@@ -2208,7 +2898,11 @@ fn parse_globals(
     let mut type_block_pending = false;
     for (index, masked) in masked_lines.iter().enumerate() {
         let line = index + 1;
-        if function_ranges.iter().any(|(start, end)| line >= *start && line <= *end) || masked.trim_start().starts_with('#') {
+        if function_ranges
+            .iter()
+            .any(|(start, end)| line >= *start && line <= *end)
+            || masked.trim_start().starts_with('#')
+        {
             continue;
         }
         let trimmed = masked.trim();
@@ -2300,7 +2994,8 @@ fn function_name(signature: &str) -> Option<String> {
     if control.iter().any(|keyword| signature.starts_with(keyword)) || signature.contains(';') {
         return None;
     }
-    FUNCTION_NAME_RE.captures(signature)
+    FUNCTION_NAME_RE
+        .captures(signature)
         .and_then(|captures| captures.get(1).map(|item| item.as_str().to_string()))
 }
 
@@ -2343,7 +3038,11 @@ fn call_identifiers(line: &str) -> Vec<String> {
             let value = &line[start..index];
             let mut lookahead = index;
             skip_ascii_space(line, &mut lookahead);
-            if lookahead < bytes.len() && bytes[lookahead] == b'(' && !control.contains(&value) && seen.insert(value.to_string()) {
+            if lookahead < bytes.len()
+                && bytes[lookahead] == b'('
+                && !control.contains(&value)
+                && seen.insert(value.to_string())
+            {
                 result.push(value.to_string());
             }
         } else {
@@ -2353,12 +3052,50 @@ fn call_identifiers(line: &str) -> Vec<String> {
     result
 }
 
+fn direct_calls(line: &str) -> Vec<DirectCall> {
+    let control = ["if", "for", "while", "switch", "catch", "return", "sizeof"];
+    let bytes = line.as_bytes();
+    let mut calls = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if is_ident_start(bytes[index]) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_ident_continue(bytes[index]) {
+                index += 1;
+            }
+            let value = &line[start..index];
+            let mut lookahead = index;
+            skip_ascii_space(line, &mut lookahead);
+            if lookahead < bytes.len() && bytes[lookahead] == b'(' && !control.contains(&value) {
+                let close = skip_bracket(line, lookahead);
+                if close > lookahead + 1 && close <= line.len() {
+                    calls.push(DirectCall {
+                        name: value.to_string(),
+                        arguments: split_top_level_commas(&line[lookahead + 1..close - 1]),
+                    });
+                    index = close;
+                    continue;
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    calls
+}
+
 fn type_name_from_declarator(declarator: &str) -> Option<String> {
     let before_name = GLOBAL_DECLARATOR_RE.replace(declarator, "");
     let tokens: Vec<&str> = before_name
         .split(|ch: char| ch.is_whitespace() || ch == '*' || ch == '&')
         .filter(|token| !token.is_empty())
-        .filter(|token| !["const", "volatile", "static", "extern", "register", "struct", "class"].contains(token))
+        .filter(|token| {
+            ![
+                "const", "volatile", "static", "extern", "register", "struct", "class",
+            ]
+            .contains(token)
+        })
         .collect();
     tokens.last().map(|item| item.to_string())
 }
@@ -2367,9 +3104,22 @@ fn should_skip_global(statement: &str) -> bool {
     statement.starts_with('#')
         || statement.contains('(')
         || statement.contains(')')
-        || ["typedef", "using", "return", "goto", "break", "continue", "struct", "class", "enum", "namespace"]
-            .iter()
-            .any(|keyword| statement.starts_with(keyword) || statement.contains(&format!(" {keyword} ")))
+        || [
+            "typedef",
+            "using",
+            "return",
+            "goto",
+            "break",
+            "continue",
+            "struct",
+            "class",
+            "enum",
+            "namespace",
+        ]
+        .iter()
+        .any(|keyword| {
+            statement.starts_with(keyword) || statement.contains(&format!(" {keyword} "))
+        })
 }
 
 fn split_top_level_commas(value: &str) -> Vec<String> {
@@ -2405,8 +3155,8 @@ fn split_top_level_commas(value: &str) -> Vec<String> {
 
 fn is_keyword(value: &str) -> bool {
     [
-        "int", "char", "short", "long", "float", "double", "void", "const", "volatile", "static", "extern",
-        "unsigned", "signed", "struct", "class", "enum",
+        "int", "char", "short", "long", "float", "double", "void", "const", "volatile", "static",
+        "extern", "unsigned", "signed", "struct", "class", "enum",
     ]
     .contains(&value)
 }
@@ -2505,39 +3255,85 @@ mod tests {
     #[test]
     fn native_analysis_detects_globals_members_macros_and_unresolved() {
         let file = write_temp_source("native_fixture.cpp", &fixture_source());
-        let result = analyze_many_legacy(
-            vec![file],
-            test_options(256, true),
-        )
-        .expect("native analysis should succeed");
+        let result = analyze_many_legacy(vec![file], test_options(256, true))
+            .expect("native analysis should succeed");
         let analysis = result.files.first().expect("file analysis");
-        let globals: HashSet<_> = analysis.globals.iter().map(|item| item.name.as_str()).collect();
+        let globals: HashSet<_> = analysis
+            .globals
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
         assert!(globals.contains("g_counter"));
         assert!(globals.contains("g_deviceState"));
         assert!(!globals.contains("counter"));
 
-        let worker = analysis.functions.iter().find(|func| func.name == "Worker").expect("Worker function");
-        assert!(worker.accesses.iter().any(|access| access.variable_name == "g_counter" && access.kind == "write"));
-        assert!(worker.accesses.iter().any(|access| access.variable_name == "g_deviceState.counter" && access.kind == "write"));
+        let worker = analysis
+            .functions
+            .iter()
+            .find(|func| func.name == "Worker")
+            .expect("Worker function");
+        assert!(worker
+            .accesses
+            .iter()
+            .any(|access| access.variable_name == "g_counter" && access.kind == "write"));
+        assert!(worker.accesses.iter().any(|access| access.variable_name
+            == "g_deviceState.counter"
+            && access.kind == "write"));
         assert!(worker.accesses.iter().any(|access| {
             access.variable_name == "g_deviceState.counter"
                 && access.kind == "read"
-                && access.macro_names.as_ref().is_some_and(|names| names.iter().any(|name| name == "DEVICE_COUNTER_ALIAS"))
+                && access
+                    .macro_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == "DEVICE_COUNTER_ALIAS"))
         }));
-        assert!(worker.unresolved.iter().any(|item| item.kind == "inline-asm"));
-        assert!(worker.unresolved.iter().any(|item| item.kind == "function-pointer"));
-        assert!(worker.unresolved.iter().any(|item| item.kind == "address-taken" && item.variable_name.as_deref() == Some("g_deviceState")));
+        assert!(worker.accesses.iter().any(|access| {
+            access.variable_name == "g_parent->child->value" && access.kind == "write"
+        }));
+        assert!(worker.accesses.iter().any(|access| {
+            access.variable_name == "g_deviceArrayPtr[]->counter" && access.kind == "write"
+        }));
+        assert!(worker.accesses.iter().any(|access| {
+            access.variable_name == "g_deviceState.counter"
+                && access.kind == "write"
+                && access
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "call-argument-alias")
+        }));
+        let api_dispatch = analysis
+            .functions
+            .iter()
+            .find(|func| func.name == "ApiDispatch")
+            .expect("ApiDispatch function");
+        assert!(api_dispatch.calls.iter().any(|call| call == "ApiTarget1"));
+        assert!(api_dispatch.calls.iter().any(|call| call == "ApiTarget2"));
+        assert!(!api_dispatch
+            .unresolved
+            .iter()
+            .any(|item| item.kind == "function-pointer" && item.evidence.contains("dispatch")));
+        assert!(worker
+            .unresolved
+            .iter()
+            .any(|item| item.kind == "inline-asm"));
+        assert!(worker
+            .unresolved
+            .iter()
+            .any(|item| item.kind == "function-pointer"));
+        assert!(worker
+            .unresolved
+            .iter()
+            .any(|item| item.kind == "address-taken"
+                && item.variable_name.as_deref() == Some("g_deviceState")));
     }
 
     #[test]
     fn native_analysis_worker_count_does_not_change_result() {
         let first = write_temp_source("native_fixture_one.cpp", &fixture_source());
         let second = write_temp_source("native_fixture_two.cpp", &fixture_source());
-        let single = analyze_many_legacy(
-            vec![first.clone(), second.clone()],
-            test_options(256, true),
-        )
-        .expect("single worker analysis");
+        let single =
+            analyze_many_legacy(vec![first.clone(), second.clone()], test_options(256, true))
+                .expect("single worker analysis");
         let auto = analyze_many_legacy(
             vec![first, second],
             AnalyzeOptions {
@@ -2575,7 +3371,9 @@ mod tests {
 
     #[test]
     fn cp932_source_decodes_and_analyzes_global_access() {
-        let source = encode_cp932("// 日本語\r\nint g_cp932_counter;\r\nvoid Worker(void) { g_cp932_counter++; }\r\n");
+        let source = encode_cp932(
+            "// 日本語\r\nint g_cp932_counter;\r\nvoid Worker(void) { g_cp932_counter++; }\r\n",
+        );
         let file = write_temp_source_bytes("cp932_fixture.cpp", &source);
         let result = analyze_many_legacy(
             vec![file],
@@ -2591,11 +3389,15 @@ mod tests {
         .expect("cp932 source should analyze");
         let analysis = result.files.first().expect("file analysis");
 
-        assert!(analysis.globals.iter().any(|global| global.name == "g_cp932_counter"));
         assert!(analysis
-            .functions
+            .globals
             .iter()
-            .any(|func| func.name == "Worker" && func.accesses.iter().any(|access| access.variable_name == "g_cp932_counter")));
+            .any(|global| global.name == "g_cp932_counter"));
+        assert!(analysis.functions.iter().any(|func| func.name == "Worker"
+            && func
+                .accesses
+                .iter()
+                .any(|access| access.variable_name == "g_cp932_counter")));
     }
 
     #[test]
@@ -2603,11 +3405,14 @@ mod tests {
         let first = write_temp_source("low_memory_one.cpp", &fixture_source());
         let second = write_temp_source("low_memory_two.cpp", &fixture_source());
         let files = vec![first, second];
-        let legacy = analyze_many_legacy(files.clone(), test_options(256, true)).expect("legacy analysis");
+        let legacy =
+            analyze_many_legacy(files.clone(), test_options(256, true)).expect("legacy analysis");
 
         let mut output = Vec::new();
-        analyze_many_low_memory_to_writer(files, test_options(1, false), &mut output).expect("low memory analysis");
-        let low_memory: NativeAnalysisResult = serde_json::from_slice(&output).expect("low memory json");
+        analyze_many_low_memory_to_writer(files, test_options(1, false), &mut output)
+            .expect("low memory analysis");
+        let low_memory: NativeAnalysisResult =
+            serde_json::from_slice(&output).expect("low memory json");
 
         assert_eq!(summarize(&legacy.files), summarize(&low_memory.files));
     }
@@ -2615,7 +3420,8 @@ mod tests {
     #[test]
     fn ascii_scanners_ignore_comments_strings_and_detect_calls() {
         let mut in_block = false;
-        let masked = mask_comments_and_strings("CallMe(g_counter); // OtherCall(g_counter)", &mut in_block);
+        let masked =
+            mask_comments_and_strings("CallMe(g_counter); // OtherCall(g_counter)", &mut in_block);
         assert_eq!(call_identifiers(&masked), vec!["CallMe".to_string()]);
         let masked = mask_comments_and_strings("\"g_counter\" g_counter++;", &mut in_block);
         assert_eq!(identifiers(&masked), vec!["g_counter".to_string()]);
@@ -2661,15 +3467,39 @@ mod tests {
             "    int counter;",
             "    int mode;",
             "} DEVICE_STATE;",
+            "typedef struct tagDEVICE_CHILD {",
+            "    int value;",
+            "} DEVICE_CHILD;",
+            "typedef struct tagDEVICE_PARENT {",
+            "    DEVICE_CHILD *child;",
+            "} DEVICE_PARENT;",
             "int g_counter;",
             "DEVICE_STATE g_deviceState;",
+            "DEVICE_STATE *g_deviceArrayPtr;",
+            "DEVICE_CHILD g_child;",
+            "DEVICE_PARENT *g_parent;",
             "#define DEVICE_COUNTER_ALIAS g_deviceState.counter",
             "void Target(void) {}",
+            "void ChildWriter(DEVICE_STATE *state) { state->counter++; }",
+            "int ApiTarget1(int value) { return value; }",
+            "int ApiTarget2(int value) { return value + 1; }",
+            "int ApiDispatch(int index)",
+            "{",
+            "    int (*dispatch[])(int value) =",
+            "    {",
+            "        &ApiTarget1,",
+            "        &ApiTarget2",
+            "    };",
+            "    return dispatch[index](index);",
+            "}",
             "void Worker(void)",
             "{",
             "    DEVICE_STATE *p = &g_deviceState;",
             "    g_counter++;",
             "    p->counter = DEVICE_COUNTER_ALIAS;",
+            "    g_parent->child->value++;",
+            "    (g_deviceArrayPtr + 1)->counter++;",
+            "    ChildWriter(&g_deviceState);",
             "    __asm nop",
             "    void (*callback)(void);",
             "    (*callback)();",
@@ -2684,7 +3514,12 @@ mod tests {
             .iter()
             .map(|file| {
                 let accesses = file.functions.iter().map(|func| func.accesses.len()).sum();
-                let unresolved = file.unresolved.len() + file.functions.iter().map(|func| func.unresolved.len()).sum::<usize>();
+                let unresolved = file.unresolved.len()
+                    + file
+                        .functions
+                        .iter()
+                        .map(|func| func.unresolved.len())
+                        .sum::<usize>();
                 (file.globals.len(), accesses, unresolved)
             })
             .collect()

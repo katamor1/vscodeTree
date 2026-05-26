@@ -66,6 +66,11 @@ export function buildMemberAnalysisContext(
     for (const symbol of buildMemberSymbolsForGlobal(global, type, structTypes)) {
       memberSymbols.set(symbol.name, [...(memberSymbols.get(symbol.name) ?? []), symbol]);
     }
+    if ((global.pointerLevel ?? 0) > 0 && !global.isArray) {
+      for (const symbol of buildMemberSymbolsForPointerIndexGlobal(global, type, structTypes)) {
+        memberSymbols.set(symbol.name, [...(memberSymbols.get(symbol.name) ?? []), symbol]);
+      }
+    }
   }
 
   return {
@@ -161,6 +166,30 @@ function buildMemberSymbolsForGlobal(
     structTypes,
     isArrayOwner: global.isArray,
     pointerOwner: (global.pointerLevel ?? 0) > 0,
+    depth: 0
+  });
+  return symbols;
+}
+
+function buildMemberSymbolsForPointerIndexGlobal(
+  global: GlobalVariable,
+  type: StructTypeInfo,
+  structTypes: Map<string, StructTypeInfo>
+): MemberSymbol[] {
+  const symbols: MemberSymbol[] = [];
+  appendMemberSymbols({
+    symbols,
+    ownerName: `${global.name}[]`,
+    ownerTypeName: type.name,
+    file: global.file,
+    line: global.line,
+    declarationPrefix: global.declaration,
+    pathPrefix: "",
+    separator: "->",
+    type,
+    structTypes,
+    isArrayOwner: true,
+    pointerOwner: true,
     depth: 0
   });
   return symbols;

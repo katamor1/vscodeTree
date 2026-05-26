@@ -52,7 +52,7 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     [
       ...functions.flatMap((func) => func.unresolved),
       ...index.files.flatMap((file) => file.unresolved)
-    ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions))
+    ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions, macroTargets))
   );
   const risks = buildRisks(symbolName, symbolKind, accesses, threadContexts, unresolved);
   const graph = buildGraph(symbolName, symbolKind, globals, members, macros, functions, accesses, threadContexts, risks, unresolved);
@@ -259,15 +259,35 @@ function unresolvedRelevant(
   item: UnresolvedEvidence,
   symbolKind: ImpactResult["symbolKind"],
   symbolName: string,
-  functions: FunctionInfo[]
+  functions: FunctionInfo[],
+  macroTargets: Set<string>
 ): boolean {
   if (item.variableName === symbolName) {
     return true;
   }
+  if (symbolKind === "global" || symbolKind === "member") {
+    return item.variableName === directParentSymbolName(symbolName);
+  }
+  if (symbolKind === "macro") {
+    return macroTargets.has(item.variableName ?? "");
+  }
   if (symbolKind === "function" && item.functionName === symbolName) {
     return true;
   }
-  return functions.some((func) => func.name === item.functionName);
+  if (symbolKind === "function") {
+    return functions.some((func) => func.name === item.functionName);
+  }
+  return false;
+}
+
+function directParentSymbolName(symbolName: string): string | undefined {
+  const dotIndex = symbolName.lastIndexOf(".");
+  const arrowIndex = symbolName.lastIndexOf("->");
+  const separatorIndex = Math.max(dotIndex, arrowIndex);
+  if (separatorIndex <= 0) {
+    return undefined;
+  }
+  return symbolName.slice(0, separatorIndex);
 }
 
 function uniqueThreadContexts(items: ThreadReachability[]): ThreadReachability[] {
