@@ -181,6 +181,7 @@ describe("Rust sidecar output and encoding", () => {
     );
 
     expect(result.files.length).toBe(2);
+    expect(result.phaseDurationsMs.rustBatchSize).toBe(16);
     expect(result.phaseDurationsMs.rustOutputBytes).toBeGreaterThan(0);
     expect(result.phaseDurationsMs.rustPeakRssBytes).toBeGreaterThanOrEqual(0);
     expect(result.diagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("low-memory analyze-many");

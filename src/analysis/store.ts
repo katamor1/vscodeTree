@@ -4,6 +4,14 @@ import type { AnalysisIndex } from "./types";
 import { normalizePath, sanitizeFileName } from "./pathUtils";
 
 const ARTIFACT_RELATIVE_ROOT = ".vscode/vc6-impact-review";
+const INDEX_SUMMARY_TAIL_BYTES = 32 * 1024 * 1024;
+
+export interface IndexBuildSummary {
+  durationMs: number;
+  workerCount: number;
+  sourceFileCount: number;
+  reusedFiles: number;
+}
 
 export function resolveArtifactRoot(workspaceRoot: string): string {
   return normalizePath(path.join(workspaceRoot, ".vscode", "vc6-impact-review"));
@@ -76,6 +84,51 @@ export async function readIndex(indexPath: string): Promise<AnalysisIndex | unde
     }
     throw error;
   }
+}
+
+export async function readIndexBuildSummary(indexPath: string): Promise<IndexBuildSummary | undefined> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    const stat = await fs.stat(indexPath);
+    const length = Math.min(stat.size, INDEX_SUMMARY_TAIL_BYTES);
+    handle = await fs.open(indexPath, "r");
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, stat.size - length);
+    return parseIndexBuildSummaryTail(buffer.toString("utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function parseIndexBuildSummaryTail(tail: string): IndexBuildSummary | undefined {
+  const buildStart = tail.lastIndexOf('"build"');
+  if (buildStart < 0) {
+    return undefined;
+  }
+  const buildText = tail.slice(buildStart);
+  const durationMs = matchNumberProperty(buildText, "durationMs");
+  const workerCount = matchNumberProperty(buildText, "workerCount");
+  const sourceFileCount = matchNumberProperty(buildText, "sourceFileCount");
+  const reusedFiles = matchNumberProperty(buildText, "reusedFiles");
+  if (
+    typeof durationMs !== "number" ||
+    typeof workerCount !== "number" ||
+    typeof sourceFileCount !== "number" ||
+    typeof reusedFiles !== "number"
+  ) {
+    return undefined;
+  }
+  return { durationMs, workerCount, sourceFileCount, reusedFiles };
+}
+
+function matchNumberProperty(text: string, property: string): number | undefined {
+  const match = new RegExp(`"${property}"\\s*:\\s*(\\d+)`).exec(text);
+  return match ? Number(match[1]) : undefined;
 }
 
 export async function writeIndex(indexPath: string, index: AnalysisIndex): Promise<void> {

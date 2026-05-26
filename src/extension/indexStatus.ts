@@ -1,5 +1,5 @@
 export interface IndexStatusSummary {
-  action: "built" | "updated";
+  action: "built" | "updated" | "loaded";
   sourceFileCount?: number;
   changedFileCount?: number;
   reusedFileCount?: number;
@@ -16,9 +16,9 @@ export interface IndexStatusLine {
 export function formatIndexStatusLines(status: IndexStatusSummary): IndexStatusLine[] {
   const lines: IndexStatusLine[] = [
     {
-      label: status.action === "built" ? "Index built" : "Index updated",
-      description: "ready",
-      icon: "check"
+      label: status.action === "built" ? "Index built" : status.action === "loaded" ? "Index loaded" : "Index updated",
+      description: status.action === "loaded" ? "from disk" : "ready",
+      icon: status.action === "loaded" ? "database" : "check"
     }
   ];
 

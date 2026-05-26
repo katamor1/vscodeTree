@@ -1,17 +1,50 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
+const perfSamplesRoot = "C:/Users/stell/source/repos/vscodeTree_perf_samples";
 const defaultBaseRoot = "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample2-base";
-const defaultOutputRoot = "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample2-scale-7000";
 const defaultSourceEntries = 7000;
+const defaultOutputRoot = outputRootForEntries(defaultSourceEntries);
+const defaultTierEntries = [7000, 16000, 31000];
+const scaleIndexSizeModel = {
+  baseEntries: 3,
+  baseIndexBytes: 2240214,
+  calibratedEntries: 7000,
+  calibratedIndexBytes: 46852268,
+  calibratedFrom: "sample2-scale-7000",
+  targetIndexSizeMiB: 190
+};
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const baseRoot = path.resolve(args.base || process.env.VC6_IMPACT_SAMPLE2_BASE || defaultBaseRoot);
-  const outputRoot = path.resolve(args.output || process.env.VC6_IMPACT_SAMPLE2_SCALE || defaultOutputRoot);
-  const sourceEntries = Number(args.entries || process.env.VC6_IMPACT_SAMPLE2_ENTRIES || defaultSourceEntries);
+  const tierEntries = args.tiers ? parseTierEntries(args.tiers) : undefined;
+  if (tierEntries && (args.entries || args.output)) {
+    throw new Error("--tiers cannot be combined with --entries or --output because tier output paths are derived from entry counts");
+  }
 
   await ensureBaseMetadata(baseRoot);
+  if (tierEntries) {
+    const tiers = tierEntries.map((entries) => ({
+      sourceEntries: entries,
+      outputRoot: slash(path.resolve(outputRootForEntries(entries))),
+      projectedIndexSizeMiB: projectedIndexSizeMiB(entries)
+    }));
+    if (!args.baseOnly) {
+      for (const tier of tiers) {
+        await generateScaleSample(baseRoot, tier.outputRoot, tier.sourceEntries);
+      }
+    }
+    console.log(JSON.stringify({
+      baseRoot: slash(baseRoot),
+      tiers,
+      baseOnly: Boolean(args.baseOnly)
+    }, null, 2));
+    return;
+  }
+
+  const outputRoot = path.resolve(args.output || process.env.VC6_IMPACT_SAMPLE2_SCALE || defaultOutputRoot);
+  const sourceEntries = Number(args.entries || process.env.VC6_IMPACT_SAMPLE2_ENTRIES || defaultSourceEntries);
   if (!args.baseOnly) {
     await generateScaleSample(baseRoot, outputRoot, sourceEntries);
   }
@@ -20,6 +53,7 @@ async function main() {
     baseRoot: slash(baseRoot),
     outputRoot: args.baseOnly ? undefined : slash(outputRoot),
     sourceEntries,
+    projectedIndexSizeMiB: projectedIndexSizeMiB(sourceEntries),
     baseOnly: Boolean(args.baseOnly)
   }, null, 2));
 }
@@ -42,13 +76,12 @@ async function ensureBaseMetadata(root) {
   });
 }
 
-async function generateScaleSample(baseRoot, outputRoot, sourceEntries) {
+async function generateScaleSample(baseRoot, outputRoot, sourceEntries, scaleMetadata = scaleProjectionMetadata(sourceEntries)) {
   const baseEntries = await sourceEntriesForRoot(baseRoot);
   if (sourceEntries < baseEntries.length) {
     throw new Error(`--entries must be at least ${baseEntries.length} because all base source files are included`);
   }
-  assertSafeScaleOutput(outputRoot);
-  await fs.rm(outputRoot, { recursive: true, force: true });
+  await resetScaleOutput(outputRoot);
   await fs.mkdir(path.join(outputRoot, "src"), { recursive: true });
   for (const entry of baseEntries) {
     const relative = entry.replace(/^src\//, "");
@@ -77,6 +110,7 @@ async function generateScaleSample(baseRoot, outputRoot, sourceEntries) {
     threadMapFileName: "thread-map.json",
     generatedFileCount: generatedCount,
     baseRoot: slash(baseRoot),
+    ...scaleMetadata,
     note: "Generated outside vscodeTree so it is not managed by that repository. Use as a read-only performance fixture."
   });
 }
@@ -257,10 +291,24 @@ async function countFiles(root) {
 
 function assertSafeScaleOutput(outputRoot) {
   const normalized = slash(path.resolve(outputRoot)).toLowerCase();
-  const expectedParent = slash(path.resolve("C:/Users/stell/source/repos/vscodeTree_perf_samples")).toLowerCase();
+  const expectedParent = slash(path.resolve(perfSamplesRoot)).toLowerCase();
   const basename = path.basename(outputRoot).toLowerCase();
   if (!normalized.startsWith(`${expectedParent}/`) || !basename.startsWith("vc6-large-sample2-scale-")) {
     throw new Error(`Refusing to delete unexpected output directory: ${outputRoot}`);
+  }
+}
+
+async function resetScaleOutput(outputRoot) {
+  assertSafeScaleOutput(outputRoot);
+  await fs.mkdir(outputRoot, { recursive: true });
+  const entries = await fs.readdir(outputRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    await fs.rm(path.join(outputRoot, entry.name), {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 250
+    });
   }
 }
 
@@ -286,11 +334,45 @@ function parseArgs(argv) {
       result.output = argv[++index];
     } else if (arg === "--entries") {
       result.entries = argv[++index];
+    } else if (arg === "--tiers") {
+      result.tiers = argv[++index];
     } else if (arg === "--base-only") {
       result.baseOnly = true;
     }
   }
   return result;
+}
+
+function parseTierEntries(value) {
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => Number(entry));
+  if (entries.length === 0 || entries.some((entry) => !Number.isInteger(entry) || entry <= 0)) {
+    throw new Error(`invalid --tiers value: ${value}`);
+  }
+  return entries;
+}
+
+function outputRootForEntries(entries) {
+  return path.join(perfSamplesRoot, `vc6-large-sample2-scale-${entries}`);
+}
+
+function projectedIndexSizeMiB(sourceEntries) {
+  const generatedEntries = sourceEntries - scaleIndexSizeModel.baseEntries;
+  const bytesPerGeneratedFile = (scaleIndexSizeModel.calibratedIndexBytes - scaleIndexSizeModel.baseIndexBytes)
+    / (scaleIndexSizeModel.calibratedEntries - scaleIndexSizeModel.baseEntries);
+  const projectedBytes = scaleIndexSizeModel.baseIndexBytes + (generatedEntries * bytesPerGeneratedFile);
+  return Math.round((projectedBytes / 1024 / 1024) * 10) / 10;
+}
+
+function scaleProjectionMetadata(sourceEntries) {
+  return {
+    projectedIndexSizeMiB: projectedIndexSizeMiB(sourceEntries),
+    targetIndexSizeMiB: scaleIndexSizeModel.targetIndexSizeMiB,
+    calibratedFrom: scaleIndexSizeModel.calibratedFrom
+  };
 }
 
 function pad(value, width) {
@@ -301,7 +383,22 @@ function slash(value) {
   return value.replace(/\\/g, "/");
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  assertSafeScaleOutput,
+  defaultTierEntries,
+  generateScaleSample,
+  outputRootForEntries,
+  parseArgs,
+  parseTierEntries,
+  projectedIndexSizeMiB,
+  resetScaleOutput,
+  scaleIndexSizeModel,
+  scaleProjectionMetadata
+};

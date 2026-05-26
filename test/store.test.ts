@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ensureArtifactIgnored, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
+import { ensureArtifactIgnored, readIndexBuildSummary, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
 import type { AnalysisIndex } from "../src/analysis/types";
 
 describe("artifact storage policy", () => {
@@ -64,6 +64,30 @@ describe("artifact storage policy", () => {
     const text = await fs.readFile(indexPath, "utf8");
     expect(text).not.toContain("\n  ");
     expect(JSON.parse(text).version).toBe(1);
+  });
+
+  it("reads build summary from the index tail without requiring the whole JSON object", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.build.durationMs = 19435;
+    index.build.workerCount = 7;
+    index.build.sourceFileCount = 7002;
+    index.build.reusedFiles = 123;
+    await writeIndex(indexPath, index);
+
+    await expect(readIndexBuildSummary(indexPath)).resolves.toEqual({
+      durationMs: 19435,
+      workerCount: 7,
+      sourceFileCount: 7002,
+      reusedFiles: 123
+    });
+  });
+
+  it("returns undefined for missing index build summary", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+
+    await expect(readIndexBuildSummary(path.join(tempRoot, "missing.json"))).resolves.toBeUndefined();
   });
 });
 

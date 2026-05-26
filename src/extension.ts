@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as vscode from "vscode";
 import { buildImpact } from "./analysis/impact";
 import { buildFullIndex, updateIndex } from "./analysis/indexer";
-import { ensureArtifactIgnored, reportPaths, readIndex, writeIndex } from "./analysis/store";
+import { ensureArtifactIgnored, readIndexBuildSummary, reportPaths, readIndex, writeIndex } from "./analysis/store";
 import { writeReviewReport } from "./analysis/report";
 import type { AnalysisIndex, ImpactResult } from "./analysis/types";
 import { normalizeCommandSymbolArg } from "./extension/commandArgs";
@@ -97,6 +97,8 @@ export function activate(context: vscode.ExtensionContext): void {
       });
     })
   );
+
+  void restoreExistingIndexStatus(context, treeProvider);
 }
 
 export function deactivate(): void {
@@ -121,6 +123,24 @@ async function loadIndexAndSymbol(
   }
   await fs.mkdir(settings.outputDir, { recursive: true });
   return { index, symbolName, settings };
+}
+
+async function restoreExistingIndexStatus(context: vscode.ExtensionContext, treeProvider: ImpactTreeProvider): Promise<void> {
+  try {
+    const settings = await readSettings(context);
+    const summary = await readIndexBuildSummary(settings.indexPath);
+    if (!summary) {
+      return;
+    }
+    treeProvider.setIndexStatus({
+      action: "loaded",
+      sourceFileCount: summary.sourceFileCount,
+      durationMs: summary.durationMs,
+      workerCount: summary.workerCount
+    });
+  } catch (error) {
+    console.warn("VC6 Impact: existing index status was not restored", error);
+  }
 }
 
 function getSelectedSymbol(): string | undefined {

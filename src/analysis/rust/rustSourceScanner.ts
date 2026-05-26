@@ -8,6 +8,7 @@ import type { TextEncoding } from "../textEncoding";
 import type { FileAnalysis, ParserDiagnostic } from "../types";
 
 const execFileAsync = promisify(execFile);
+const nativeAnalyzeBatchSize = 16;
 
 export interface RustNativeAnalysisResult {
   files: FileAnalysis[];
@@ -54,7 +55,7 @@ export async function analyzeFilesWithRustSidecar(
       "--encoding",
       sourceEncoding,
       "--batch-size",
-      "256"
+      String(nativeAnalyzeBatchSize)
     ], {
       windowsHide: true,
       timeout: Math.max(30000, files.length * 250),
@@ -80,7 +81,7 @@ export async function analyzeFilesWithRustSidecar(
         rustAccessAnalysis: parsed.metrics?.accessAnalysis ?? 0,
         rustTotalNative: parsed.metrics?.totalNative ?? 0,
         rustFileCount: parsed.metrics?.fileCount ?? files.length,
-        rustBatchSize: parsed.metrics?.batchSize ?? 256,
+        rustBatchSize: parsed.metrics?.batchSize ?? nativeAnalyzeBatchSize,
         rustOutputBytes: parsed.metrics?.outputBytes ?? outputBytes,
         rustPeakRssBytes: parsed.metrics?.peakRssBytes ?? 0
       }

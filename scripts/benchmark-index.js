@@ -1,7 +1,8 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
-const { buildFullIndex } = require("../dist/analysis/indexer");
+
+const perfSamplesRoot = "C:/Users/stell/source/repos/vscodeTree_perf_samples";
 
 const samples = {
   fixture: {
@@ -25,19 +26,36 @@ const samples = {
     threadMap: "thread-map.json"
   },
   "sample2-scale": {
-    root: "C:/Users/stell/source/repos/vscodeTree_perf_samples/vc6-large-sample2-scale-7000",
+    root: sample2ScaleRoot(7000),
+    project: "sample2_scale.dsw",
+    threadMap: "thread-map.json"
+  },
+  "sample2-scale-7000": {
+    root: sample2ScaleRoot(7000),
+    project: "sample2_scale.dsw",
+    threadMap: "thread-map.json"
+  },
+  "sample2-scale-16000": {
+    root: sample2ScaleRoot(16000),
+    project: "sample2_scale.dsw",
+    threadMap: "thread-map.json"
+  },
+  "sample2-scale-31000": {
+    root: sample2ScaleRoot(31000),
     project: "sample2_scale.dsw",
     threadMap: "thread-map.json"
   }
 };
 
 async function main() {
+  const { buildFullIndex } = require("../dist/analysis/indexer");
   const args = parseArgs(process.argv.slice(2));
   const sample = samples[args.sample || "small"];
   if (!sample) {
     throw new Error(`Unknown sample: ${args.sample}`);
   }
   await ensureCompiled();
+  const manifest = await readJsonIfExists(path.join(sample.root, "manifest.json"));
   const started = performance.now();
   const index = await buildFullIndex({
     workspaceRoot: sample.root,
@@ -61,9 +79,13 @@ async function main() {
     structTypes: Object.keys(index.structTypes).length,
     memberSymbols: Object.keys(index.memberSymbols).length,
     functions: Object.keys(index.functions).length,
+    functionAccesses: countFunctionAccesses(index),
     macros: Object.keys(index.macroAliases || {}).length,
     threads: index.threads.length,
     reachability: Object.keys(index.threadReachability).length,
+    projectedIndexSizeMiB: manifest?.projectedIndexSizeMiB,
+    targetIndexSizeMiB: manifest?.targetIndexSizeMiB,
+    calibratedFrom: manifest?.calibratedFrom,
     rssMb: Math.round(memory.rss / 1024 / 1024),
     heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024)
   };
@@ -77,6 +99,22 @@ async function main() {
 
 function roundMb(bytes) {
   return Math.round((Number(bytes) / 1024 / 1024) * 10) / 10;
+}
+
+function sample2ScaleRoot(entries) {
+  return `${perfSamplesRoot}/vc6-large-sample2-scale-${entries}`;
+}
+
+function countFunctionAccesses(index) {
+  return Object.values(index.functions).reduce((sum, func) => sum + (func.accesses?.length ?? 0), 0);
+}
+
+async function readJsonIfExists(file) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    return undefined;
+  }
 }
 
 function parseArgs(argv) {
@@ -108,7 +146,17 @@ async function ensureCompiled() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  parseArgs,
+  countFunctionAccesses,
+  roundMb,
+  sample2ScaleRoot,
+  samples
+};

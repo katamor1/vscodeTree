@@ -360,7 +360,7 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
         workers: None,
         tree_sitter_diagnostics: false,
         output: None,
-        batch_size: 256,
+        batch_size: 16,
         legacy_in_memory: false,
         encoding: SourceEncoding::Auto,
     };
@@ -3344,6 +3344,13 @@ mod tests {
         .expect("auto worker analysis");
 
         assert_eq!(summarize(&single.files), summarize(&auto.files));
+    }
+
+    #[test]
+    fn analyze_options_defaults_to_small_low_memory_batch() {
+        let options = parse_analyze_options(&[]).expect("options should parse");
+
+        assert_eq!(options.batch_size, 16);
     }
 
     #[test]
