@@ -121,9 +121,13 @@ struct FileStructure {
     unresolved: Vec<UnresolvedEvidence>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct FunctionSummary {
     name: String,
+    start_line: usize,
+    end_line: usize,
+    signature: String,
 }
 
 #[allow(dead_code)]
@@ -360,7 +364,7 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
         workers: None,
         tree_sitter_diagnostics: false,
         output: None,
-        batch_size: 16,
+        batch_size: 1,
         legacy_in_memory: false,
         encoding: SourceEncoding::Auto,
     };
@@ -597,10 +601,9 @@ fn analyze_many_legacy(
 
 fn write_json_result<T: Serialize>(output: Option<&str>, result: &T) -> Result<(), String> {
     if let Some(output_path) = output {
-        let file = File::create(output_path).map_err(|error| error.to_string())?;
-        let mut writer = io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, result).map_err(|error| error.to_string())?;
-        writer.flush().map_err(|error| error.to_string())?;
+        write_atomic_json_output(output_path, |writer| {
+            serde_json::to_writer(writer, result).map_err(|error| error.to_string())
+        })?;
     } else {
         serde_json::to_writer(io::stdout().lock(), result).map_err(|error| error.to_string())?;
     }
@@ -609,16 +612,46 @@ fn write_json_result<T: Serialize>(output: Option<&str>, result: &T) -> Result<(
 
 fn write_low_memory_result(files: Vec<String>, options: AnalyzeOptions) -> Result<(), String> {
     if let Some(output_path) = options.output.clone() {
-        let file = File::create(output_path).map_err(|error| error.to_string())?;
-        let mut writer = io::BufWriter::new(file);
-        analyze_many_low_memory_to_writer(files, options, &mut writer)?;
-        writer.flush().map_err(|error| error.to_string())?;
+        write_atomic_json_output(&output_path, |writer| {
+            analyze_many_low_memory_to_writer(files, options, writer)
+        })?;
     } else {
         let stdout = io::stdout();
         let mut writer = stdout.lock();
         analyze_many_low_memory_to_writer(files, options, &mut writer)?;
     }
     Ok(())
+}
+
+fn write_atomic_json_output<F>(output_path: &str, write_fn: F) -> Result<(), String>
+where
+    F: FnOnce(&mut io::BufWriter<File>) -> Result<(), String>,
+{
+    let temp_path = atomic_temp_output_path(output_path);
+    let file = File::create(&temp_path).map_err(|error| error.to_string())?;
+    let mut writer = io::BufWriter::new(file);
+    let write_result = write_fn(&mut writer);
+    let flush_result = writer.flush().map_err(|error| error.to_string());
+    drop(writer);
+
+    if let Err(error) = write_result.and(flush_result) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if Path::new(output_path).exists() {
+        fs::remove_file(output_path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temp_path, output_path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn atomic_temp_output_path(output_path: &str) -> String {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("{output_path}.tmp-{}-{suffix}", std::process::id())
 }
 
 fn analyze_many_low_memory_to_writer<W: Write>(
@@ -670,14 +703,11 @@ fn analyze_many_low_memory_to_writer<W: Write>(
         .write_all(b"{\"files\":[")
         .map_err(|error| error.to_string())?;
     let mut first_file = true;
+    let mut streamed_file_count = 0usize;
+    let mut max_structure_batch_files = 0usize;
     for batch in files.chunks(batch_size) {
-        let structures = scan_many(
-            batch.to_vec(),
-            Some(worker_count.min(batch.len().max(1))),
-            options.tree_sitter_diagnostics,
-            options.encoding,
-        )?;
-        let analyses = analyze_structures(structures, &context, worker_count)?;
+        let analyses = analyze_file_batch_streaming(batch, &context, &options, worker_count)?;
+        max_structure_batch_files = max_structure_batch_files.max(analyses.len());
         for analysis in analyses {
             if !first_file {
                 counting
@@ -686,6 +716,7 @@ fn analyze_many_low_memory_to_writer<W: Write>(
             }
             serde_json::to_writer(&mut counting, &analysis).map_err(|error| error.to_string())?;
             first_file = false;
+            streamed_file_count += 1;
         }
         peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
     }
@@ -696,6 +727,11 @@ fn analyze_many_low_memory_to_writer<W: Write>(
     metrics.insert(
         "totalNative".to_string(),
         total_started.elapsed().as_millis(),
+    );
+    metrics.insert("streamedFileCount".to_string(), streamed_file_count as u128);
+    metrics.insert(
+        "maxStructureBatchFiles".to_string(),
+        max_structure_batch_files as u128,
     );
     metrics.insert("peakRssBytes".to_string(), peak_rss);
     metrics.insert("outputBytes".to_string(), counting.bytes_written() as u128);
@@ -712,6 +748,52 @@ fn analyze_many_low_memory_to_writer<W: Write>(
         .write_all(format!(",\"workerCount\":{worker_count}}}").as_bytes())
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn analyze_file_batch_streaming(
+    batch: &[String],
+    context: &NativeContext,
+    options: &AnalyzeOptions,
+    worker_count: usize,
+) -> Result<Vec<FileAnalysis>, String> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch_worker_count = worker_count.max(1).min(batch.len());
+    let mut chunks: Vec<Vec<(usize, String)>> = vec![Vec::new(); batch_worker_count];
+    for (index, file) in batch.iter().enumerate() {
+        chunks[index % batch_worker_count].push((index, file.clone()));
+    }
+    let tree_sitter_diagnostics = options.tree_sitter_diagnostics;
+    let encoding = options.encoding;
+
+    thread::scope(|scope| -> Result<Vec<FileAnalysis>, String> {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| {
+                scope.spawn(move || -> Result<Vec<(usize, FileAnalysis)>, String> {
+                    let mut results = Vec::with_capacity(chunk.len());
+                    for (index, file) in chunk {
+                        let structure =
+                            scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?;
+                        results.push((index, analyze_file_structure_native(structure, context)));
+                    }
+                    Ok(results)
+                })
+            })
+            .collect();
+        let mut indexed = Vec::with_capacity(batch.len());
+        for handle in handles {
+            indexed.extend(
+                handle
+                    .join()
+                    .map_err(|_| "rust native bounded streaming worker panicked".to_string())??,
+            );
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, analysis)| analysis).collect())
+    })
 }
 
 struct CountingWriter<'a, W: Write> {
@@ -983,28 +1065,49 @@ fn build_parameter_member_access_templates_from_functions(
             .map(|(index, name)| (name.clone(), index))
             .collect();
         let mut function_templates = Vec::new();
+        let mut seen_templates = HashSet::new();
         for body_line in &function.body_lines {
-            for expression in extract_member_expressions(&body_line.masked) {
-                let Some(parameter_index) =
-                    parameter_index_by_name.get(&expression.owner_name).copied()
-                else {
-                    continue;
-                };
-                let (kind, _) = classify_access(&body_line.masked, &expression.expression);
-                let member_path = expression.member_path.clone();
-                function_templates.push(ParameterMemberAccessTemplate {
-                    parameter_index,
-                    member_path,
-                    kind,
-                    member_name: expression.member_path.last().cloned(),
-                });
-            }
+            collect_parameter_member_access_templates(
+                &body_line.masked,
+                &parameter_index_by_name,
+                &mut function_templates,
+                &mut seen_templates,
+            );
         }
         if !function_templates.is_empty() {
             result.insert(function.name.clone(), function_templates);
         }
     }
     result
+}
+
+fn collect_parameter_member_access_templates(
+    masked: &str,
+    parameter_index_by_name: &HashMap<String, usize>,
+    templates: &mut Vec<ParameterMemberAccessTemplate>,
+    seen_templates: &mut HashSet<String>,
+) {
+    if parameter_index_by_name.is_empty() {
+        return;
+    }
+    for expression in extract_member_expressions(masked) {
+        let Some(parameter_index) = parameter_index_by_name.get(&expression.owner_name).copied()
+        else {
+            continue;
+        };
+        let (kind, _) = classify_access(masked, &expression.expression);
+        let member_path = expression.member_path.clone();
+        let key = format!("{}:{}:{}", parameter_index, member_path.join("."), kind);
+        if !seen_templates.insert(key) {
+            continue;
+        }
+        templates.push(ParameterMemberAccessTemplate {
+            parameter_index,
+            member_path,
+            kind,
+            member_name: expression.member_path.last().cloned(),
+        });
+    }
 }
 
 fn parameter_names_from_signature(signature: &str) -> Vec<String> {
@@ -1208,6 +1311,7 @@ fn analyze_file_structure_native(
 
 fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) -> FunctionInfo {
     let mut accesses = Vec::new();
+    let mut access_keys = HashSet::new();
     let mut unresolved = Vec::new();
     let mut calls = HashSet::new();
     let mut local_types = parse_function_parameter_types(&func.signature, context);
@@ -1276,21 +1380,25 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
             };
             let (kind, reasons) = classify_access(&masked, &expression.expression);
             if let Some(target_name) = &resolved.access_target_name {
-                accesses.push(VariableAccess {
-                    variable_name: target_name.clone(),
-                    target_name: Some(target_name.clone()),
-                    target_kind: Some("member".to_string()),
-                    function_name: func.name.clone(),
-                    kind,
-                    location: location(&func.file, body_line.line, raw),
-                    evidence: raw.trim().to_string(),
-                    expanded_evidence: expanded_evidence(raw, &masked),
-                    reasons: reasons.clone(),
-                    owner_name: resolved.owner_name.clone(),
-                    member_name: resolved.member_name.clone(),
-                    access_expression: Some(expression.expression.clone()),
-                    macro_names: macro_names_option(&macro_names),
-                });
+                push_access_once(
+                    &mut accesses,
+                    &mut access_keys,
+                    VariableAccess {
+                        variable_name: target_name.clone(),
+                        target_name: Some(target_name.clone()),
+                        target_kind: Some("member".to_string()),
+                        function_name: func.name.clone(),
+                        kind,
+                        location: location(&func.file, body_line.line, raw),
+                        evidence: raw.trim().to_string(),
+                        expanded_evidence: expanded_evidence(raw, &masked),
+                        reasons: reasons.clone(),
+                        owner_name: resolved.owner_name.clone(),
+                        member_name: resolved.member_name.clone(),
+                        access_expression: Some(expression.expression.clone()),
+                        macro_names: macro_names_option(&macro_names),
+                    },
+                );
             }
             if reasons.iter().any(|reason| reason == "address-taken") {
                 if let Some(target_name) = &resolved.access_target_name {
@@ -1325,21 +1433,25 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                 continue;
             }
             let (kind, reasons) = classify_access(&masked_without_members, &variable_name);
-            accesses.push(VariableAccess {
-                variable_name: variable_name.clone(),
-                target_name: Some(variable_name.clone()),
-                target_kind: Some("global".to_string()),
-                function_name: func.name.clone(),
-                kind,
-                location: location(&func.file, body_line.line, raw),
-                evidence: raw.trim().to_string(),
-                expanded_evidence: expanded_evidence(raw, &masked),
-                reasons: reasons.clone(),
-                owner_name: None,
-                member_name: None,
-                access_expression: None,
-                macro_names: macro_names_option(&macro_names),
-            });
+            push_access_once(
+                &mut accesses,
+                &mut access_keys,
+                VariableAccess {
+                    variable_name: variable_name.clone(),
+                    target_name: Some(variable_name.clone()),
+                    target_kind: Some("global".to_string()),
+                    function_name: func.name.clone(),
+                    kind,
+                    location: location(&func.file, body_line.line, raw),
+                    evidence: raw.trim().to_string(),
+                    expanded_evidence: expanded_evidence(raw, &masked),
+                    reasons: reasons.clone(),
+                    owner_name: None,
+                    member_name: None,
+                    access_expression: None,
+                    macro_names: macro_names_option(&macro_names),
+                },
+            );
             if reasons.iter().any(|reason| reason == "address-taken") {
                 unresolved.push(unresolved_evidence(
                     "address-taken",
@@ -1379,21 +1491,25 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                     };
                     let target_name =
                         append_member_path(&owner_name, &first_connector, &template.member_path);
-                    accesses.push(VariableAccess {
-                        variable_name: target_name.clone(),
-                        target_name: Some(target_name.clone()),
-                        target_kind: Some("member".to_string()),
-                        function_name: func.name.clone(),
-                        kind: template.kind.clone(),
-                        location: location(&func.file, body_line.line, raw),
-                        evidence: raw.trim().to_string(),
-                        expanded_evidence: expanded_evidence(raw, &masked),
-                        reasons: vec!["call-argument-alias".to_string()],
-                        owner_name: Some(owner_name),
-                        member_name: template.member_name.clone(),
-                        access_expression: Some(argument.trim().to_string()),
-                        macro_names: macro_names_option(&macro_names),
-                    });
+                    push_access_once(
+                        &mut accesses,
+                        &mut access_keys,
+                        VariableAccess {
+                            variable_name: target_name.clone(),
+                            target_name: Some(target_name.clone()),
+                            target_kind: Some("member".to_string()),
+                            function_name: func.name.clone(),
+                            kind: template.kind.clone(),
+                            location: location(&func.file, body_line.line, raw),
+                            evidence: raw.trim().to_string(),
+                            expanded_evidence: expanded_evidence(raw, &masked),
+                            reasons: vec!["call-argument-alias".to_string()],
+                            owner_name: Some(owner_name),
+                            member_name: template.member_name.clone(),
+                            access_expression: Some(argument.trim().to_string()),
+                            macro_names: macro_names_option(&macro_names),
+                        },
+                    );
                 }
             }
         }
@@ -1426,6 +1542,37 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
         calls,
         accesses,
         unresolved,
+    }
+}
+
+fn push_access_once(
+    accesses: &mut Vec<VariableAccess>,
+    seen: &mut HashSet<String>,
+    access: VariableAccess,
+) {
+    let line = access.location.line.to_string();
+    let macro_names = access
+        .macro_names
+        .as_ref()
+        .map(|names| names.join(","))
+        .unwrap_or_default();
+    let reasons = access.reasons.join(",");
+    let key = [
+        access.target_kind.as_deref().unwrap_or(""),
+        access
+            .target_name
+            .as_deref()
+            .unwrap_or(&access.variable_name),
+        access.kind.as_str(),
+        access.location.file.as_str(),
+        line.as_str(),
+        access.access_expression.as_deref().unwrap_or(""),
+        reasons.as_str(),
+        macro_names.as_str(),
+    ]
+    .join("\u{1f}");
+    if seen.insert(key) {
+        accesses.push(access);
     }
 }
 
@@ -2452,26 +2599,36 @@ fn scan_file_summary(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
 ) -> Result<FileSummary, String> {
-    let (structure, decode_info) = scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?;
-    let functions = structure
-        .functions
+    let decoded = read_source_text(file, encoding)?;
+    let text = decoded.text;
+    let signature = file_signature(file)?;
+    let masked_lines = mask_lines(&text);
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut unresolved = Vec::new();
+
+    if tree_sitter_diagnostics {
+        append_tree_sitter_diagnostic(file, &text, &mut unresolved)?;
+    }
+
+    let macro_definitions = parse_macros(file, &raw_lines, &masked_lines, &mut unresolved);
+    let struct_types = parse_struct_types(file, &raw_lines, &masked_lines);
+    let (functions, parameter_member_accesses) = parse_function_summaries(&masked_lines);
+    let function_ranges: Vec<(usize, usize)> = functions
         .iter()
-        .map(|function| FunctionSummary {
-            name: function.name.clone(),
-        })
+        .map(|function| (function.start_line, function.end_line))
         .collect();
+    let globals = parse_globals_with_ranges(file, &masked_lines, &function_ranges);
+
     Ok(FileSummary {
-        file: structure.file,
-        signature: structure.signature,
-        globals: structure.globals,
-        struct_types: structure.struct_types,
-        macro_definitions: structure.macro_definitions,
+        file: file.to_string(),
+        signature,
+        globals,
+        struct_types,
+        macro_definitions,
         functions,
-        parameter_member_accesses: build_parameter_member_access_templates_from_functions(
-            &structure.functions,
-        ),
-        unresolved: structure.unresolved,
-        decode_info,
+        parameter_member_accesses,
+        unresolved,
+        decode_info: decoded.info,
     })
 }
 
@@ -2488,26 +2645,7 @@ fn scan_file_with_decode(
     let mut unresolved = Vec::new();
 
     if tree_sitter_diagnostics {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .map_err(|error| format!("tree-sitter-cpp language init failed: {error}"))?;
-        if let Some(tree) = parser.parse(&text, None) {
-            if tree.root_node().has_error() {
-                unresolved.push(UnresolvedEvidence {
-                    kind: "macro".to_string(),
-                    function_name: None,
-                    variable_name: None,
-                    location: SourceLocation {
-                        file: file.to_string(),
-                        line: 1,
-                        text: None,
-                    },
-                    evidence: "tree-sitter parse errors".to_string(),
-                    note: "Rust/tree-sitter backend parsed the file but reported syntax errors; review unresolved evidence.".to_string(),
-                });
-            }
-        }
+        append_tree_sitter_diagnostic(file, &text, &mut unresolved)?;
     }
 
     let macro_definitions = parse_macros(file, &raw_lines, &masked_lines, &mut unresolved);
@@ -2527,6 +2665,34 @@ fn scan_file_with_decode(
         },
         decoded.info,
     ))
+}
+
+fn append_tree_sitter_diagnostic(
+    file: &str,
+    text: &str,
+    unresolved: &mut Vec<UnresolvedEvidence>,
+) -> Result<(), String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .map_err(|error| format!("tree-sitter-cpp language init failed: {error}"))?;
+    if let Some(tree) = parser.parse(text, None) {
+        if tree.root_node().has_error() {
+            unresolved.push(UnresolvedEvidence {
+                kind: "macro".to_string(),
+                function_name: None,
+                variable_name: None,
+                location: SourceLocation {
+                    file: file.to_string(),
+                    line: 1,
+                    text: None,
+                },
+                evidence: "tree-sitter parse errors".to_string(),
+                note: "Rust/tree-sitter backend parsed the file but reported syntax errors; review unresolved evidence.".to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 struct DecodedSource {
@@ -2881,6 +3047,117 @@ fn parse_functions(
     functions
 }
 
+struct ActiveFunctionSummary {
+    summary: FunctionSummary,
+    parameter_index_by_name: HashMap<String, usize>,
+    templates: Vec<ParameterMemberAccessTemplate>,
+    seen_templates: HashSet<String>,
+}
+
+fn parse_function_summaries(
+    masked_lines: &[String],
+) -> (
+    Vec<FunctionSummary>,
+    HashMap<String, Vec<ParameterMemberAccessTemplate>>,
+) {
+    let mut functions = Vec::new();
+    let mut templates_by_function = HashMap::new();
+    let mut pending = String::new();
+    let mut pending_start = 1usize;
+    let mut active: Option<ActiveFunctionSummary> = None;
+    let mut brace_depth = 0isize;
+
+    for (index, masked) in masked_lines.iter().enumerate() {
+        let line = index + 1;
+        if masked.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(active_function) = active.as_mut() {
+            collect_parameter_member_access_templates(
+                masked,
+                &active_function.parameter_index_by_name,
+                &mut active_function.templates,
+                &mut active_function.seen_templates,
+            );
+            brace_depth += count_char(masked, '{') as isize - count_char(masked, '}') as isize;
+            if brace_depth <= 0 {
+                let mut finished = active.take().unwrap();
+                finished.summary.end_line = line;
+                finish_function_summary(finished, &mut functions, &mut templates_by_function);
+            }
+            continue;
+        }
+        let trimmed = masked.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if pending.is_empty() {
+            pending_start = line;
+        }
+        pending = format!("{} {}", pending, trimmed).trim().to_string();
+        if let Some(open) = pending.find('{') {
+            let signature = pending[..open]
+                .replace(char::is_whitespace, " ")
+                .trim()
+                .to_string();
+            if let Some(name) = function_name(&signature) {
+                let parameter_names = parameter_names_from_signature(&signature);
+                let parameter_index_by_name: HashMap<String, usize> = parameter_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (name.clone(), index))
+                    .collect();
+                let mut active_function = ActiveFunctionSummary {
+                    summary: FunctionSummary {
+                        name,
+                        start_line: pending_start,
+                        end_line: line,
+                        signature,
+                    },
+                    parameter_index_by_name,
+                    templates: Vec::new(),
+                    seen_templates: HashSet::new(),
+                };
+                collect_parameter_member_access_templates(
+                    masked,
+                    &active_function.parameter_index_by_name,
+                    &mut active_function.templates,
+                    &mut active_function.seen_templates,
+                );
+                brace_depth = count_char(masked, '{') as isize - count_char(masked, '}') as isize;
+                pending.clear();
+                if brace_depth <= 0 {
+                    finish_function_summary(
+                        active_function,
+                        &mut functions,
+                        &mut templates_by_function,
+                    );
+                } else {
+                    active = Some(active_function);
+                }
+                continue;
+            }
+            pending.clear();
+        }
+        if pending.contains(';') {
+            pending.clear();
+        }
+    }
+    functions.shrink_to_fit();
+    (functions, templates_by_function)
+}
+
+fn finish_function_summary(
+    active: ActiveFunctionSummary,
+    functions: &mut Vec<FunctionSummary>,
+    templates_by_function: &mut HashMap<String, Vec<ParameterMemberAccessTemplate>>,
+) {
+    if !active.templates.is_empty() {
+        templates_by_function.insert(active.summary.name.clone(), active.templates);
+    }
+    functions.push(active.summary);
+}
+
 fn parse_globals(
     file: &str,
     _raw_lines: &[&str],
@@ -2891,6 +3168,14 @@ fn parse_globals(
         .iter()
         .map(|func| (func.start_line, func.end_line))
         .collect();
+    parse_globals_with_ranges(file, masked_lines, &function_ranges)
+}
+
+fn parse_globals_with_ranges(
+    file: &str,
+    masked_lines: &[String],
+    function_ranges: &[(usize, usize)],
+) -> Vec<GlobalVariable> {
     let mut globals = Vec::new();
     let mut pending = String::new();
     let mut pending_line = 1usize;
@@ -3350,7 +3635,7 @@ mod tests {
     fn analyze_options_defaults_to_small_low_memory_batch() {
         let options = parse_analyze_options(&[]).expect("options should parse");
 
-        assert_eq!(options.batch_size, 16);
+        assert_eq!(options.batch_size, 1);
     }
 
     #[test]
@@ -3422,6 +3707,79 @@ mod tests {
             serde_json::from_slice(&output).expect("low memory json");
 
         assert_eq!(summarize(&legacy.files), summarize(&low_memory.files));
+    }
+
+    #[test]
+    fn low_memory_parallel_streaming_caps_retained_files_to_batch_size() {
+        let first = write_temp_source("streaming_one.cpp", &fixture_source());
+        let second = write_temp_source("streaming_two.cpp", &fixture_source());
+        let third = write_temp_source("streaming_three.cpp", &fixture_source());
+        let fourth = write_temp_source("streaming_four.cpp", &fixture_source());
+        let files = vec![first, second, third, fourth];
+
+        let mut output = Vec::new();
+        analyze_many_low_memory_to_writer(files, test_options(2, false), &mut output)
+            .expect("low memory analysis");
+        let low_memory: NativeAnalysisResult =
+            serde_json::from_slice(&output).expect("low memory json");
+
+        assert_eq!(low_memory.files.len(), 4);
+        assert_eq!(low_memory.metrics.get("streamedFileCount"), Some(&4));
+        assert_eq!(low_memory.metrics.get("maxStructureBatchFiles"), Some(&2));
+    }
+
+    #[test]
+    fn atomic_output_does_not_publish_partial_json_on_failure() {
+        let output = write_temp_source("partial-output.json", "{}");
+        fs::remove_file(&output).expect("remove placeholder");
+
+        let result = write_atomic_json_output(&output, |writer| {
+            writer
+                .write_all(b"{\"files\":[")
+                .map_err(|error| error.to_string())?;
+            Err("forced failure".to_string())
+        });
+
+        assert!(result.is_err());
+        assert!(!Path::new(&output).exists());
+    }
+
+    #[test]
+    fn summary_scan_keeps_function_ranges_and_deduped_parameter_templates_without_full_analysis() {
+        let source = [
+            "typedef struct tagDEVICE_STATE {",
+            "    int counter;",
+            "} DEVICE_STATE;",
+            "void Touch(DEVICE_STATE *state)",
+            "{",
+            "    state->counter++;",
+            "    state->counter++;",
+            "}",
+            "DEVICE_STATE g_after;",
+        ]
+        .join("\n");
+        let file = write_temp_source("summary_ranges.cpp", &source);
+
+        let summary = scan_file_summary(&file, false, SourceEncoding::Auto)
+            .expect("summary scan should pass");
+        let touch = summary
+            .functions
+            .iter()
+            .find(|function| function.name == "Touch")
+            .expect("Touch summary");
+        let templates = summary
+            .parameter_member_accesses
+            .get("Touch")
+            .expect("Touch parameter templates");
+
+        assert_eq!(touch.start_line, 4);
+        assert_eq!(touch.end_line, 8);
+        assert_eq!(touch.signature, "void Touch(DEVICE_STATE *state)");
+        assert!(summary
+            .globals
+            .iter()
+            .any(|global| global.name == "g_after"));
+        assert_eq!(templates.len(), 1);
     }
 
     #[test]

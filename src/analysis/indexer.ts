@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import { parseVc6Project } from "./vc6ProjectParser";
 import { readThreadMap } from "./threadMap";
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature } from "./sourceScanner";
-import { analyzeFilesWithRustSidecar } from "./rust/rustSourceScanner";
+import { analyzeFilesWithParserBackend } from "./parserBackend";
 import type {
   AnalysisIndex,
   BuildOptions,
@@ -22,6 +22,7 @@ import type {
 export async function buildFullIndex(options: BuildOptions): Promise<AnalysisIndex> {
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
+  const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
   const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
@@ -29,11 +30,19 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
   phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
-  const scanResult = await analyzeFilesWithRustSidecar(project.sourceFiles, options.maxIndexWorkers, options.sourceEncoding ?? "auto");
+  const scanResult = await analyzeFilesWithParserBackend({
+    parserEngine,
+    files: project.sourceFiles,
+    maxIndexWorkers: options.maxIndexWorkers,
+    maxNativeBatchFiles: options.maxNativeBatchFiles,
+    sourceEncoding: options.sourceEncoding ?? "auto",
+    includePaths: project.includePaths,
+    macros: project.macros
+  });
   phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   Object.assign(phaseDurationsMs, scanResult.phaseDurationsMs);
-  phaseDurationsMs.symbolMap = scanResult.phaseDurationsMs.rustSymbolMap ?? 0;
-  phaseDurationsMs.accessAnalysis = scanResult.phaseDurationsMs.rustAccessAnalysis ?? 0;
+  phaseDurationsMs.symbolMap = scanResult.phaseDurationsMs[`${parserEngine}SymbolMap`] ?? scanResult.phaseDurationsMs.rustSymbolMap ?? 0;
+  phaseDurationsMs.accessAnalysis = scanResult.phaseDurationsMs[`${parserEngine}AccessAnalysis`] ?? scanResult.phaseDurationsMs.rustAccessAnalysis ?? 0;
 
   return composeIndex({
     mode: "full",
@@ -48,6 +57,7 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
     changedFiles: project.sourceFiles,
     reusedFiles: 0,
     sourceFileCount: project.sourceFiles.length,
+    parserEngine,
     phaseDurationsMs,
     workerCount: scanResult.workerCount,
     parserDiagnostics: scanResult.diagnostics
@@ -67,6 +77,7 @@ export async function updateIndex(
 
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
+  const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
   const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
@@ -78,6 +89,13 @@ export async function updateIndex(
     const index = await buildFullIndex(options);
     index.build.mode = "update";
     index.build.fullRebuildReason = "project-source-list-changed";
+    return index;
+  }
+
+  if (previousIndex.build.parserMode !== parserEngine) {
+    const index = await buildFullIndex(options);
+    index.build.mode = "update";
+    index.build.fullRebuildReason = "parser-engine-changed";
     return index;
   }
 
@@ -99,6 +117,7 @@ export async function updateIndex(
       changedFiles,
       reusedFiles: previousIndex.files.length,
       sourceFileCount: project.sourceFiles.length,
+      parserEngine,
       phaseDurationsMs: {
         ...phaseDurationsMs,
         structureScan: 0,
@@ -114,7 +133,9 @@ export async function updateIndex(
   index.build.mode = "update";
   index.build.changedFiles = changedFiles;
   index.build.reusedFiles = 0;
-  index.build.fullRebuildReason = "rust-native-update-rebuild";
+  index.build.fullRebuildReason = parserEngine === "rust"
+    ? "rust-native-update-rebuild"
+    : `${parserEngine}-update-rebuild`;
   return index;
 }
 
@@ -131,6 +152,7 @@ function composeIndex(args: {
   changedFiles: string[];
   reusedFiles: number;
   sourceFileCount: number;
+  parserEngine: AnalysisIndex["build"]["parserMode"];
   phaseDurationsMs: Record<string, number>;
   workerCount: number;
   parserDiagnostics: ParserDiagnostic[];
@@ -201,7 +223,7 @@ function composeIndex(args: {
     threadReachability: buildThreadReachability(args.threads, callGraph),
     build: {
       mode: args.mode,
-      parserMode: "rust",
+      parserMode: args.parserEngine,
       durationMs: Date.now() - args.started,
       phaseDurationsMs: {
         ...args.phaseDurationsMs,

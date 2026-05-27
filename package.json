@@ -78,6 +78,23 @@
           "maximum": 64,
           "description": "Maximum worker threads used while building indexes. 0 means auto (CPU count - 1)."
         },
+        "vc6Impact.maxNativeBatchFiles": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Maximum source files retained at once during Rust native access analysis. Lower this to 1 for the smallest memory footprint."
+        },
+        "vc6Impact.parserEngine": {
+          "type": "string",
+          "enum": [
+            "rust",
+            "typescript",
+            "clang"
+          ],
+          "default": "rust",
+          "description": "Parser engine used for index generation. rust is the production default; typescript and clang are fallback engines for troubleshooting."
+        },
         "vc6Impact.indexDbPath": {
           "type": "string",
           "default": "",
@@ -101,7 +118,7 @@
             "cp932"
           ],
           "default": "auto",
-          "description": "Encoding for C/C++ source files scanned by the Rust sidecar. auto tries UTF-8 BOM, UTF-8, then CP932."
+          "description": "Encoding for C/C++ source files scanned by the selected parser engine. auto tries UTF-8 BOM, UTF-8, then CP932."
         }
       }
     },

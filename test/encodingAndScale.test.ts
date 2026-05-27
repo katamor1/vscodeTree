@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildFullIndex } from "../src/analysis/indexer";
-import { analyzeFilesWithRustSidecar } from "../src/analysis/rust/rustSourceScanner";
+import { analyzeFilesWithRustSidecar, jsonTailForDiagnostics, looksLikeCompleteJsonObject } from "../src/analysis/rust/rustSourceScanner";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const cp932Japanese = Buffer.from([0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
@@ -177,14 +177,23 @@ describe("Rust sidecar output and encoding", () => {
     const result = await analyzeFilesWithRustSidecar(
       [path.join(fixtureRoot, "src", "main.cpp"), path.join(fixtureRoot, "src", "globals.h")],
       1,
-      "auto"
+      "auto",
+      2
     );
 
     expect(result.files.length).toBe(2);
-    expect(result.phaseDurationsMs.rustBatchSize).toBe(16);
+    expect(result.phaseDurationsMs.rustBatchSize).toBe(2);
+    expect(result.phaseDurationsMs.rustMaxStructureBatchFiles).toBe(2);
+    expect(result.phaseDurationsMs.rustStreamedFileCount).toBe(2);
     expect(result.phaseDurationsMs.rustOutputBytes).toBeGreaterThan(0);
     expect(result.phaseDurationsMs.rustPeakRssBytes).toBeGreaterThanOrEqual(0);
     expect(result.diagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("low-memory analyze-many");
+  });
+
+  it("detects truncated Rust output JSON before parsing", () => {
+    expect(looksLikeCompleteJsonObject('{"files":[]}')).toBe(true);
+    expect(looksLikeCompleteJsonObject('{"files":[')).toBe(false);
+    expect(jsonTailForDiagnostics("a\n".repeat(300))).not.toContain("\n");
   });
 
   it("builds an index from a CP932 source file through the Rust sidecar", async () => {

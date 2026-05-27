@@ -61,12 +61,14 @@ async function main() {
     workspaceRoot: sample.root,
     projectFile: path.join(sample.root, sample.project),
     threadMapFile: path.join(sample.root, sample.threadMap),
-    maxIndexWorkers: args.workers === undefined ? 0 : Number(args.workers)
+    maxIndexWorkers: args.workers === undefined ? 0 : Number(args.workers),
+    maxNativeBatchFiles: args.batch === undefined ? undefined : Number(args.batch),
+    parserEngine: args.parser
   });
   const memory = process.memoryUsage();
   const report = {
     sample: args.sample || "small",
-    parserEngine: "rust-native",
+    parserEngine: index.build.parserMode,
     wallMs: Math.round(performance.now() - started),
     reportedDurationMs: index.build.durationMs,
     phaseDurationsMs: index.build.phaseDurationsMs,
@@ -128,6 +130,10 @@ function parseArgs(argv) {
       result.workers = argv[++index];
     } else if (arg === "--output") {
       result.output = argv[++index];
+    } else if (arg === "--batch") {
+      result.batch = argv[++index];
+    } else if (arg === "--parser") {
+      result.parser = argv[++index];
     } else if (!arg.startsWith("-")) {
       positional.push(arg);
     }

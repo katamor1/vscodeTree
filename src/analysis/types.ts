@@ -96,8 +96,10 @@ export interface MacroAlias {
   declaration: string;
 }
 
+export type ParserEngine = "rust" | "typescript" | "clang";
+
 export interface ParserDiagnostic {
-  backend: "rust";
+  backend: ParserEngine;
   file?: string;
   severity: "info" | "warning" | "error";
   message: string;
@@ -186,7 +188,7 @@ export interface AnalysisIndex {
   threadReachability: Record<string, ThreadReachability>;
   build: {
     mode: "full" | "update";
-    parserMode: "rust";
+    parserMode: ParserEngine;
     durationMs: number;
     phaseDurationsMs: Record<string, number>;
     workerCount: number;
@@ -248,6 +250,8 @@ export interface BuildOptions {
   threadMapFile?: string;
   excludeGlobs?: string[];
   maxIndexWorkers?: number;
+  maxNativeBatchFiles?: number;
+  parserEngine?: ParserEngine;
   projectEncoding?: "auto" | "utf8" | "cp932";
   sourceEncoding?: "auto" | "utf8" | "cp932";
 }

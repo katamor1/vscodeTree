@@ -60,7 +60,7 @@ describe("extension manifest", () => {
     expect(activityBarContainer?.icon).toBe("resources/activitybar.svg");
   });
 
-  it("exposes only the Rust production command surface", async () => {
+  it("exposes the production command surface with selectable parser engines", async () => {
     const manifestPath = path.resolve(__dirname, "..", "package.json");
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
       activationEvents?: string[];
@@ -87,7 +87,7 @@ describe("extension manifest", () => {
     expect(serialized).not.toContain("Compare Parser Backends");
     expect(serialized).not.toContain("\"standard\"");
     expect(serialized).not.toContain("\"custom\"");
-    expect(serialized).not.toContain("\"clang\"");
+    expect(manifest.contributes?.configuration?.properties).toHaveProperty("vc6Impact.parserEngine");
     expect(manifest.scripts?.["compare:parsers"]).toBeUndefined();
   });
 });

@@ -1,8 +1,10 @@
 import * as vscode from "vscode";
 import { findDefaultProjectFile } from "../analysis/vc6ProjectParser";
 import { normalizePath, resolveMaybeRelative } from "../analysis/pathUtils";
+import { normalizeParserEngine } from "../analysis/parserBackend";
 import { resolveArtifactRoot, resolveIndexPath } from "../analysis/store";
 import { normalizeTextEncoding, type TextEncoding } from "../analysis/textEncoding";
+import type { ParserEngine } from "../analysis/types";
 
 export interface ExtensionSettings {
   workspaceRoot: string;
@@ -13,6 +15,8 @@ export interface ExtensionSettings {
   excludeGlobs: string[];
   maxGraphDepth: number;
   maxIndexWorkers: number;
+  maxNativeBatchFiles: number;
+  parserEngine: ParserEngine;
   projectEncoding: TextEncoding;
   sourceEncoding: TextEncoding;
 }
@@ -54,6 +58,8 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     excludeGlobs: config.get<string[]>("excludeGlobs") ?? [],
     maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4,
     maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
+    maxNativeBatchFiles: config.get<number>("maxNativeBatchFiles") ?? 4,
+    parserEngine: normalizeParserEngine(config.get<string>("parserEngine"), "rust"),
     projectEncoding: normalizeTextEncoding(config.get<string>("projectEncoding"), "auto"),
     sourceEncoding: normalizeTextEncoding(config.get<string>("sourceEncoding"), "auto")
   };

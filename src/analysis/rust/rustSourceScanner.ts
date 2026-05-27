@@ -8,7 +8,7 @@ import type { TextEncoding } from "../textEncoding";
 import type { FileAnalysis, ParserDiagnostic } from "../types";
 
 const execFileAsync = promisify(execFile);
-const nativeAnalyzeBatchSize = 16;
+const defaultNativeAnalyzeBatchSize = 4;
 
 export interface RustNativeAnalysisResult {
   files: FileAnalysis[];
@@ -28,7 +28,8 @@ export class RustSidecarUnavailableError extends Error {
 export async function analyzeFilesWithRustSidecar(
   files: string[],
   maxIndexWorkers = 0,
-  sourceEncoding: TextEncoding = "auto"
+  sourceEncoding: TextEncoding = "auto",
+  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize
 ): Promise<RustNativeAnalysisResult> {
   const sidecar = await findRustSidecarExecutable();
   if (!sidecar) {
@@ -45,6 +46,7 @@ export async function analyzeFilesWithRustSidecar(
   try {
     await fs.writeFile(listPath, JSON.stringify(files), "utf8");
     const workerArg = maxIndexWorkers > 0 ? String(Math.floor(maxIndexWorkers)) : "auto";
+    const nativeBatchSize = normalizeNativeBatchFiles(maxNativeBatchFiles);
     await execFileAsync(sidecar, [
       "analyze-many",
       listPath,
@@ -55,20 +57,30 @@ export async function analyzeFilesWithRustSidecar(
       "--encoding",
       sourceEncoding,
       "--batch-size",
-      String(nativeAnalyzeBatchSize)
+      String(nativeBatchSize)
     ], {
       windowsHide: true,
       timeout: Math.max(30000, files.length * 250),
       maxBuffer: 16 * 1024 * 1024
     });
-    const outputText = await fs.readFile(outputPath, "utf8");
     const outputBytes = (await fs.stat(outputPath)).size;
-    const parsed = JSON.parse(outputText) as {
+    const outputText = await fs.readFile(outputPath, "utf8");
+    if (!looksLikeCompleteJsonObject(outputText)) {
+      throw new Error(`Rust sidecar output JSON is incomplete or truncated (${outputBytes} bytes). Tail: ${jsonTailForDiagnostics(outputText)}`);
+    }
+    type RustOutput = {
       files: FileAnalysis[];
       diagnostics?: ParserDiagnostic[];
       metrics?: Record<string, number>;
       workerCount?: number;
     };
+    let parsed: RustOutput;
+    try {
+      parsed = JSON.parse(outputText) as RustOutput;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Rust sidecar output JSON parse failed (${outputBytes} bytes): ${reason}. Tail: ${jsonTailForDiagnostics(outputText)}`);
+    }
     diagnostics.push(...(parsed.diagnostics ?? []));
     return {
       files: parsed.files ?? [],
@@ -81,7 +93,9 @@ export async function analyzeFilesWithRustSidecar(
         rustAccessAnalysis: parsed.metrics?.accessAnalysis ?? 0,
         rustTotalNative: parsed.metrics?.totalNative ?? 0,
         rustFileCount: parsed.metrics?.fileCount ?? files.length,
-        rustBatchSize: parsed.metrics?.batchSize ?? nativeAnalyzeBatchSize,
+        rustBatchSize: parsed.metrics?.batchSize ?? nativeBatchSize,
+        rustStreamedFileCount: parsed.metrics?.streamedFileCount ?? 0,
+        rustMaxStructureBatchFiles: parsed.metrics?.maxStructureBatchFiles ?? 0,
         rustOutputBytes: parsed.metrics?.outputBytes ?? outputBytes,
         rustPeakRssBytes: parsed.metrics?.peakRssBytes ?? 0
       }
@@ -97,6 +111,22 @@ export async function analyzeFilesWithRustSidecar(
     await fs.rm(listPath, { force: true }).catch(() => undefined);
     await fs.rm(outputPath, { force: true }).catch(() => undefined);
   }
+}
+
+function normalizeNativeBatchFiles(value: number): number {
+  if (!Number.isFinite(value)) {
+    return defaultNativeAnalyzeBatchSize;
+  }
+  return Math.max(1, Math.min(64, Math.floor(value)));
+}
+
+export function looksLikeCompleteJsonObject(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("{") && trimmed.endsWith("}");
+}
+
+export function jsonTailForDiagnostics(text: string): string {
+  return text.slice(Math.max(0, text.length - 240)).replace(/\s+/g, " ").slice(0, 240);
 }
 
 export async function findRustSidecarExecutable(): Promise<string | undefined> {

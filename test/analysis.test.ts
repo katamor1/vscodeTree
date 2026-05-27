@@ -25,7 +25,7 @@ describe("VC6 project parsing", () => {
   });
 });
 
-describe("Rust native impact index", () => {
+describe("Impact index", () => {
   it("detects global read/write access, thread reachability, and risk candidates", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
     const impact = buildImpact(index, "g_counter");
@@ -45,6 +45,19 @@ describe("Rust native impact index", () => {
       expect.arrayContaining(["MULTI_THREAD_WRITE", "CROSS_THREAD_READ_WRITE", "INTERRUPT_CONTEXT"])
     );
   });
+
+  it("can build comparable JSON indexes with TypeScript and clang fallback engines", async () => {
+    const rust = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "rust" });
+    const typescript = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "typescript" });
+    const clang = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "clang" });
+
+    expect(typescript.build.parserMode).toBe("typescript");
+    expect(clang.build.parserMode).toBe("clang");
+    expect(typescript.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("typescript parser backend");
+    expect(clang.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toMatch(/clang/);
+    expect(coreQualitySummary(typescript)).toEqual(coreQualitySummary(rust));
+    expect(coreQualitySummary(clang)).toEqual(coreQualitySummary(rust));
+  }, 20000);
 
   it("keeps pointer alias uncertainty as unresolved review evidence", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
@@ -101,7 +114,7 @@ describe("Rust native impact index", () => {
     expect(updated.build.reusedFiles).toBe(0);
     expect(updated.build.fullRebuildReason).toBe("rust-native-update-rebuild");
     expect(updated.build.parserMode).toBe("rust");
-  });
+  }, 15000);
 
   it("produces the same core index shape with explicit single-worker and auto-worker options", async () => {
     const singleWorker = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, maxIndexWorkers: 1 });
@@ -247,6 +260,22 @@ describe("Rust native impact index", () => {
       }
     }
   });
+
+  it("does not require the Rust sidecar when TypeScript fallback is selected", async () => {
+    const previous = process.env.VC6_IMPACT_RUST_SIDECAR;
+    process.env.VC6_IMPACT_RUST_SIDECAR = path.join(os.tmpdir(), `missing-vc6-impact-rust-${Date.now()}.exe`);
+    try {
+      const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "typescript" });
+      expect(index.build.parserMode).toBe("typescript");
+      expect(index.globals.g_counter?.length).toBeGreaterThan(0);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.VC6_IMPACT_RUST_SIDECAR;
+      } else {
+        process.env.VC6_IMPACT_RUST_SIDECAR = previous;
+      }
+    }
+  });
 });
 
 describe("function impact", () => {
@@ -266,6 +295,24 @@ async function copyFixtureToTemp(): Promise<string> {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-fixture-"));
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
+}
+
+function coreQualitySummary(index: Awaited<ReturnType<typeof buildFullIndex>>): Record<string, unknown> {
+  return {
+    globals: Object.keys(index.globals).sort(),
+    functions: Object.keys(index.functions).sort(),
+    macroAliases: Object.keys(index.macroAliases).sort(),
+    counterAccesses: accessSummary(index, "g_counter"),
+    memberAccesses: accessSummary(index, "g_deviceState.counter"),
+    arrayMemberAccesses: accessSummary(index, "g_devices[].status"),
+    pointerUnknown: index.functions.PointerMemberUnknown?.unresolved.map((item) => `${item.kind}:${item.variableName}`).sort() ?? []
+  };
+}
+
+function accessSummary(index: Awaited<ReturnType<typeof buildFullIndex>>, symbolName: string): string[] {
+  return buildImpact(index, symbolName).accesses
+    .map((access) => `${access.functionName}:${access.kind}:${access.variableName}:${access.reasons.join("+")}:${access.macroNames?.join("+") ?? ""}`)
+    .sort();
 }
 
 async function createSample2ImpactFixture(): Promise<{ root: string; projectFile: string; threadMapFile: string }> {
