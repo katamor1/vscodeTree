@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ensureArtifactIgnored, readIndexBuildSummary, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
+import { ensureArtifactIgnored, readIndex, readIndexBuildSummary, readIndexForSymbol, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
 import type { AnalysisIndex } from "../src/analysis/types";
 
 describe("artifact storage policy", () => {
@@ -64,6 +64,102 @@ describe("artifact storage policy", () => {
     const text = await fs.readFile(indexPath, "utf8");
     expect(text).not.toContain("\n  ");
     expect(JSON.parse(text).version).toBe(1);
+  });
+
+  it("does not stringify the entire top-level index object while writing", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const originalStringify = JSON.stringify;
+    JSON.stringify = ((value: unknown, replacer?: Parameters<typeof JSON.stringify>[1], space?: Parameters<typeof JSON.stringify>[2]) => {
+      if (value && typeof value === "object" && (value as Partial<AnalysisIndex>).version === 1 && "files" in value && "build" in value) {
+        throw new Error("top-level index JSON.stringify should not be used");
+      }
+      return originalStringify(value, replacer, space);
+    }) as typeof JSON.stringify;
+    try {
+      await writeIndex(indexPath, minimalIndex());
+    } finally {
+      JSON.stringify = originalStringify;
+    }
+
+    const text = await fs.readFile(indexPath, "utf8");
+    expect(JSON.parse(text).version).toBe(1);
+  });
+
+  it("stores functions in a sidecar and hydrates only functions needed for a symbol", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.globals.g_counter = [{
+      name: "g_counter",
+      file: "C:/tmp/project/main.cpp",
+      line: 1,
+      declaration: "int g_counter;",
+      isExtern: false
+    }];
+    index.functions.TouchCounter = {
+      name: "TouchCounter",
+      file: "C:/tmp/project/main.cpp",
+      startLine: 2,
+      endLine: 4,
+      signature: "void TouchCounter(void)",
+      calls: [],
+      accesses: [{
+        variableName: "g_counter",
+        targetName: "g_counter",
+        targetKind: "global",
+        functionName: "TouchCounter",
+        kind: "write",
+        location: { file: "C:/tmp/project/main.cpp", line: 3 },
+        evidence: "g_counter++;",
+        reasons: ["increment-decrement"]
+      }],
+      unresolved: []
+    };
+    index.functions.Unrelated = {
+      name: "Unrelated",
+      file: "C:/tmp/project/main.cpp",
+      startLine: 5,
+      endLine: 7,
+      signature: "void Unrelated(void)",
+      calls: [],
+      accesses: [],
+      unresolved: []
+    };
+    index.callGraph.TouchCounter = [];
+    index.callGraph.Unrelated = [];
+
+    await writeIndex(indexPath, index);
+
+    const stored = await readIndex(indexPath);
+    expect(stored?.storage?.layout).toBe("split-v1");
+    expect(stored?.functions).toEqual({});
+    await expect(fs.readFile(path.join(tempRoot, "vc6-impact-index.functions.jsonl"), "utf8")).resolves.toContain("TouchCounter");
+
+    const hydrated = await readIndexForSymbol(indexPath, "g_counter");
+    expect(Object.keys(hydrated?.functions ?? {})).toEqual(["TouchCounter"]);
+  });
+
+  it("does not preserve a stale sidecar when writing a fresh empty-function index", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.functions.Stale = {
+      name: "Stale",
+      file: "C:/tmp/project/main.cpp",
+      startLine: 1,
+      endLine: 1,
+      signature: "void Stale(void)",
+      calls: [],
+      accesses: [],
+      unresolved: []
+    };
+    await writeIndex(indexPath, index);
+
+    const empty = minimalIndex();
+    await writeIndex(indexPath, empty);
+
+    await expect(fs.readFile(path.join(tempRoot, "vc6-impact-index.functions.jsonl"), "utf8")).resolves.toBe("");
   });
 
   it("reads build summary from the index tail without requiring the whole JSON object", async () => {

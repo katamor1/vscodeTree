@@ -1,11 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as vscode from "vscode";
 import { buildImpact } from "./analysis/impact";
-import { buildFullIndex, updateIndex } from "./analysis/indexer";
-import { ensureArtifactIgnored, readIndexBuildSummary, reportPaths, readIndex, writeIndex } from "./analysis/store";
+import { buildFullIndexToStorage, updateIndexToStorage } from "./analysis/indexer";
+import { ensureArtifactIgnored, readIndexBuildSummary, reportPaths, readIndex, readIndexForSymbol } from "./analysis/store";
 import { writeReviewReport } from "./analysis/report";
 import type { AnalysisIndex, ImpactResult } from "./analysis/types";
-import { normalizeCommandSymbolArg } from "./extension/commandArgs";
+import { extractSymbolAtTextOffset, normalizeCommandSymbolArg } from "./extension/commandArgs";
 import { ImpactTreeProvider } from "./extension/impactTree";
 import { GraphView } from "./extension/graphView";
 import { readSettings } from "./extension/settings";
@@ -25,11 +25,10 @@ export function activate(context: vscode.ExtensionContext): void {
           { location: vscode.ProgressLocation.Notification, title: "VC6 Impact: building full index", cancellable: false },
           async (progress) => {
             progress.report({ message: "Parsing DSW/DSP and scanning source files..." });
-            return buildFullIndex(settings);
+            return buildFullIndexToStorage(settings, settings.indexPath);
           }
         );
         await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
-        await writeIndex(settings.indexPath, index);
         treeProvider.setIndexStatus({
           action: "built",
           sourceFileCount: index.build.sourceFileCount,
@@ -47,11 +46,10 @@ export function activate(context: vscode.ExtensionContext): void {
           { location: vscode.ProgressLocation.Notification, title: "VC6 Impact: updating index", cancellable: false },
           async (progress) => {
             progress.report({ message: "Checking changed files..." });
-            return updateIndex(settings, previous);
+            return updateIndexToStorage(settings, previous, settings.indexPath);
           }
         );
         await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
-        await writeIndex(settings.indexPath, index);
         treeProvider.setIndexStatus({
           action: "updated",
           sourceFileCount: index.build.sourceFileCount,
@@ -110,16 +108,16 @@ async function loadIndexAndSymbol(
   symbolArg?: unknown
 ): Promise<{ index: AnalysisIndex; symbolName: string; settings: Awaited<ReturnType<typeof readSettings>> }> {
   const settings = await readSettings(context);
-  const index = await readIndex(settings.indexPath);
-  if (!index) {
-    throw new Error(`索引がありません。先に Build Full Index を実行してください: ${settings.indexPath}`);
-  }
   const symbolName =
     normalizeCommandSymbolArg(symbolArg) ??
     normalizeCommandSymbolArg(getSelectedSymbol()) ??
     normalizeCommandSymbolArg(await vscode.window.showInputBox({ prompt: "Inspect symbol name" }));
   if (!symbolName) {
     throw new Error("対象シンボル名が指定されていません。");
+  }
+  const index = await readIndexForSymbol(settings.indexPath, symbolName, settings.maxGraphDepth);
+  if (!index) {
+    throw new Error(`索引がありません。先に Build Full Index を実行してください: ${settings.indexPath}`);
   }
   await fs.mkdir(settings.outputDir, { recursive: true });
   return { index, symbolName, settings };
@@ -149,10 +147,11 @@ function getSelectedSymbol(): string | undefined {
     return undefined;
   }
   const selection = editor.selection;
-  const range = selection.isEmpty
-    ? editor.document.getWordRangeAtPosition(selection.active, /[A-Za-z_]\w*(?:::[A-Za-z_]\w*)?/)
-    : selection;
-  return range ? editor.document.getText(range).trim() : undefined;
+  if (!selection.isEmpty) {
+    return editor.document.getText(selection).trim();
+  }
+  const line = editor.document.lineAt(selection.active.line).text;
+  return extractSymbolAtTextOffset(line, selection.active.character);
 }
 
 async function withErrors(task: () => Promise<void>): Promise<void> {

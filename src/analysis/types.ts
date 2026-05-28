@@ -175,6 +175,8 @@ export interface AnalysisIndex {
   includePaths: string[];
   macros: string[];
   files: FileAnalysis[];
+  fileSignatures?: Record<string, FileSignature>;
+  fileUnresolved?: UnresolvedEvidence[];
   globals: Record<string, GlobalVariable[]>;
   structTypes: Record<string, StructTypeInfo>;
   memberSymbols: Record<string, MemberSymbol[]>;
@@ -182,6 +184,7 @@ export interface AnalysisIndex {
   macroAliases: Record<string, MacroAlias[]>;
   parserDiagnostics: ParserDiagnostic[];
   functions: Record<string, FunctionInfo>;
+  accessIndex?: Record<string, string[]>;
   callGraph: Record<string, string[]>;
   calledBy: Record<string, string[]>;
   threads: ThreadDefinition[];
@@ -196,6 +199,10 @@ export interface AnalysisIndex {
     reusedFiles: number;
     fullRebuildReason?: string;
     sourceFileCount: number;
+  };
+  storage?: {
+    layout: "split-v1";
+    functionsPath: string;
   };
 }
 

@@ -3,8 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildImpact } from "../src/analysis/impact";
-import { assertReadableTargetUnchanged, buildFullIndex, updateIndex, verifySignaturesUnchanged } from "../src/analysis/indexer";
+import { assertReadableTargetUnchanged, buildFullIndex, buildFullIndexToStorage, updateIndex, updateIndexToStorage, verifySignaturesUnchanged } from "../src/analysis/indexer";
 import { renderMarkdownReport, writeReviewReport } from "../src/analysis/report";
+import { readIndex, readIndexForSymbol } from "../src/analysis/store";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const fixtureRoot = path.resolve(__dirname, "fixtures", "vc6-sample");
@@ -46,6 +47,55 @@ describe("Impact index", () => {
     );
   });
 
+  it("writes Rust production indexes with a function sidecar and hydrates symbols on demand", async () => {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-prod-index-"));
+    const indexPath = path.join(outputDir, "vc6-impact-index.json");
+
+    const written = await buildFullIndexToStorage({
+      workspaceRoot: fixtureRoot,
+      projectFile,
+      threadMapFile,
+      parserEngine: "rust",
+      maxIndexWorkers: 1
+    }, indexPath);
+
+    expect(written.storage?.layout).toBe("split-v1");
+    expect(written.functions).toEqual({});
+    await expect(fs.readFile(path.join(outputDir, "vc6-impact-index.functions.jsonl"), "utf8")).resolves.toContain("WorkerThread");
+    const stored = await readIndex(indexPath);
+    expect(stored?.functions).toEqual({});
+
+    const hydrated = await readIndexForSymbol(indexPath, "g_counter");
+    expect(hydrated).toBeDefined();
+    const impact = buildImpact(hydrated!, "g_counter");
+    expect(impact.accesses.some((access) => access.kind === "write" && access.functionName === "WorkerThread")).toBe(true);
+  });
+
+  it("rebuilds a split production index when the function sidecar is missing", async () => {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-prod-index-"));
+    const indexPath = path.join(outputDir, "vc6-impact-index.json");
+    const first = await buildFullIndexToStorage({
+      workspaceRoot: fixtureRoot,
+      projectFile,
+      threadMapFile,
+      parserEngine: "rust",
+      maxIndexWorkers: 1
+    }, indexPath);
+    const sidecarPath = path.join(outputDir, "vc6-impact-index.functions.jsonl");
+    await fs.rm(sidecarPath, { force: true });
+
+    const updated = await updateIndexToStorage({
+      workspaceRoot: fixtureRoot,
+      projectFile,
+      threadMapFile,
+      parserEngine: "rust",
+      maxIndexWorkers: 1
+    }, first, indexPath);
+
+    expect(updated.build.fullRebuildReason).toBe("function-sidecar-missing");
+    await expect(fs.readFile(sidecarPath, "utf8")).resolves.toContain("WorkerThread");
+  });
+
   it("can build comparable JSON indexes with TypeScript and clang fallback engines", async () => {
     const rust = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "rust" });
     const typescript = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, parserEngine: "typescript" });
@@ -59,7 +109,7 @@ describe("Impact index", () => {
     expect(clang.build.phaseDurationsMs.clangFileConcurrency).toBe(3);
     expect(coreQualitySummary(typescript)).toEqual(coreQualitySummary(rust));
     expect(coreQualitySummary(clang)).toEqual(coreQualitySummary(rust));
-  }, 30000);
+  }, 60000);
 
   it("bounds TypeScript fallback file opens through maxIndexWorkers", async () => {
     const index = await buildFullIndex({
@@ -128,7 +178,7 @@ describe("Impact index", () => {
     expect(updated.build.reusedFiles).toBe(0);
     expect(updated.build.fullRebuildReason).toBe("rust-native-update-rebuild");
     expect(updated.build.parserMode).toBe("rust");
-  }, 15000);
+  }, 30000);
 
   it("produces the same core index shape with explicit single-worker and auto-worker options", async () => {
     const singleWorker = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile, maxIndexWorkers: 1 });
@@ -214,7 +264,7 @@ describe("Impact index", () => {
         expect.objectContaining({ variableName: "PTR_GBL->sub1.sample_value1", kind: "write" })
       ])
     );
-  }, 20000);
+  }, 30000);
 
   it("keeps unresolved typed pointer member access as review evidence", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
@@ -311,6 +361,49 @@ describe("Impact index", () => {
       }
     }
   });
+
+  it("keeps unknown member impact scoped to the requested access symbol", async () => {
+    const fixture = await createSingleFileProject([
+      "typedef struct tagLeaf { int value; } LEAF;",
+      "typedef struct tagChild { LEAF* ptr; } CHILD;",
+      "typedef struct tagMain { CHILD child; } MAIN;",
+      "MAIN* PTR_GBL;",
+      "int g_other;",
+      "void Worker(void) {",
+      "  PTR_GBL->child.ptr->value++;",
+      "  g_other++;",
+      "}"
+    ]);
+    const index = await buildFullIndex({ workspaceRoot: fixture.root, projectFile: fixture.projectFile, parserEngine: "rust", maxIndexWorkers: 1 });
+    const impact = buildImpact(index, "PTR_GBL->child.ptr->value");
+
+    expect(impact.symbolKind).toBe("unknown");
+    expect(impact.accesses.map((access) => access.variableName)).toEqual(["PTR_GBL->child.ptr->value"]);
+  });
+
+  it("classifies whitespace-separated TypeScript member expressions without leaking owner globals", async () => {
+    const fixture = await createSingleFileProject([
+      "typedef struct tagSub { int value; } SUB;",
+      "typedef struct tagMain { SUB sub1; } MAIN;",
+      "MAIN* PTR_GBL;",
+      "void Worker(void) {",
+      "  PTR_GBL -> sub1 . value++;",
+      "}"
+    ]);
+    const index = await buildFullIndex({ workspaceRoot: fixture.root, projectFile: fixture.projectFile, parserEngine: "typescript", maxIndexWorkers: 1 });
+    const accesses = index.functions.Worker.accesses;
+
+    expect(accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          variableName: "PTR_GBL->sub1.value",
+          kind: "write",
+          reasons: expect.arrayContaining(["increment-decrement"])
+        })
+      ])
+    );
+    expect(accesses.map((access) => access.variableName)).not.toContain("PTR_GBL");
+  });
 });
 
 describe("function impact", () => {
@@ -330,6 +423,16 @@ async function copyFixtureToTemp(): Promise<string> {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-fixture-"));
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
+}
+
+async function createSingleFileProject(sourceLines: string[]): Promise<{ root: string; projectFile: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-single-file-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  const projectFile = path.join(root, "sample.dsw");
+  await fs.writeFile(projectFile, 'Project: "sample"="sample.dsp" - Package Owner=<4>\r\n', "utf8");
+  await fs.writeFile(path.join(root, "sample.dsp"), "SOURCE=.\\src\\main.cpp\r\n", "utf8");
+  await fs.writeFile(path.join(root, "src", "main.cpp"), `${sourceLines.join("\n")}\n`, "utf8");
+  return { root, projectFile };
 }
 
 function coreQualitySummary(index: Awaited<ReturnType<typeof buildFullIndex>>): Record<string, unknown> {

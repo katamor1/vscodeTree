@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildFullIndex } from "../src/analysis/indexer";
-import { analyzeFilesWithRustSidecar, jsonTailForDiagnostics, looksLikeCompleteJsonObject } from "../src/analysis/rust/rustSourceScanner";
+import { analyzeFilesWithRustSidecar, jsonTailForDiagnostics, looksLikeCompleteJsonObject, parseRustOutputFile } from "../src/analysis/rust/rustSourceScanner";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const cp932Japanese = Buffer.from([0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
@@ -230,6 +230,29 @@ describe("Rust sidecar output and encoding", () => {
     expect(jsonTailForDiagnostics("a\n".repeat(300))).not.toContain("\n");
   });
 
+  it("parses Rust output JSON from disk without requiring a whole-file JSON parse", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-rust-output-"));
+    const outputPath = path.join(tempRoot, "out.json");
+    await fs.writeFile(
+      outputPath,
+      [
+        '{"files":[',
+        JSON.stringify(minimalFileAnalysis("one.cpp")),
+        ",",
+        JSON.stringify(minimalFileAnalysis("two.cpp")),
+        '],"diagnostics":[{"backend":"rust","severity":"info","message":"ok"}],"metrics":{"outputBytes":123},"workerCount":2}'
+      ].join(""),
+      "utf8"
+    );
+
+    const parsed = await parseRustOutputFile(outputPath);
+
+    expect(parsed.files.map((file) => path.basename(file.file))).toEqual(["one.cpp", "two.cpp"]);
+    expect(parsed.diagnostics?.[0]?.message).toBe("ok");
+    expect(parsed.metrics?.outputBytes).toBe(123);
+    expect(parsed.workerCount).toBe(2);
+  });
+
   it("builds an index from a CP932 source file through the Rust sidecar", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-cp932-source-"));
     await fs.mkdir(path.join(root, "src"), { recursive: true });
@@ -268,4 +291,16 @@ function ascii(value: string): Buffer {
 
 function cp932(parts: Buffer[]): Buffer {
   return Buffer.concat(parts);
+}
+
+function minimalFileAnalysis(name: string) {
+  return {
+    file: `C:/tmp/${name}`,
+    signature: { size: 1, mtimeMs: 1 },
+    globals: [],
+    structTypes: [],
+    macroDefinitions: [],
+    functions: [],
+    unresolved: []
+  };
 }

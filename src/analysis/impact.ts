@@ -34,7 +34,7 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     : symbolKind === "macro"
       ? functionsTouchingMacro(index, symbolName, macroTargets)
       : functionsTouchingSymbol(index, symbolName);
-  const accesses = symbolKind === "global" || symbolKind === "member"
+  const accesses = symbolKind === "global" || symbolKind === "member" || symbolKind === "unknown"
     ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
     : symbolKind === "macro"
       ? functions.flatMap((func) => func.accesses.filter((access) =>

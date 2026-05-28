@@ -1,4 +1,6 @@
 const fs = require("node:fs/promises");
+const nodeFs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 
@@ -48,7 +50,7 @@ const samples = {
 };
 
 async function main() {
-  const { buildFullIndex } = require("../dist/analysis/indexer");
+  const { buildFullIndexToStorage } = require("../dist/analysis/indexer");
   const args = parseArgs(process.argv.slice(2));
   const sample = samples[args.sample || "small"];
   if (!sample) {
@@ -56,47 +58,53 @@ async function main() {
   }
   await ensureCompiled();
   const manifest = await readJsonIfExists(path.join(sample.root, "manifest.json"));
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-bench-"));
+  const indexPath = path.join(tempRoot, "vc6-impact-index.json");
   const started = performance.now();
-  const index = await buildFullIndex({
-    workspaceRoot: sample.root,
-    projectFile: path.join(sample.root, sample.project),
-    threadMapFile: path.join(sample.root, sample.threadMap),
-    maxIndexWorkers: args.workers === undefined ? 0 : Number(args.workers),
-    maxNativeBatchFiles: args.batch === undefined ? undefined : Number(args.batch),
-    parserEngine: args.parser
-  });
-  const memory = process.memoryUsage();
-  const report = {
-    sample: args.sample || "small",
-    parserEngine: index.build.parserMode,
-    wallMs: Math.round(performance.now() - started),
-    reportedDurationMs: index.build.durationMs,
-    phaseDurationsMs: index.build.phaseDurationsMs,
-    workerCount: index.build.workerCount,
-    nativeBatchSize: index.build.phaseDurationsMs.rustBatchSize ?? 0,
-    nativeOutputMb: roundMb(index.build.phaseDurationsMs.rustOutputBytes ?? 0),
-    nativePeakRssMb: roundMb(index.build.phaseDurationsMs.rustPeakRssBytes ?? 0),
-    sourceFileCount: index.build.sourceFileCount,
-    globals: Object.keys(index.globals).length,
-    structTypes: Object.keys(index.structTypes).length,
-    memberSymbols: Object.keys(index.memberSymbols).length,
-    functions: Object.keys(index.functions).length,
-    functionAccesses: countFunctionAccesses(index),
-    macros: Object.keys(index.macroAliases || {}).length,
-    threads: index.threads.length,
-    reachability: Object.keys(index.threadReachability).length,
-    projectedIndexSizeMiB: manifest?.projectedIndexSizeMiB,
-    targetIndexSizeMiB: manifest?.targetIndexSizeMiB,
-    calibratedFrom: manifest?.calibratedFrom,
-    rssMb: Math.round(memory.rss / 1024 / 1024),
-    heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024)
-  };
-  const text = `${JSON.stringify(report, null, 2)}\n`;
-  if (args.output) {
-    await fs.mkdir(path.dirname(path.resolve(args.output)), { recursive: true });
-    await fs.writeFile(args.output, text, "utf8");
+  try {
+    const index = await buildFullIndexToStorage({
+      workspaceRoot: sample.root,
+      projectFile: path.join(sample.root, sample.project),
+      threadMapFile: path.join(sample.root, sample.threadMap),
+      maxIndexWorkers: args.workers === undefined ? 0 : Number(args.workers),
+      maxNativeBatchFiles: args.batch === undefined ? undefined : Number(args.batch),
+      parserEngine: args.parser
+    }, indexPath);
+    const memory = process.memoryUsage();
+    const report = {
+      sample: args.sample || "small",
+      parserEngine: index.build.parserMode,
+      wallMs: Math.round(performance.now() - started),
+      reportedDurationMs: index.build.durationMs,
+      phaseDurationsMs: index.build.phaseDurationsMs,
+      workerCount: index.build.workerCount,
+      nativeBatchSize: index.build.phaseDurationsMs.rustBatchSize ?? 0,
+      nativeOutputMb: roundMb(index.build.phaseDurationsMs.rustOutputBytes ?? 0),
+      nativePeakRssMb: roundMb(index.build.phaseDurationsMs.rustPeakRssBytes ?? 0),
+      sourceFileCount: index.build.sourceFileCount,
+      globals: Object.keys(index.globals).length,
+      structTypes: Object.keys(index.structTypes).length,
+      memberSymbols: Object.keys(index.memberSymbols).length,
+      functions: countFunctions(index),
+      functionAccesses: await countFunctionAccessesFromStorage(index, indexPath),
+      macros: Object.keys(index.macroAliases || {}).length,
+      threads: index.threads.length,
+      reachability: Object.keys(index.threadReachability).length,
+      projectedIndexSizeMiB: manifest?.projectedIndexSizeMiB,
+      targetIndexSizeMiB: manifest?.targetIndexSizeMiB,
+      calibratedFrom: manifest?.calibratedFrom,
+      rssMb: Math.round(memory.rss / 1024 / 1024),
+      heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024)
+    };
+    const text = `${JSON.stringify(report, null, 2)}\n`;
+    if (args.output) {
+      await fs.mkdir(path.dirname(path.resolve(args.output)), { recursive: true });
+      await fs.writeFile(args.output, text, "utf8");
+    }
+    console.log(text.trimEnd());
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
   }
-  console.log(text.trimEnd());
 }
 
 function roundMb(bytes) {
@@ -109,6 +117,41 @@ function sample2ScaleRoot(entries) {
 
 function countFunctionAccesses(index) {
   return Object.values(index.functions).reduce((sum, func) => sum + (func.accesses?.length ?? 0), 0);
+}
+
+function countFunctions(index) {
+  const loaded = Object.keys(index.functions || {}).length;
+  return loaded > 0 ? loaded : Object.keys(index.callGraph || {}).length;
+}
+
+async function countFunctionAccessesFromStorage(index, indexPath) {
+  if (Object.keys(index.functions || {}).length > 0 || !index.storage?.functionsPath) {
+    return countFunctionAccesses(index);
+  }
+  const functionsPath = path.isAbsolute(index.storage.functionsPath)
+    ? index.storage.functionsPath
+    : path.join(path.dirname(indexPath), index.storage.functionsPath);
+  let total = 0;
+  let buffer = "";
+  for await (const chunk of nodeFs.createReadStream(functionsPath, { encoding: "utf8" })) {
+    buffer += chunk;
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      total += countAccessesInFunctionLine(line);
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+  total += countAccessesInFunctionLine(buffer.trim());
+  return total;
+}
+
+function countAccessesInFunctionLine(line) {
+  if (!line) {
+    return 0;
+  }
+  return JSON.parse(line).accesses?.length ?? 0;
 }
 
 async function readJsonIfExists(file) {
@@ -162,6 +205,7 @@ if (require.main === module) {
 module.exports = {
   parseArgs,
   countFunctionAccesses,
+  countFunctionAccessesFromStorage,
   roundMb,
   sample2ScaleRoot,
   samples

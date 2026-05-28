@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeCommandSymbolArg } from "../src/extension/commandArgs";
+import { extractSymbolAtTextOffset, normalizeCommandSymbolArg } from "../src/extension/commandArgs";
 
 describe("normalizeCommandSymbolArg", () => {
   it("accepts plain string symbols", () => {
@@ -16,5 +16,19 @@ describe("normalizeCommandSymbolArg", () => {
     expect(normalizeCommandSymbolArg({ scheme: "file", fsPath: "C:/tmp/main.cpp" })).toBeUndefined();
     expect(normalizeCommandSymbolArg({ label: 123 })).toBeUndefined();
     expect(normalizeCommandSymbolArg(undefined)).toBeUndefined();
+  });
+});
+
+describe("extractSymbolAtTextOffset", () => {
+  it("selects a whole struct member expression around the cursor", () => {
+    const source = "void f(void) { PTR_GBL->sub1.sample_value1++; }";
+
+    expect(extractSymbolAtTextOffset(source, source.indexOf("sub1") + 1)).toBe("PTR_GBL->sub1.sample_value1");
+    expect(extractSymbolAtTextOffset(source, source.indexOf("sample_value1") + 2)).toBe("PTR_GBL->sub1.sample_value1");
+  });
+
+  it("selects dotted members and plain function names", () => {
+    expect(extractSymbolAtTextOffset("g_state.mode = 1;", "g_state.mode".length - 1)).toBe("g_state.mode");
+    expect(extractSymbolAtTextOffset("CommonUpdate();", 2)).toBe("CommonUpdate");
   });
 });

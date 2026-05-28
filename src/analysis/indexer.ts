@@ -1,8 +1,12 @@
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { parseVc6Project } from "./vc6ProjectParser";
 import { readThreadMap } from "./threadMap";
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature } from "./sourceScanner";
 import { analyzeFilesWithParserBackend } from "./parserBackend";
+import { mapWithConcurrency } from "./limitedConcurrency";
+import { parseRustOutputFile, runRustAnalyzeManyToOutput, rustPhaseDurations } from "./rust/rustSourceScanner";
+import { createIndexFunctionWriter, writeIndex } from "./store";
 import type {
   AnalysisIndex,
   BuildOptions,
@@ -18,6 +22,10 @@ import type {
   ThreadDefinition,
   ThreadReachability
 } from "./types";
+
+const SIGNATURE_CHECK_CONCURRENCY = 64;
+
+type SummaryFile = Pick<FileAnalysis, "file" | "signature" | "globals" | "structTypes" | "macroDefinitions" | "functions" | "unresolved">;
 
 export async function buildFullIndex(options: BuildOptions): Promise<AnalysisIndex> {
   const started = Date.now();
@@ -64,6 +72,35 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   });
 }
 
+export async function buildFullIndexToStorage(options: BuildOptions, indexPath: string): Promise<AnalysisIndex> {
+  const parserEngine = options.parserEngine ?? "rust";
+  if (parserEngine !== "rust") {
+    const index = await buildFullIndex(options);
+    await writeIndex(indexPath, index);
+    return index;
+  }
+
+  const started = Date.now();
+  const phaseDurationsMs: Record<string, number> = {};
+  let phaseStarted = Date.now();
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
+  phaseStarted = Date.now();
+  const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
+  phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
+  return buildRustIndexToStorage({
+    indexPath,
+    options,
+    mode: "full",
+    started,
+    phaseDurationsMs,
+    project,
+    threads: threadMap.threads,
+    changedFiles: project.sourceFiles,
+    reusedFiles: 0
+  });
+}
+
 export async function updateIndex(
   options: BuildOptions,
   previousIndex: AnalysisIndex | undefined
@@ -99,34 +136,36 @@ export async function updateIndex(
     return index;
   }
 
-  const previousFilesByPath = new Map(previousIndex.files.map((file) => [file.file, file]));
+  const previousFilesByPath = previousFileSignatures(previousIndex);
   phaseStarted = Date.now();
   const changedFiles = await findChangedFiles(project.sourceFiles, previousFilesByPath);
   phaseDurationsMs.signatureCheck = elapsedSince(phaseStarted);
   if (changedFiles.length === 0) {
-    return composeIndex({
-      mode: "update",
-      started,
-      workspaceRoot: project.workspaceRoot,
+    return {
+      ...previousIndex,
+      generatedAt: new Date().toISOString(),
       projectFile: project.projectFile,
       projectFiles: project.sourceFiles,
       includePaths: project.includePaths,
       macros: project.macros,
-      files: previousIndex.files,
       threads: threadMap.threads,
-      changedFiles,
-      reusedFiles: previousIndex.files.length,
-      sourceFileCount: project.sourceFiles.length,
-      parserEngine,
-      phaseDurationsMs: {
-        ...phaseDurationsMs,
-        structureScan: 0,
-        symbolMap: 0,
-        accessAnalysis: 0
-      },
-      workerCount: 0,
-      parserDiagnostics: previousIndex.parserDiagnostics ?? []
-    });
+      threadReachability: buildThreadReachability(threadMap.threads, previousIndex.callGraph),
+      build: {
+        mode: "update",
+        parserMode: parserEngine,
+        durationMs: Date.now() - started,
+        phaseDurationsMs: {
+          ...phaseDurationsMs,
+          structureScan: 0,
+          symbolMap: 0,
+          accessAnalysis: 0
+        },
+        workerCount: 0,
+        changedFiles,
+        reusedFiles: project.sourceFiles.length,
+        sourceFileCount: project.sourceFiles.length
+      }
+    };
   }
 
   const index = await buildFullIndex(options);
@@ -137,6 +176,319 @@ export async function updateIndex(
     ? "rust-native-update-rebuild"
     : `${parserEngine}-update-rebuild`;
   return index;
+}
+
+export async function updateIndexToStorage(
+  options: BuildOptions,
+  previousIndex: AnalysisIndex | undefined,
+  indexPath: string
+): Promise<AnalysisIndex> {
+  const parserEngine = options.parserEngine ?? "rust";
+  if (parserEngine !== "rust") {
+    const index = await updateIndex(options, previousIndex);
+    await writeIndex(indexPath, index);
+    return index;
+  }
+  if (!previousIndex) {
+    const index = await buildFullIndexToStorage(options, indexPath);
+    index.build.mode = "update";
+    index.build.fullRebuildReason = "previous-index-missing";
+    await writeIndex(indexPath, index);
+    return index;
+  }
+
+  const started = Date.now();
+  const phaseDurationsMs: Record<string, number> = {};
+  let phaseStarted = Date.now();
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
+  phaseStarted = Date.now();
+  const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
+  phaseDurationsMs.threadMap = elapsedSince(phaseStarted);
+
+  if (!sameStringSet(project.sourceFiles, previousIndex.projectFiles)) {
+    return buildRustIndexToStorage({
+      indexPath,
+      options,
+      mode: "update",
+      started,
+      phaseDurationsMs,
+      project,
+      threads: threadMap.threads,
+      changedFiles: project.sourceFiles,
+      reusedFiles: 0,
+      fullRebuildReason: "project-source-list-changed"
+    });
+  }
+
+  if (previousIndex.build.parserMode !== parserEngine) {
+    return buildRustIndexToStorage({
+      indexPath,
+      options,
+      mode: "update",
+      started,
+      phaseDurationsMs,
+      project,
+      threads: threadMap.threads,
+      changedFiles: project.sourceFiles,
+      reusedFiles: 0,
+      fullRebuildReason: "parser-engine-changed"
+    });
+  }
+
+  const previousFilesByPath = previousFileSignatures(previousIndex);
+  phaseStarted = Date.now();
+  const changedFiles = await findChangedFiles(project.sourceFiles, previousFilesByPath);
+  phaseDurationsMs.signatureCheck = elapsedSince(phaseStarted);
+  if (changedFiles.length === 0) {
+    if (!(await splitFunctionSidecarExists(indexPath, previousIndex))) {
+      return buildRustIndexToStorage({
+        indexPath,
+        options,
+        mode: "update",
+        started,
+        phaseDurationsMs,
+        project,
+        threads: threadMap.threads,
+        changedFiles: project.sourceFiles,
+        reusedFiles: 0,
+        fullRebuildReason: "function-sidecar-missing"
+      });
+    }
+    const index: AnalysisIndex = {
+      ...previousIndex,
+      generatedAt: new Date().toISOString(),
+      projectFile: project.projectFile,
+      projectFiles: project.sourceFiles,
+      includePaths: project.includePaths,
+      macros: project.macros,
+      threads: threadMap.threads,
+      threadReachability: buildThreadReachability(threadMap.threads, previousIndex.callGraph),
+      build: {
+        mode: "update",
+        parserMode: parserEngine,
+        durationMs: Date.now() - started,
+        phaseDurationsMs: {
+          ...phaseDurationsMs,
+          structureScan: 0,
+          symbolMap: 0,
+          accessAnalysis: 0
+        },
+        workerCount: 0,
+        changedFiles,
+        reusedFiles: project.sourceFiles.length,
+        sourceFileCount: project.sourceFiles.length
+      }
+    };
+    await writeIndex(indexPath, index);
+    return index;
+  }
+
+  return buildRustIndexToStorage({
+    indexPath,
+    options,
+    mode: "update",
+    started,
+    phaseDurationsMs,
+    project,
+    threads: threadMap.threads,
+    changedFiles,
+    reusedFiles: 0,
+    fullRebuildReason: "rust-native-update-rebuild"
+  });
+}
+
+async function buildRustIndexToStorage(args: {
+  indexPath: string;
+  options: BuildOptions;
+  mode: "full" | "update";
+  started: number;
+  phaseDurationsMs: Record<string, number>;
+  project: {
+    workspaceRoot: string;
+    projectFile: string;
+    sourceFiles: string[];
+    includePaths: string[];
+    macros: string[];
+  };
+  threads: ThreadDefinition[];
+  changedFiles: string[];
+  reusedFiles: number;
+  fullRebuildReason?: string;
+}): Promise<AnalysisIndex> {
+  let phaseStarted = Date.now();
+  const output = await runRustAnalyzeManyToOutput(
+    args.project.sourceFiles,
+    args.options.maxIndexWorkers,
+    args.options.sourceEncoding ?? "auto",
+    args.options.maxNativeBatchFiles
+  );
+  args.phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
+  const functionWriter = await createIndexFunctionWriter(args.indexPath);
+  try {
+    const composeStarted = Date.now();
+    const summaryFiles: SummaryFile[] = [];
+    const globals: Record<string, GlobalVariable[]> = {};
+    const fileSignatures: Record<string, FileSignature> = {};
+    const fileUnresolved: FileAnalysis["unresolved"] = [];
+    const callGraph: Record<string, string[]> = {};
+    const calledBy: Record<string, string[]> = {};
+    const accessIndex = new Map<string, Set<string>>();
+
+    const parsed = await parseRustOutputFile(output.outputPath, async (file) => {
+      fileSignatures[file.file] = file.signature;
+      if (file.unresolved.length > 0) {
+        fileUnresolved.push(...file.unresolved);
+      }
+      summaryFiles.push({
+        file: file.file,
+        signature: file.signature,
+        globals: file.globals,
+        structTypes: file.structTypes,
+        macroDefinitions: file.macroDefinitions,
+        functions: [],
+        unresolved: file.unresolved
+      });
+      for (const global of file.globals) {
+        globals[global.name] = [...(globals[global.name] ?? []), global];
+      }
+      for (const func of file.functions) {
+        callGraph[func.name] = func.calls;
+        for (const called of func.calls) {
+          calledBy[called] = [...(calledBy[called] ?? []), func.name];
+        }
+        addAccessIndexEntries(accessIndex, func);
+        await functionWriter.write(func);
+      }
+    });
+    await functionWriter.commit();
+    output.diagnostics.push(...(parsed.diagnostics ?? []));
+    Object.assign(
+      args.phaseDurationsMs,
+      rustPhaseDurations(parsed.metrics, args.project.sourceFiles.length, output.outputBytes, output.nativeBatchSize)
+    );
+    args.phaseDurationsMs.symbolMap = args.phaseDurationsMs.rustSymbolMap ?? 0;
+    args.phaseDurationsMs.accessAnalysis = args.phaseDurationsMs.rustAccessAnalysis ?? 0;
+
+    const memberContext = buildMemberAnalysisContext(summaryFiles);
+    const globalNames = new Set(Object.keys(globals));
+    const macroContext = buildMacroAnalysisContext(summaryFiles, globalNames, memberContext);
+    const structTypes: Record<string, StructTypeInfo> = {};
+    const memberSymbols: Record<string, MemberSymbol[]> = {};
+    const macroDefinitions: Record<string, MacroDefinition[]> = {};
+    const macroAliases: Record<string, MacroAlias[]> = {};
+    for (const [typeName, typeInfo] of memberContext.structTypes) {
+      structTypes[typeName] = typeInfo;
+    }
+    for (const [memberName, symbols] of memberContext.memberSymbols) {
+      memberSymbols[memberName] = symbols;
+    }
+    for (const [macroName, definitions] of macroContext.definitions) {
+      macroDefinitions[macroName] = definitions;
+    }
+    for (const [macroName, aliases] of macroContext.aliases) {
+      macroAliases[macroName] = aliases;
+    }
+
+    const normalizedCallGraph = normalizeStringArrayRecord(callGraph);
+    const normalizedCalledBy = normalizeStringArrayRecord(calledBy);
+    args.phaseDurationsMs.compose = elapsedSince(composeStarted);
+    const index: AnalysisIndex = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      workspaceRoot: args.project.workspaceRoot,
+      projectFile: args.project.projectFile,
+      projectFiles: args.project.sourceFiles,
+      includePaths: args.project.includePaths,
+      macros: args.project.macros,
+      files: [],
+      fileSignatures,
+      fileUnresolved,
+      globals,
+      structTypes,
+      memberSymbols,
+      macroDefinitions,
+      macroAliases,
+      parserDiagnostics: output.diagnostics,
+      functions: {},
+      accessIndex: objectFromSetMap(accessIndex),
+      callGraph: normalizedCallGraph,
+      calledBy: normalizedCalledBy,
+      threads: args.threads,
+      threadReachability: buildThreadReachability(args.threads, normalizedCallGraph),
+      build: {
+        mode: args.mode,
+        parserMode: "rust",
+        durationMs: Date.now() - args.started,
+        phaseDurationsMs: args.phaseDurationsMs,
+        workerCount: parsed.workerCount ?? 1,
+        changedFiles: args.changedFiles,
+        reusedFiles: args.reusedFiles,
+        fullRebuildReason: args.fullRebuildReason,
+        sourceFileCount: args.project.sourceFiles.length
+      },
+      storage: {
+        layout: "split-v1",
+        functionsPath: path.basename(functionWriter.targetPath)
+      }
+    };
+    await writeIndex(args.indexPath, index);
+    return index;
+  } catch (error) {
+    await functionWriter.dispose();
+    throw error;
+  } finally {
+    await output.cleanup();
+  }
+}
+
+function addAccessIndexEntries(index: Map<string, Set<string>>, func: FunctionInfo): void {
+  for (const access of func.accesses) {
+    addAccessIndexEntry(index, access.variableName, func.name);
+    if (access.targetName) {
+      addAccessIndexEntry(index, access.targetName, func.name);
+    }
+    for (const macroName of access.macroNames ?? []) {
+      addAccessIndexEntry(index, macroName, func.name);
+    }
+  }
+}
+
+function addAccessIndexEntry(index: Map<string, Set<string>>, symbolName: string, functionName: string): void {
+  if (!symbolName) {
+    return;
+  }
+  (index.get(symbolName) ?? index.set(symbolName, new Set()).get(symbolName)!).add(functionName);
+}
+
+function objectFromSetMap(values: Map<string, Set<string>>): Record<string, string[]> {
+  return Object.fromEntries(
+    [...values.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, items]) => [name, [...items].sort()])
+  );
+}
+
+function normalizeStringArrayRecord(values: Record<string, string[]>): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(values)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, items]) => [key, [...new Set(items)].sort()])
+  );
+}
+
+async function splitFunctionSidecarExists(indexPath: string, index: AnalysisIndex): Promise<boolean> {
+  if (index.storage?.layout !== "split-v1") {
+    return true;
+  }
+  const configured = index.storage.functionsPath;
+  const functionsPath = path.isAbsolute(configured) ? configured : path.join(path.dirname(indexPath), configured);
+  try {
+    await fs.access(functionsPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function composeIndex(args: {
@@ -201,6 +553,8 @@ function composeIndex(args: {
     }
   }
 
+  const normalizedCallGraph = normalizeStringArrayRecord(callGraph);
+  const normalizedCalledBy = normalizeStringArrayRecord(calledBy);
   const index: AnalysisIndex = {
     version: 1,
     generatedAt: new Date().toISOString(),
@@ -217,10 +571,10 @@ function composeIndex(args: {
     macroAliases,
     parserDiagnostics: args.parserDiagnostics,
     functions,
-    callGraph,
-    calledBy,
+    callGraph: normalizedCallGraph,
+    calledBy: normalizedCalledBy,
     threads: args.threads,
-    threadReachability: buildThreadReachability(args.threads, callGraph),
+    threadReachability: buildThreadReachability(args.threads, normalizedCallGraph),
     build: {
       mode: args.mode,
       parserMode: args.parserEngine,
@@ -279,20 +633,35 @@ function buildThreadReachability(
 
 async function findChangedFiles(
   projectFiles: string[],
-  previousFilesByPath: Map<string, { signature: FileSignature }>
+  previousFilesByPath: Map<string, FileSignature>
 ): Promise<string[]> {
-  const checks = await Promise.all(projectFiles.map(async (file) => {
-    const previous = previousFilesByPath.get(file);
-    if (!previous) {
-      return file;
+  const checks = await mapWithConcurrency(
+    projectFiles,
+    SIGNATURE_CHECK_CONCURRENCY,
+    async (file) => {
+      const previous = previousFilesByPath.get(file);
+      if (!previous) {
+        return file;
+      }
+      const current = await getFileSignature(file);
+      if (!sameFileSignature(current, previous)) {
+        return file;
+      }
+      return undefined;
     }
-    const current = await getFileSignature(file);
-    if (current.size !== previous.signature.size || current.mtimeMs !== previous.signature.mtimeMs) {
-      return file;
-    }
-    return undefined;
-  }));
+  );
   return checks.filter((file): file is string => Boolean(file)).sort();
+}
+
+function previousFileSignatures(previousIndex: AnalysisIndex): Map<string, FileSignature> {
+  if (previousIndex.fileSignatures) {
+    return new Map(Object.entries(previousIndex.fileSignatures));
+  }
+  return new Map(previousIndex.files.map((file) => [file.file, file.signature]));
+}
+
+function sameFileSignature(left: FileSignature, right: FileSignature): boolean {
+  return left.size === right.size && Math.abs(left.mtimeMs - right.mtimeMs) < 2;
 }
 
 function sameStringSet(left: string[], right: string[]): boolean {
@@ -305,10 +674,12 @@ function sameStringSet(left: string[], right: string[]): boolean {
 
 export async function assertReadableTargetUnchanged(projectFiles: string[]): Promise<Record<string, FileSignature>> {
   const signatures: Record<string, FileSignature> = {};
-  await Promise.all(
-    projectFiles.map(async (file) => {
+  await mapWithConcurrency(
+    projectFiles,
+    SIGNATURE_CHECK_CONCURRENCY,
+    async (file) => {
       signatures[file] = await getFileSignature(file);
-    })
+    }
   );
   return signatures;
 }
@@ -317,13 +688,15 @@ export async function verifySignaturesUnchanged(
   before: Record<string, FileSignature>
 ): Promise<{ ok: boolean; changed: string[] }> {
   const changed: string[] = [];
-  await Promise.all(
-    Object.entries(before).map(async ([file, signature]) => {
+  await mapWithConcurrency(
+    Object.entries(before),
+    SIGNATURE_CHECK_CONCURRENCY,
+    async ([file, signature]) => {
       const current = await getFileSignature(file);
       if (current.size !== signature.size || current.mtimeMs !== signature.mtimeMs) {
         changed.push(file);
       }
-    })
+    }
   );
   return { ok: changed.length === 0, changed: changed.sort() };
 }

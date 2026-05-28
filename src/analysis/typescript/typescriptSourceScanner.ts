@@ -54,6 +54,9 @@ interface ParameterTemplate {
 
 interface MemberExpression {
   expression: string;
+  sourceExpression: string;
+  start: number;
+  end: number;
   ownerName: string;
   connector: "." | "->";
   memberPath: string[];
@@ -212,7 +215,7 @@ function analyzeFunction(func: FunctionStructure, context: TypeScriptContext): F
     const maskedWithoutMembers = maskMemberExpressions(masked, memberExpressions);
     for (const expression of memberExpressions) {
       const resolved = resolveMemberExpression(expression, context, localAliases, parameterTypes);
-      const classified = classifyAccessDetails(masked, expression.expression);
+      const classified = classifyAccessDetails(masked, expression.sourceExpression);
       if (resolved.targetName) {
         pushAccess(accesses, seenAccesses, {
           variableName: resolved.targetName,
@@ -522,7 +525,7 @@ function buildParameterTemplates(func: FunctionStructure, macroContext: MacroAna
       if (index === undefined) {
         continue;
       }
-      const key = `${index}:${expression.memberPath.join(".")}:${classifyAccess(masked, expression.expression)}`;
+      const key = `${index}:${expression.memberPath.join(".")}:${classifyAccess(masked, expression.sourceExpression)}`;
       if (seen.has(key)) {
         continue;
       }
@@ -530,7 +533,7 @@ function buildParameterTemplates(func: FunctionStructure, macroContext: MacroAna
       result.push({
         parameterIndex: index,
         memberPath: expression.memberPath,
-        kind: classifyAccess(masked, expression.expression),
+        kind: classifyAccess(masked, expression.sourceExpression),
         memberName: expression.memberPath.at(-1)
       });
     }
@@ -578,7 +581,7 @@ function resolveMemberExpression(
 
 function resolveCallArgumentOwner(argument: string, context: TypeScriptContext, localAliases: Map<string, PointerAlias>): PointerAlias | undefined {
   const normalized = argument.trim().replace(/^&\s*/, "").replace(/\[[^\]]+\]/g, "[]");
-  const memberExpression = extractMemberExpressions(normalized).find((expression) => expression.expression === normalized);
+  const memberExpression = extractMemberExpressions(normalized).find((expression) => expression.start === 0 && expression.end === normalized.length);
   if (memberExpression) {
     const resolved = resolveMemberExpression(memberExpression, context, localAliases, new Map());
     if (resolved.targetName) {
@@ -621,10 +624,14 @@ function extractMemberExpressions(line: string): MemberExpression[] {
   const re = /\b([A-Za-z_]\w*)(?:\s*\[[^\]]+\])?\s*(\.|->)\s*([A-Za-z_]\w*(?:(?:\s*(?:\.|->)\s*)[A-Za-z_]\w*)*)/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(line))) {
-    const raw = match[0].replace(/\s+/g, "");
+    const sourceExpression = match[0];
+    const raw = sourceExpression.replace(/\s+/g, "");
     const ownerName = /\[[^\]]+\]/.test(match[0].slice(0, match[0].indexOf(match[2]))) ? `${match[1]}[]` : match[1];
     result.push({
       expression: raw,
+      sourceExpression,
+      start: match.index,
+      end: match.index + sourceExpression.length,
       ownerName,
       connector: match[2] as "." | "->",
       memberPath: match[3].split(/\.|->/).map((item) => item.trim()).filter(Boolean)
@@ -634,11 +641,13 @@ function extractMemberExpressions(line: string): MemberExpression[] {
 }
 
 function maskMemberExpressions(line: string, expressions: MemberExpression[]): string {
-  let masked = line;
-  for (const expression of [...expressions].sort((left, right) => right.expression.length - left.expression.length)) {
-    masked = masked.replace(expression.expression, " ".repeat(expression.expression.length));
+  const chars = line.split("");
+  for (const expression of expressions) {
+    for (let index = expression.start; index < expression.end; index += 1) {
+      chars[index] = " ";
+    }
   }
-  return masked;
+  return chars.join("");
 }
 
 function directCalls(line: string): Array<{ name: string; arguments: string[] }> {
