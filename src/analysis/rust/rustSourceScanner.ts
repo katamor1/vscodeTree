@@ -94,8 +94,17 @@ export async function analyzeFilesWithRustSidecar(
         rustTotalNative: parsed.metrics?.totalNative ?? 0,
         rustFileCount: parsed.metrics?.fileCount ?? files.length,
         rustBatchSize: parsed.metrics?.batchSize ?? nativeBatchSize,
+        rustSummaryBatchSize: parsed.metrics?.summaryBatchSize ?? nativeBatchSize,
+        rustStreamedSummaryFileCount: parsed.metrics?.streamedSummaryFileCount ?? 0,
+        rustMaxSummaryBatchFiles: parsed.metrics?.maxSummaryBatchFiles ?? 0,
+        rustSummaryRetainedFileCount: parsed.metrics?.summaryRetainedFileCount ?? 0,
         rustStreamedFileCount: parsed.metrics?.streamedFileCount ?? 0,
         rustMaxStructureBatchFiles: parsed.metrics?.maxStructureBatchFiles ?? 0,
+        rustContextGlobalCount: parsed.metrics?.contextGlobalCount ?? 0,
+        rustContextFunctionNameCount: parsed.metrics?.contextFunctionNameCount ?? 0,
+        rustContextStructTypeCount: parsed.metrics?.contextStructTypeCount ?? 0,
+        rustContextGlobalTypeCount: parsed.metrics?.contextGlobalTypeCount ?? 0,
+        rustContextMacroAliasCount: parsed.metrics?.contextMacroAliasCount ?? 0,
         rustOutputBytes: parsed.metrics?.outputBytes ?? outputBytes,
         rustPeakRssBytes: parsed.metrics?.peakRssBytes ?? 0
       }

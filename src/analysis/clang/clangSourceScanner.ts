@@ -12,7 +12,8 @@ export async function analyzeFilesWithClang(
   files: string[],
   sourceEncoding: TextEncoding = "auto",
   includePaths: string[] = [],
-  macros: string[] = []
+  macros: string[] = [],
+  maxConcurrentFiles = 8
 ): Promise<TypeScriptAnalysisResult> {
   const diagnostics: ParserDiagnostic[] = [];
   const clang = await findClangExecutable();
@@ -22,7 +23,7 @@ export async function analyzeFilesWithClang(
       severity: "warning",
       message: "clang executable was not found; using TypeScript extraction without clang diagnostics."
     });
-    return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics);
+    return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles);
   }
 
   diagnostics.push({
@@ -43,7 +44,7 @@ export async function analyzeFilesWithClang(
       message: `clang diagnostics limited to first 200 files of ${files.length}; TypeScript extraction still processed all files.`
     });
   }
-  return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics);
+  return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles);
 }
 
 async function runClangSyntaxOnly(

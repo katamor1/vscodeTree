@@ -1,10 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { mapWithConcurrency } from "./limitedConcurrency";
 import { matchesExcluded, normalizePath, resolveMaybeRelative } from "./pathUtils";
 import { readTextFile, type TextEncoding } from "./textEncoding";
 import type { Vc6ProjectInfo } from "./types";
 
 const SOURCE_EXTENSIONS = new Set([".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".inl"]);
+const FILE_EXISTS_CONCURRENCY = 64;
 
 export async function parseVc6Project(
   workspaceRoot: string,
@@ -22,6 +24,9 @@ export async function parseVc6Project(
   const macros = new Set<string>();
 
   for (const dspFile of dspFiles) {
+    if (ext === ".dsw" && !(await fileExists(dspFile))) {
+      continue;
+    }
     const dsp = await parseDsp(dspFile, workspaceRoot, excludeGlobs, projectEncoding);
     dsp.sourceFiles.forEach((file) => sourceFiles.add(file));
     dsp.includePaths.forEach((includePath) => includePaths.add(includePath));
@@ -68,7 +73,7 @@ async function parseDsp(
 ): Promise<Pick<Vc6ProjectInfo, "sourceFiles" | "includePaths" | "macros">> {
   const text = (await readTextFile(dspFile, projectEncoding)).text;
   const baseDir = path.dirname(dspFile);
-  const sourceFiles = new Set<string>();
+  const sourceCandidates = new Set<string>();
   const includePaths = new Set<string>();
   const macros = new Set<string>();
 
@@ -81,8 +86,11 @@ async function parseDsp(
         continue;
       }
       const sourceFile = resolveMaybeRelative(baseDir, sourcePath);
-      if (SOURCE_EXTENSIONS.has(path.extname(sourceFile).toLowerCase()) && !matchesExcluded(sourceFile, excludeGlobs)) {
-        sourceFiles.add(sourceFile);
+      if (
+        SOURCE_EXTENSIONS.has(path.extname(sourceFile).toLowerCase()) &&
+        !matchesExcluded(sourceFile, excludeGlobs)
+      ) {
+        sourceCandidates.add(sourceFile);
       }
       continue;
     }
@@ -97,11 +105,31 @@ async function parseDsp(
     }
   }
 
+  const sourceFiles = await filterExistingFiles([...sourceCandidates]);
   return {
-    sourceFiles: [...sourceFiles].sort(),
+    sourceFiles: sourceFiles.sort(),
     includePaths: [...includePaths].sort(),
     macros: [...macros].sort()
   };
+}
+
+async function filterExistingFiles(files: string[]): Promise<string[]> {
+  const checked = await mapWithConcurrency(files, FILE_EXISTS_CONCURRENCY, async (file) =>
+    (await fileExists(file)) ? file : undefined
+  );
+  return checked.filter((file): file is string => typeof file === "string");
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function parseDswProjectPath(line: string): string | undefined {

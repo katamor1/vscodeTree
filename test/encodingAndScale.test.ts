@@ -55,6 +55,37 @@ describe("VC6 encoding and path parsing", () => {
     );
     expect(project.macros).toEqual(["NAME=VALUE", "PLAIN", "WIN32"]);
   });
+
+  it("skips generated source files and missing DSW projects that are absent during parsing", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-missing-generated-"));
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    await fs.writeFile(path.join(root, "src", "main.cpp"), "int g_existing;\n", "utf8");
+    await fs.writeFile(
+      path.join(root, "sample.dsw"),
+      [
+        'Project: "existing"=".\\existing.dsp" - Package Owner=<4>',
+        'Project: "generated"=".\\generated_project.dsp" - Package Owner=<4>',
+        ""
+      ].join("\r\n"),
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(root, "existing.dsp"),
+      [
+        "SOURCE=.\\src\\main.cpp",
+        "SOURCE=.\\src\\generated_header.h",
+        "SOURCE=.\\src\\generated_source.cpp",
+        ""
+      ].join("\r\n"),
+      "utf8"
+    );
+
+    const project = await parseVc6Project(root, path.join(root, "sample.dsw"), [], "auto");
+
+    expect(project.sourceFiles).toEqual([
+      path.join(root, "src", "main.cpp").replace(/\\/g, "/")
+    ]);
+  });
 });
 
 describe("Rust sidecar output and encoding", () => {
@@ -183,6 +214,9 @@ describe("Rust sidecar output and encoding", () => {
 
     expect(result.files.length).toBe(2);
     expect(result.phaseDurationsMs.rustBatchSize).toBe(2);
+    expect(result.phaseDurationsMs.rustStreamedSummaryFileCount).toBe(2);
+    expect(result.phaseDurationsMs.rustMaxSummaryBatchFiles).toBe(2);
+    expect(result.phaseDurationsMs.rustSummaryRetainedFileCount).toBe(0);
     expect(result.phaseDurationsMs.rustMaxStructureBatchFiles).toBe(2);
     expect(result.phaseDurationsMs.rustStreamedFileCount).toBe(2);
     expect(result.phaseDurationsMs.rustOutputBytes).toBeGreaterThan(0);

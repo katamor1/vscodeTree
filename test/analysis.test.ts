@@ -55,9 +55,23 @@ describe("Impact index", () => {
     expect(clang.build.parserMode).toBe("clang");
     expect(typescript.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toContain("typescript parser backend");
     expect(clang.parserDiagnostics.map((diagnostic) => diagnostic.message).join("\n")).toMatch(/clang/);
+    expect(typescript.build.phaseDurationsMs.typescriptFileConcurrency).toBe(3);
+    expect(clang.build.phaseDurationsMs.clangFileConcurrency).toBe(3);
     expect(coreQualitySummary(typescript)).toEqual(coreQualitySummary(rust));
     expect(coreQualitySummary(clang)).toEqual(coreQualitySummary(rust));
-  }, 20000);
+  }, 30000);
+
+  it("bounds TypeScript fallback file opens through maxIndexWorkers", async () => {
+    const index = await buildFullIndex({
+      workspaceRoot: fixtureRoot,
+      projectFile,
+      threadMapFile,
+      parserEngine: "typescript",
+      maxIndexWorkers: 2
+    });
+
+    expect(index.build.phaseDurationsMs.typescriptFileConcurrency).toBe(2);
+  });
 
   it("keeps pointer alias uncertainty as unresolved review evidence", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
@@ -180,6 +194,27 @@ describe("Impact index", () => {
     expect(unresolvedEvidence).not.toContain("PTR_GBL->sub4.subsub_ptr = &subLocal;");
     expect(unresolvedEvidence).not.toContain("subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;");
   });
+
+  it("exposes nested pointer-global member declarations and accesses with clang fallback", async () => {
+    const sample2 = await createSample2ImpactFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: sample2.root,
+      projectFile: sample2.projectFile,
+      threadMapFile: sample2.threadMapFile,
+      parserEngine: "clang",
+      maxIndexWorkers: 1
+    });
+    const impact = buildImpact(index, "PTR_GBL->sub1.sample_value1");
+
+    expect(index.memberSymbols["PTR_GBL->sub1.sample_value1"]?.length).toBeGreaterThan(0);
+    expect(impact.symbolKind).toBe("member");
+    expect(impact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variableName: "PTR_GBL->sub1.sample_value1", kind: "read" }),
+        expect.objectContaining({ variableName: "PTR_GBL->sub1.sample_value1", kind: "write" })
+      ])
+    );
+  }, 20000);
 
   it("keeps unresolved typed pointer member access as review evidence", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
@@ -369,6 +404,7 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
     [
       '#include "header.h"',
       "extern SAMPLE_MAIN* PTR_GBL;",
+      "int api_major1_sub1(int minor) { return PTR_GBL->sub1.sample_value1 + minor; }",
       "int api_major3_sub1(int minor) { return PTR_GBL->sub3.sample_value1 + minor; }",
       ""
     ].join("\n"),
@@ -387,6 +423,9 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
       "    subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;",
       "    subPtr.sample_value3 = &PTR_GBL->sub3.sample_value3;",
       "    PTR_GBL->sub3.sample_value1++;",
+      "}",
+      "void thread1_entry(void) {",
+      "    thread_sub1ptr(&PTR_GBL->sub1);",
       "}",
       "void thread3_entry(void) {",
       "    thread_sub1ptr(&PTR_GBL->sub3);",

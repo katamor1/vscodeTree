@@ -249,14 +249,37 @@ struct ParameterMemberAccessTemplate {
 
 #[derive(Clone)]
 struct GlobalTypeInfo {
-    global: GlobalVariable,
-    type_info: StructTypeInfo,
+    type_name: String,
+    is_array: bool,
+    pointer_level: usize,
+}
+
+#[derive(Clone)]
+struct GlobalTypeCandidate {
+    name: String,
+    type_name: String,
+    is_array: bool,
+    pointer_level: usize,
 }
 
 #[derive(Clone)]
 struct MacroAliasInfo {
     name: String,
     replacement: String,
+}
+
+#[derive(Clone)]
+struct MacroAliasCandidate {
+    name: String,
+    replacement: String,
+    is_function_like: bool,
+}
+
+struct NativeContextBuildResult {
+    context: NativeContext,
+    diagnostics: Vec<ParserDiagnostic>,
+    streamed_summary_file_count: usize,
+    max_summary_batch_files: usize,
 }
 
 #[derive(Clone)]
@@ -480,19 +503,19 @@ fn scan_many(
         .collect())
 }
 
-fn scan_many_summaries(
-    files: Vec<String>,
-    requested_workers: Option<usize>,
+fn scan_summary_batch_streaming(
+    batch: &[String],
+    worker_count: usize,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
 ) -> Result<Vec<FileSummary>, String> {
-    if files.is_empty() {
+    if batch.is_empty() {
         return Ok(Vec::new());
     }
-    let worker_count = effective_worker_count(files.len(), requested_workers);
-    let mut chunks: Vec<Vec<(usize, String)>> = vec![Vec::new(); worker_count];
-    for (index, file) in files.into_iter().enumerate() {
-        chunks[index % worker_count].push((index, file));
+    let batch_worker_count = worker_count.max(1).min(batch.len());
+    let mut chunks: Vec<Vec<(usize, String)>> = vec![Vec::new(); batch_worker_count];
+    for (index, file) in batch.iter().enumerate() {
+        chunks[index % batch_worker_count].push((index, file.clone()));
     }
     let handles: Vec<_> = chunks
         .into_iter()
@@ -514,16 +537,41 @@ fn scan_many_summaries(
             })
         })
         .collect();
-    let mut indexed = Vec::new();
+    let mut indexed = Vec::with_capacity(batch.len());
     for handle in handles {
         indexed.extend(
             handle
                 .join()
-                .map_err(|_| "rust sidecar summary worker panicked".to_string())??,
+                .map_err(|_| "rust sidecar summary streaming worker panicked".to_string())??,
         );
     }
     indexed.sort_by_key(|(index, _)| *index);
     Ok(indexed.into_iter().map(|(_, summary)| summary).collect())
+}
+
+fn build_native_context_from_summary_stream(
+    files: &[String],
+    options: &AnalyzeOptions,
+    worker_count: usize,
+    batch_size: usize,
+) -> Result<NativeContextBuildResult, String> {
+    let mut builder = NativeContextBuilder::new();
+    let mut max_summary_batch_files = 0usize;
+    for batch in files.chunks(batch_size.max(1)) {
+        let summaries = scan_summary_batch_streaming(
+            batch,
+            worker_count,
+            options.tree_sitter_diagnostics,
+            options.encoding,
+        )?;
+        max_summary_batch_files = max_summary_batch_files.max(summaries.len());
+        for summary in summaries {
+            builder.ingest_summary(summary);
+        }
+    }
+    let mut result = builder.finish();
+    result.max_summary_batch_files = max_summary_batch_files;
+    Ok(result)
 }
 
 fn effective_worker_count(file_count: usize, requested_workers: Option<usize>) -> usize {
@@ -538,6 +586,13 @@ fn effective_worker_count(file_count: usize, requested_workers: Option<usize>) -
         })
         .max(1)
         .min(file_count)
+}
+
+fn summary_scan_batch_size(batch_size: usize, worker_count: usize) -> usize {
+    batch_size
+        .max(1)
+        .saturating_mul(worker_count.max(1))
+        .clamp(batch_size.max(1), 512)
 }
 
 fn current_rss_bytes() -> Option<u128> {
@@ -666,30 +721,53 @@ fn analyze_many_low_memory_to_writer<W: Write>(
     metrics.insert("fileCount".to_string(), files.len() as u128);
     metrics.insert("workerCount".to_string(), worker_count as u128);
     metrics.insert("batchSize".to_string(), batch_size as u128);
+    let summary_batch_size = summary_scan_batch_size(batch_size, worker_count);
+    metrics.insert("summaryBatchSize".to_string(), summary_batch_size as u128);
     let mut peak_rss = current_rss_bytes().unwrap_or(0);
 
     let scan_started = Instant::now();
-    let summaries = scan_many_summaries(
-        files.clone(),
-        Some(worker_count),
-        options.tree_sitter_diagnostics,
-        options.encoding,
-    )?;
+    let context_result =
+        build_native_context_from_summary_stream(&files, &options, worker_count, summary_batch_size)?;
     peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
     metrics.insert(
         "readMaskDeclarationScan".to_string(),
         scan_started.elapsed().as_millis(),
     );
+    metrics.insert(
+        "streamedSummaryFileCount".to_string(),
+        context_result.streamed_summary_file_count as u128,
+    );
+    metrics.insert(
+        "maxSummaryBatchFiles".to_string(),
+        context_result.max_summary_batch_files as u128,
+    );
+    metrics.insert("summaryRetainedFileCount".to_string(), 0);
 
     let symbol_started = Instant::now();
-    let context = build_native_context_from_summaries(&summaries);
+    let mut diagnostics = context_result.diagnostics;
+    let context = context_result.context;
     peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
     metrics.insert(
         "symbolMap".to_string(),
         symbol_started.elapsed().as_millis(),
     );
-
-    let mut diagnostics = encoding_diagnostics(&summaries);
+    metrics.insert("contextGlobalCount".to_string(), context.global_names.len() as u128);
+    metrics.insert(
+        "contextFunctionNameCount".to_string(),
+        context.function_name_map.len() as u128,
+    );
+    metrics.insert(
+        "contextStructTypeCount".to_string(),
+        context.struct_types.len() as u128,
+    );
+    metrics.insert(
+        "contextGlobalTypeCount".to_string(),
+        context.global_types.len() as u128,
+    );
+    metrics.insert(
+        "contextMacroAliasCount".to_string(),
+        context.macro_aliases.len() as u128,
+    );
     diagnostics.insert(0, ParserDiagnostic {
         backend: "rust".to_string(),
         file: None,
@@ -868,186 +946,222 @@ fn analyze_structures(
     })
 }
 
+struct NativeContextBuilder {
+    global_names: HashSet<String>,
+    function_name_map: HashMap<String, Vec<String>>,
+    parameter_member_accesses: HashMap<String, Vec<ParameterMemberAccessTemplate>>,
+    struct_types: HashMap<String, StructTypeInfo>,
+    known_member_names: HashSet<String>,
+    global_type_candidates: Vec<GlobalTypeCandidate>,
+    macro_alias_candidates: Vec<MacroAliasCandidate>,
+    encoding_counts: HashMap<&'static str, usize>,
+    lossy_files: Vec<String>,
+    streamed_summary_file_count: usize,
+}
+
+impl NativeContextBuilder {
+    fn new() -> Self {
+        Self {
+            global_names: HashSet::new(),
+            function_name_map: HashMap::new(),
+            parameter_member_accesses: HashMap::new(),
+            struct_types: HashMap::new(),
+            known_member_names: HashSet::new(),
+            global_type_candidates: Vec::new(),
+            macro_alias_candidates: Vec::new(),
+            encoding_counts: HashMap::new(),
+            lossy_files: Vec::new(),
+            streamed_summary_file_count: 0,
+        }
+    }
+
+    fn ingest_structure(&mut self, file: &FileStructure) {
+        for global in &file.globals {
+            self.ingest_global(global);
+        }
+        for function in &file.functions {
+            self.ingest_function_name(&function.name);
+        }
+        self.ingest_struct_types(file.struct_types.iter().cloned());
+        for definition in &file.macro_definitions {
+            self.ingest_macro_definition(definition);
+        }
+        for (function_name, templates) in
+            build_parameter_member_access_templates_from_functions(&file.functions)
+        {
+            self.parameter_member_accesses
+                .entry(function_name)
+                .or_insert(templates);
+        }
+    }
+
+    fn ingest_summary(&mut self, summary: FileSummary) {
+        self.streamed_summary_file_count += 1;
+        *self
+            .encoding_counts
+            .entry(summary.decode_info.used_encoding)
+            .or_insert(0) += 1;
+        if summary.decode_info.lossy {
+            self.lossy_files.push(summary.file.clone());
+        }
+        for global in summary.globals {
+            self.ingest_global(&global);
+        }
+        for function in summary.functions {
+            self.ingest_function_name(&function.name);
+        }
+        self.ingest_struct_types(summary.struct_types.into_iter());
+        for definition in summary.macro_definitions {
+            self.ingest_macro_candidate(MacroAliasCandidate {
+                name: definition.name,
+                replacement: definition.replacement,
+                is_function_like: definition.is_function_like,
+            });
+        }
+        for (function_name, templates) in summary.parameter_member_accesses {
+            self.parameter_member_accesses
+                .entry(function_name)
+                .or_insert(templates);
+        }
+    }
+
+    fn ingest_global(&mut self, global: &GlobalVariable) {
+        self.global_names.insert(global.name.clone());
+        if let Some(type_name) = &global.type_name {
+            self.global_type_candidates.push(GlobalTypeCandidate {
+                name: global.name.clone(),
+                type_name: type_name.clone(),
+                is_array: global.is_array.unwrap_or(false),
+                pointer_level: global.pointer_level.unwrap_or(0),
+            });
+        }
+    }
+
+    fn ingest_function_name(&mut self, function_name: &str) {
+        self.function_name_map
+            .entry(simplify_function_name(function_name))
+            .or_default()
+            .push(function_name.to_string());
+    }
+
+    fn ingest_struct_types<I>(&mut self, structs: I)
+    where
+        I: IntoIterator<Item = StructTypeInfo>,
+    {
+        for struct_type in structs {
+            for member in &struct_type.members {
+                self.known_member_names.insert(member.name.clone());
+            }
+            for type_name in std::iter::once(&struct_type.name).chain(struct_type.aliases.iter()) {
+                if !type_name.is_empty() && !self.struct_types.contains_key(type_name) {
+                    self.struct_types
+                        .insert(type_name.clone(), struct_type.clone());
+                }
+            }
+        }
+    }
+
+    fn ingest_macro_definition(&mut self, definition: &MacroDefinition) {
+        self.ingest_macro_candidate(MacroAliasCandidate {
+            name: definition.name.clone(),
+            replacement: definition.replacement.clone(),
+            is_function_like: definition.is_function_like,
+        });
+    }
+
+    fn ingest_macro_candidate(&mut self, candidate: MacroAliasCandidate) {
+        self.macro_alias_candidates.push(candidate);
+    }
+
+    fn finish(mut self) -> NativeContextBuildResult {
+        for names in self.function_name_map.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+
+        let diagnostics = self.encoding_diagnostics();
+        let mut global_types = HashMap::new();
+        for candidate in self.global_type_candidates {
+            if self.struct_types.contains_key(&candidate.type_name) {
+                global_types.entry(candidate.name.clone()).or_insert(GlobalTypeInfo {
+                    type_name: candidate.type_name,
+                    is_array: candidate.is_array,
+                    pointer_level: candidate.pointer_level,
+                });
+            }
+        }
+
+        let mut macro_aliases: HashMap<String, Vec<MacroAliasInfo>> = HashMap::new();
+        for candidate in &self.macro_alias_candidates {
+            if let Some(alias) = resolve_macro_alias_native(candidate, &self.global_names) {
+                macro_aliases
+                    .entry(alias.name.clone())
+                    .or_default()
+                    .push(alias);
+            }
+        }
+
+        let mut known_type_names: Vec<String> = self.struct_types.keys().cloned().collect();
+        known_type_names.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+
+        NativeContextBuildResult {
+            context: NativeContext {
+                global_names: self.global_names,
+                function_name_map: self.function_name_map,
+                parameter_member_accesses: self.parameter_member_accesses,
+                struct_types: self.struct_types,
+                global_types,
+                known_type_names,
+                known_member_names: self.known_member_names,
+                macro_aliases,
+            },
+            diagnostics,
+            streamed_summary_file_count: self.streamed_summary_file_count,
+            max_summary_batch_files: 0,
+        }
+    }
+
+    fn encoding_diagnostics(&self) -> Vec<ParserDiagnostic> {
+        if self.streamed_summary_file_count == 0 {
+            return Vec::new();
+        }
+        let mut keys: Vec<_> = self.encoding_counts.keys().copied().collect();
+        keys.sort();
+        let usage = keys
+            .into_iter()
+            .map(|key| format!("{key}={}", self.encoding_counts.get(key).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut diagnostics = vec![ParserDiagnostic {
+            backend: "rust".to_string(),
+            file: None,
+            severity: "info".to_string(),
+            message: format!(
+                "source encoding usage: {usage}; lossy={}",
+                self.lossy_files.len()
+            ),
+        }];
+        if let Some(first_lossy) = self.lossy_files.first() {
+            diagnostics.push(ParserDiagnostic {
+                backend: "rust".to_string(),
+                file: Some(first_lossy.clone()),
+                severity: "warning".to_string(),
+                message: format!(
+                    "{} source file(s) required lossy CP932 decoding",
+                    self.lossy_files.len()
+                ),
+            });
+        }
+        diagnostics
+    }
+}
+
 fn build_native_context(files: &[FileStructure]) -> NativeContext {
-    let mut global_names = HashSet::new();
-    let mut function_name_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut struct_types: HashMap<String, StructTypeInfo> = HashMap::new();
-    let mut known_member_names = HashSet::new();
-
+    let mut builder = NativeContextBuilder::new();
     for file in files {
-        for global in &file.globals {
-            global_names.insert(global.name.clone());
-        }
-        for func in &file.functions {
-            function_name_map
-                .entry(simplify_function_name(&func.name))
-                .or_default()
-                .push(func.name.clone());
-        }
-        for struct_type in &file.struct_types {
-            for type_name in std::iter::once(&struct_type.name).chain(struct_type.aliases.iter()) {
-                if !type_name.is_empty() && !struct_types.contains_key(type_name) {
-                    struct_types.insert(type_name.clone(), struct_type.clone());
-                }
-            }
-            for member in &struct_type.members {
-                known_member_names.insert(member.name.clone());
-            }
-        }
+        builder.ingest_structure(file);
     }
-    for names in function_name_map.values_mut() {
-        names.sort();
-    }
-
-    let mut global_types = HashMap::new();
-    for file in files {
-        for global in &file.globals {
-            if let Some(type_name) = &global.type_name {
-                if let Some(type_info) = struct_types.get(type_name) {
-                    global_types.insert(
-                        global.name.clone(),
-                        GlobalTypeInfo {
-                            global: global.clone(),
-                            type_info: type_info.clone(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    let mut macro_aliases: HashMap<String, Vec<MacroAliasInfo>> = HashMap::new();
-    let member_symbols = build_member_symbol_names(&global_types, &struct_types);
-    for file in files {
-        for definition in &file.macro_definitions {
-            if let Some(alias) =
-                resolve_macro_alias_native(definition, &global_names, &member_symbols)
-            {
-                macro_aliases
-                    .entry(alias.name.clone())
-                    .or_default()
-                    .push(alias);
-            }
-        }
-    }
-
-    let mut known_type_names: Vec<String> = struct_types.keys().cloned().collect();
-    known_type_names.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-
-    let mut context = NativeContext {
-        global_names,
-        function_name_map,
-        parameter_member_accesses: HashMap::new(),
-        struct_types,
-        global_types,
-        known_type_names,
-        known_member_names,
-        macro_aliases,
-    };
-    context.parameter_member_accesses =
-        build_parameter_member_access_templates_from_structures(files);
-    context
-}
-
-fn build_native_context_from_summaries(files: &[FileSummary]) -> NativeContext {
-    let mut global_names = HashSet::new();
-    let mut function_name_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut struct_types: HashMap<String, StructTypeInfo> = HashMap::new();
-    let mut known_member_names = HashSet::new();
-
-    for file in files {
-        for global in &file.globals {
-            global_names.insert(global.name.clone());
-        }
-        for func in &file.functions {
-            function_name_map
-                .entry(simplify_function_name(&func.name))
-                .or_default()
-                .push(func.name.clone());
-        }
-        for struct_type in &file.struct_types {
-            for type_name in std::iter::once(&struct_type.name).chain(struct_type.aliases.iter()) {
-                if !type_name.is_empty() && !struct_types.contains_key(type_name) {
-                    struct_types.insert(type_name.clone(), struct_type.clone());
-                }
-            }
-            for member in &struct_type.members {
-                known_member_names.insert(member.name.clone());
-            }
-        }
-    }
-    for names in function_name_map.values_mut() {
-        names.sort();
-    }
-    let mut parameter_member_accesses: HashMap<String, Vec<ParameterMemberAccessTemplate>> =
-        HashMap::new();
-    for file in files {
-        for (function_name, templates) in &file.parameter_member_accesses {
-            parameter_member_accesses
-                .entry(function_name.clone())
-                .or_insert_with(|| templates.clone());
-        }
-    }
-
-    let mut global_types = HashMap::new();
-    for file in files {
-        for global in &file.globals {
-            if let Some(type_name) = &global.type_name {
-                if let Some(type_info) = struct_types.get(type_name) {
-                    global_types.insert(
-                        global.name.clone(),
-                        GlobalTypeInfo {
-                            global: global.clone(),
-                            type_info: type_info.clone(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    let mut macro_aliases: HashMap<String, Vec<MacroAliasInfo>> = HashMap::new();
-    let member_symbols = build_member_symbol_names(&global_types, &struct_types);
-    for file in files {
-        for definition in &file.macro_definitions {
-            if let Some(alias) =
-                resolve_macro_alias_native(definition, &global_names, &member_symbols)
-            {
-                macro_aliases
-                    .entry(alias.name.clone())
-                    .or_default()
-                    .push(alias);
-            }
-        }
-    }
-
-    let mut known_type_names: Vec<String> = struct_types.keys().cloned().collect();
-    known_type_names.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-
-    NativeContext {
-        global_names,
-        function_name_map,
-        parameter_member_accesses,
-        struct_types,
-        global_types,
-        known_type_names,
-        known_member_names,
-        macro_aliases,
-    }
-}
-
-fn build_parameter_member_access_templates_from_structures(
-    files: &[FileStructure],
-) -> HashMap<String, Vec<ParameterMemberAccessTemplate>> {
-    let mut templates = HashMap::new();
-    for file in files {
-        let file_templates =
-            build_parameter_member_access_templates_from_functions(&file.functions);
-        for (function_name, items) in file_templates {
-            templates.entry(function_name).or_insert(items);
-        }
-    }
-    templates
+    builder.finish().context
 }
 
 fn build_parameter_member_access_templates_from_functions(
@@ -1139,134 +1253,13 @@ fn parameter_names_from_signature(signature: &str) -> Vec<String> {
         .collect()
 }
 
-fn encoding_diagnostics(summaries: &[FileSummary]) -> Vec<ParserDiagnostic> {
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
-    let mut lossy_files = Vec::new();
-    for summary in summaries {
-        *counts.entry(summary.decode_info.used_encoding).or_insert(0) += 1;
-        if summary.decode_info.lossy {
-            lossy_files.push(summary.file.clone());
-        }
-    }
-    let mut keys: Vec<_> = counts.keys().copied().collect();
-    keys.sort();
-    let usage = keys
-        .into_iter()
-        .map(|key| format!("{key}={}", counts.get(key).copied().unwrap_or(0)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut diagnostics = vec![ParserDiagnostic {
-        backend: "rust".to_string(),
-        file: None,
-        severity: "info".to_string(),
-        message: format!(
-            "source encoding usage: {usage}; lossy={}",
-            lossy_files.len()
-        ),
-    }];
-    if let Some(first_lossy) = lossy_files.first() {
-        diagnostics.push(ParserDiagnostic {
-            backend: "rust".to_string(),
-            file: Some(first_lossy.clone()),
-            severity: "warning".to_string(),
-            message: format!(
-                "{} source file(s) required lossy CP932 decoding",
-                lossy_files.len()
-            ),
-        });
-    }
-    diagnostics
-}
-
-fn build_member_symbol_names(
-    global_types: &HashMap<String, GlobalTypeInfo>,
-    struct_types: &HashMap<String, StructTypeInfo>,
-) -> HashSet<String> {
-    let mut symbols = HashSet::new();
-    for global_type in global_types.values() {
-        let owner_name = if global_type.global.is_array.unwrap_or(false) {
-            format!("{}[]", global_type.global.name)
-        } else {
-            global_type.global.name.clone()
-        };
-        let separator = if global_type.global.pointer_level.unwrap_or(0) > 0 {
-            "->"
-        } else {
-            "."
-        };
-        append_member_symbol_names(
-            &mut symbols,
-            &owner_name,
-            separator,
-            "",
-            &global_type.type_info,
-            struct_types,
-            0,
-        );
-        if global_type.global.pointer_level.unwrap_or(0) > 0
-            && !global_type.global.is_array.unwrap_or(false)
-        {
-            append_member_symbol_names(
-                &mut symbols,
-                &format!("{}[]", global_type.global.name),
-                "->",
-                "",
-                &global_type.type_info,
-                struct_types,
-                0,
-            );
-        }
-    }
-    symbols
-}
-
-fn append_member_symbol_names(
-    symbols: &mut HashSet<String>,
-    owner_name: &str,
-    separator: &str,
-    path_prefix: &str,
-    type_info: &StructTypeInfo,
-    struct_types: &HashMap<String, StructTypeInfo>,
-    depth: usize,
-) {
-    if depth > 2 {
-        return;
-    }
-    for member in &type_info.members {
-        let member_path = if path_prefix.is_empty() {
-            member.name.clone()
-        } else {
-            format!("{path_prefix}.{}", member.name)
-        };
-        symbols.insert(format!("{owner_name}{separator}{member_path}"));
-        if member.pointer_level.unwrap_or(0) == 0 {
-            if let Some(nested_type) = member
-                .type_name
-                .as_ref()
-                .and_then(|type_name| struct_types.get(type_name))
-            {
-                append_member_symbol_names(
-                    symbols,
-                    owner_name,
-                    separator,
-                    &member_path,
-                    nested_type,
-                    struct_types,
-                    depth + 1,
-                );
-            }
-        }
-    }
-}
-
 fn resolve_macro_alias_native(
-    definition: &MacroDefinition,
+    definition: &MacroAliasCandidate,
     global_names: &HashSet<String>,
-    member_symbols: &HashSet<String>,
 ) -> Option<MacroAliasInfo> {
     if definition.is_function_like
         || definition.replacement.is_empty()
-        || is_header_guard_macro(definition)
+        || is_header_guard_macro_candidate(definition)
     {
         return None;
     }
@@ -1275,11 +1268,7 @@ fn resolve_macro_alias_native(
         return None;
     }
     if !global_names.contains(replacement)
-        && !member_symbols.contains(replacement)
-        && replacement
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_digit())
+        && replacement.chars().next().is_some_and(|ch| ch.is_ascii_digit())
     {
         return None;
     }
@@ -1671,7 +1660,7 @@ fn function_pointer_table_call_targets(
     unique(result)
 }
 
-fn is_header_guard_macro(definition: &MacroDefinition) -> bool {
+fn is_header_guard_macro_candidate(definition: &MacroAliasCandidate) -> bool {
     definition.replacement.is_empty()
         && (definition.name.ends_with("_H")
             || definition.name.contains("_H_")
@@ -1949,19 +1938,15 @@ fn resolve_pointer_initializer(
         let name = read_identifier(trimmed, &mut index)?;
         let indexed = trimmed[index..].contains('[');
         if let Some(global_type) = context.global_types.get(&name) {
-            if global_type.global.type_name.as_deref() == Some(expected_type_name) {
+            if global_type.type_name == expected_type_name {
                 return Some(PointerAlias {
-                    owner_name: if global_type.global.is_array.unwrap_or(false) || indexed {
+                    owner_name: if global_type.is_array || indexed {
                         format!("{name}[]")
                     } else {
                         name
                     },
-                    owner_type_name: global_type
-                        .global
-                        .type_name
-                        .clone()
-                        .unwrap_or_else(|| expected_type_name.to_string()),
-                    is_array_owner: global_type.global.is_array.unwrap_or(false) || indexed,
+                    owner_type_name: global_type.type_name.clone(),
+                    is_array_owner: global_type.is_array || indexed,
                     pointer_owner: false,
                 });
             }
@@ -1975,16 +1960,10 @@ fn resolve_pointer_initializer(
                 return Some(copied.clone());
             }
             if let Some(global_type) = context.global_types.get(&source_name) {
-                if global_type.global.pointer_level.unwrap_or(0) > 0
-                    && global_type.global.type_name.as_deref() == Some(expected_type_name)
-                {
+                if global_type.pointer_level > 0 && global_type.type_name == expected_type_name {
                     return Some(PointerAlias {
                         owner_name: source_name,
-                        owner_type_name: global_type
-                            .global
-                            .type_name
-                            .clone()
-                            .unwrap_or_else(|| expected_type_name.to_string()),
+                        owner_type_name: global_type.type_name.clone(),
                         is_array_owner: false,
                         pointer_owner: true,
                     });
@@ -2097,19 +2076,19 @@ fn resolve_member_expression(
     let member_name = expression.member_path.last().cloned();
     if expression.first_connector == "." {
         let global_type = context.global_types.get(&expression.owner_name)?;
-        if global_type.global.pointer_level.unwrap_or(0) > 0 {
+        if global_type.pointer_level > 0 {
             return None;
         }
-        let owner_name = if global_type.global.is_array.unwrap_or(false) || expression.owner_indexed
-        {
+        let owner_name = if global_type.is_array || expression.owner_indexed {
             format!("{}[]", expression.owner_name)
         } else {
             expression.owner_name.clone()
         };
         let target_name =
             canonical_member_name(&owner_name, &expression.connectors, &expression.member_path);
+        let type_info = context.struct_types.get(&global_type.type_name)?;
         if !member_path_exists(
-            &global_type.type_info,
+            type_info,
             &expression.member_path,
             &context.struct_types,
         ) {
@@ -2166,13 +2145,12 @@ fn resolve_member_expression(
     }
 
     if let Some(global_type) = context.global_types.get(&expression.owner_name) {
-        if global_type.global.pointer_level.unwrap_or(0) > 0 {
-            let owner_name =
-                if global_type.global.is_array.unwrap_or(false) || expression.owner_indexed {
-                    format!("{}[]", expression.owner_name)
-                } else {
-                    expression.owner_name.clone()
-                };
+        if global_type.pointer_level > 0 {
+            let owner_name = if global_type.is_array || expression.owner_indexed {
+                format!("{}[]", expression.owner_name)
+            } else {
+                expression.owner_name.clone()
+            };
             return Some(ResolvedMemberExpression {
                 access_target_name: Some(canonical_member_name(
                     &owner_name,
@@ -2266,7 +2244,7 @@ fn resolve_call_argument_owner(
         ));
     }
     if let Some(global_type) = context.global_types.get(&name) {
-        if address_taken || global_type.global.pointer_level.unwrap_or(0) == 0 {
+        if address_taken || global_type.pointer_level == 0 {
             return Some((name, ".".to_string()));
         }
         return Some((name, "->".to_string()));
@@ -3726,6 +3704,24 @@ mod tests {
         assert_eq!(low_memory.files.len(), 4);
         assert_eq!(low_memory.metrics.get("streamedFileCount"), Some(&4));
         assert_eq!(low_memory.metrics.get("maxStructureBatchFiles"), Some(&2));
+    }
+
+    #[test]
+    fn low_memory_pass1_streams_summaries_without_retaining_all_file_summaries() {
+        let first = write_temp_source("summary_streaming_one.cpp", &fixture_source());
+        let second = write_temp_source("summary_streaming_two.cpp", &fixture_source());
+        let third = write_temp_source("summary_streaming_three.cpp", &fixture_source());
+        let files = vec![first, second, third];
+
+        let mut output = Vec::new();
+        analyze_many_low_memory_to_writer(files, test_options(2, false), &mut output)
+            .expect("low memory analysis");
+        let low_memory: NativeAnalysisResult =
+            serde_json::from_slice(&output).expect("low memory json");
+
+        assert_eq!(low_memory.metrics.get("streamedSummaryFileCount"), Some(&3));
+        assert_eq!(low_memory.metrics.get("maxSummaryBatchFiles"), Some(&2));
+        assert_eq!(low_memory.metrics.get("summaryRetainedFileCount"), Some(&0));
     }
 
     #[test]

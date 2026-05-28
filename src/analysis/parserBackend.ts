@@ -34,10 +34,17 @@ export async function analyzeFilesWithParserBackend(args: {
       args.files,
       args.sourceEncoding ?? "auto",
       args.includePaths ?? [],
-      args.macros ?? []
+      args.macros ?? [],
+      effectiveFileConcurrency(args.maxIndexWorkers)
     );
   }
-  return analyzeFilesWithTypeScript(args.files, args.sourceEncoding ?? "auto");
+  return analyzeFilesWithTypeScript(
+    args.files,
+    args.sourceEncoding ?? "auto",
+    "typescript",
+    [],
+    effectiveFileConcurrency(args.maxIndexWorkers)
+  );
 }
 
 export function normalizeParserEngine(value: string | undefined, fallback: ParserEngine = "rust"): ParserEngine {
@@ -46,4 +53,11 @@ export function normalizeParserEngine(value: string | undefined, fallback: Parse
     return normalized;
   }
   return fallback;
+}
+
+function effectiveFileConcurrency(maxIndexWorkers: number | undefined): number {
+  if (maxIndexWorkers && maxIndexWorkers > 0) {
+    return Math.floor(maxIndexWorkers);
+  }
+  return 8;
 }

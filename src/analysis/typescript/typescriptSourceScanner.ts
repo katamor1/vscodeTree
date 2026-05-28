@@ -1,4 +1,5 @@
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature, type MacroAnalysisContext, type MemberAnalysisContext } from "../sourceScanner";
+import { mapWithConcurrency, normalizeConcurrency } from "../limitedConcurrency";
 import { readTextFile, type TextEncoding } from "../textEncoding";
 import type {
   FileAnalysis,
@@ -75,21 +76,27 @@ export async function analyzeFilesWithTypeScript(
   files: string[],
   sourceEncoding: TextEncoding = "auto",
   backend: "typescript" | "clang" = "typescript",
-  extraDiagnostics: ParserDiagnostic[] = []
+  extraDiagnostics: ParserDiagnostic[] = [],
+  maxConcurrentFiles = defaultFileConcurrency()
 ): Promise<TypeScriptAnalysisResult> {
   const started = Date.now();
+  const fileConcurrency = normalizeConcurrency(maxConcurrentFiles, files.length);
   const diagnostics: ParserDiagnostic[] = [
     {
       backend,
       severity: "info",
       message: backend === "typescript"
-        ? "typescript parser backend completed with lightweight local scanner"
-        : "clang parser backend completed with clang diagnostics plus TypeScript extraction"
+        ? `typescript parser backend completed with lightweight local scanner, file concurrency ${fileConcurrency}`
+        : `clang parser backend completed with clang diagnostics plus TypeScript extraction, file concurrency ${fileConcurrency}`
     },
     ...extraDiagnostics
   ];
   const structureStarted = Date.now();
-  const structures = await Promise.all(files.map((file) => scanFileStructure(file, sourceEncoding, backend)));
+  const structures = await mapWithConcurrency(
+    files,
+    fileConcurrency,
+    (file) => scanFileStructure(file, sourceEncoding, backend)
+  );
   const structureScan = Date.now() - structureStarted;
   const contextStarted = Date.now();
   const context = buildTypeScriptContext(structures);
@@ -106,9 +113,14 @@ export async function analyzeFilesWithTypeScript(
       [`${backend}StructureScan`]: structureScan,
       [`${backend}SymbolMap`]: symbolMap,
       [`${backend}AccessAnalysis`]: accessAnalysis,
+      [`${backend}FileConcurrency`]: fileConcurrency,
       [`${backend}Total`]: Date.now() - started
     }
   };
+}
+
+function defaultFileConcurrency(): number {
+  return 8;
 }
 
 async function scanFileStructure(
@@ -372,7 +384,7 @@ function parseStructMembers(file: string, startLine: number, block: string): Str
       line: startLine + offset + 1,
       declaration: normalized,
       isArray: Boolean(match[3]),
-      pointerLevel: (match[2].match(/\*/g) ?? []).length
+      pointerLevel: pointerLevelFromParts(match[1], match[2])
     }];
   });
 }
@@ -490,7 +502,7 @@ function parseGlobals(file: string, maskedLines: string[], functions: FunctionSt
         isExtern: /\bextern\b/.test(normalized),
         typeName: cleanTypeName(match[1]),
         isArray: Boolean(match[3]),
-        pointerLevel: (match[2].match(/\*/g) ?? []).length
+        pointerLevel: pointerLevelFromParts(match[1], match[2])
       });
     }
     pending = "";
@@ -566,6 +578,13 @@ function resolveMemberExpression(
 
 function resolveCallArgumentOwner(argument: string, context: TypeScriptContext, localAliases: Map<string, PointerAlias>): PointerAlias | undefined {
   const normalized = argument.trim().replace(/^&\s*/, "").replace(/\[[^\]]+\]/g, "[]");
+  const memberExpression = extractMemberExpressions(normalized).find((expression) => expression.expression === normalized);
+  if (memberExpression) {
+    const resolved = resolveMemberExpression(memberExpression, context, localAliases, new Map());
+    if (resolved.targetName) {
+      return { ownerName: resolved.targetName, connector: "." };
+    }
+  }
   if (context.memberContext.globalTypes.has(normalized.replace(/\[\]$/, ""))) {
     return { ownerName: normalized, connector: normalized.endsWith("[]") ? "." : "." };
   }
@@ -762,6 +781,10 @@ function simplifyFunctionName(name: string): string {
 
 function cleanTypeName(value: string): string {
   return value.replace(/\b(?:extern|static|volatile|const|struct|class|typedef)\b/g, " ").replace(/[&*]/g, " ").split(/\s+/).filter(Boolean).at(-1) ?? "";
+}
+
+function pointerLevelFromParts(...parts: string[]): number {
+  return parts.reduce((count, part) => count + (part.match(/\*/g) ?? []).length, 0);
 }
 
 function identifiers(line: string): string[] {
