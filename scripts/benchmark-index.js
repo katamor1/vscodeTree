@@ -183,6 +183,7 @@ function parseArgs(argv) {
   }
   result.sample ??= positional[0];
   result.workers ??= positional[1];
+  result.batch ??= positional[2];
   return result;
 }
 

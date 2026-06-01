@@ -1,7 +1,7 @@
 import { analyzeFilesWithClang } from "./clang/clangSourceScanner";
-import { analyzeFilesWithRustSidecar } from "./rust/rustSourceScanner";
+import { analyzeFilesWithRustSidecarAutoSkip } from "./rust/rustSourceScanner";
 import { analyzeFilesWithTypeScript } from "./typescript/typescriptSourceScanner";
-import type { FileAnalysis, ParserDiagnostic, ParserEngine } from "./types";
+import type { FileAnalysis, ParserDiagnostic, ParserEngine, SkippedSourceFile } from "./types";
 import type { TextEncoding } from "./textEncoding";
 
 export interface ParserAnalysisResult {
@@ -10,6 +10,7 @@ export interface ParserAnalysisResult {
   usedWorkers: boolean;
   diagnostics: ParserDiagnostic[];
   phaseDurationsMs: Record<string, number>;
+  skippedFiles?: SkippedSourceFile[];
 }
 
 export async function analyzeFilesWithParserBackend(args: {
@@ -20,14 +21,18 @@ export async function analyzeFilesWithParserBackend(args: {
   sourceEncoding?: TextEncoding;
   includePaths?: string[];
   macros?: string[];
+  diagnosticsDir?: string;
+  maxRustAutoSkippedFiles?: number;
 }): Promise<ParserAnalysisResult> {
   if (args.parserEngine === "rust") {
-    return analyzeFilesWithRustSidecar(
-      args.files,
-      args.maxIndexWorkers,
-      args.sourceEncoding ?? "auto",
-      args.maxNativeBatchFiles
-    );
+    return analyzeFilesWithRustSidecarAutoSkip({
+      files: args.files,
+      maxIndexWorkers: args.maxIndexWorkers,
+      sourceEncoding: args.sourceEncoding ?? "auto",
+      maxNativeBatchFiles: args.maxNativeBatchFiles,
+      diagnosticsDir: args.diagnosticsDir,
+      maxSkippedFiles: args.maxRustAutoSkippedFiles
+    });
   }
   if (args.parserEngine === "clang") {
     return analyzeFilesWithClang(

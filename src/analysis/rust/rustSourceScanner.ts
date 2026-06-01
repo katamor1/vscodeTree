@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizePath } from "../pathUtils";
 import type { TextEncoding } from "../textEncoding";
-import type { FileAnalysis, ParserDiagnostic } from "../types";
+import type { FileAnalysis, ParserDiagnostic, SkippedSourceFile } from "../types";
 
 const execFileAsync = promisify(execFile);
 const defaultNativeAnalyzeBatchSize = 4;
@@ -17,6 +17,7 @@ export interface RustNativeAnalysisResult {
   usedWorkers: boolean;
   diagnostics: ParserDiagnostic[];
   phaseDurationsMs: Record<string, number>;
+  skippedFiles?: SkippedSourceFile[];
 }
 
 export interface RustOutput {
@@ -31,13 +32,85 @@ export interface RustSidecarOutputFile {
   outputBytes: number;
   nativeBatchSize: number;
   diagnostics: ParserDiagnostic[];
+  skippedFiles?: SkippedSourceFile[];
+  analyzedFileCount?: number;
+  diagnosticSummaryPath?: string;
+  diagnosticEventsPath?: string;
   cleanup(): Promise<void>;
+}
+
+export interface RustAnalyzeManyArgs {
+  files: string[];
+  maxIndexWorkers: number;
+  sourceEncoding: TextEncoding;
+  maxNativeBatchFiles: number;
+  progressLogPath?: string;
+}
+
+export type RustAnalyzeManyRunner = (args: RustAnalyzeManyArgs) => Promise<RustSidecarOutputFile>;
+
+export interface RustAutoSkipOptions {
+  files: string[];
+  maxIndexWorkers?: number;
+  sourceEncoding?: TextEncoding;
+  maxNativeBatchFiles?: number;
+  diagnosticsDir?: string;
+  maxSkippedFiles?: number;
+  runner?: RustAnalyzeManyRunner;
+}
+
+export interface RustProgressEvent {
+  runId?: string;
+  phase?: string;
+  event?: string;
+  file?: string;
+  sourceBytes?: number;
+  rssBeforeBytes?: number;
+  rssAfterBytes?: number;
+  rssDeltaBytes?: number;
+  elapsedMs?: number;
+  error?: string;
 }
 
 export class RustSidecarUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RustSidecarUnavailableError";
+  }
+}
+
+export interface RustSidecarExecutionErrorOptions {
+  stderr?: string;
+  stdout?: string;
+  exitCode?: number | string;
+  signal?: string;
+  outputPath?: string;
+  progressLogPath?: string;
+  diagnostics?: ParserDiagnostic[];
+  cause?: unknown;
+}
+
+export class RustSidecarExecutionError extends Error {
+  stderr?: string;
+  stdout?: string;
+  exitCode?: number | string;
+  signal?: string;
+  outputPath?: string;
+  progressLogPath?: string;
+  diagnostics: ParserDiagnostic[];
+  cause?: unknown;
+
+  constructor(message: string, options: RustSidecarExecutionErrorOptions = {}) {
+    super(message);
+    this.name = "RustSidecarExecutionError";
+    this.stderr = options.stderr;
+    this.stdout = options.stdout;
+    this.exitCode = options.exitCode;
+    this.signal = options.signal;
+    this.outputPath = options.outputPath;
+    this.progressLogPath = options.progressLogPath;
+    this.diagnostics = options.diagnostics ?? [];
+    this.cause = options.cause;
   }
 }
 
@@ -77,12 +150,61 @@ export async function analyzeFilesWithRustSidecar(
   }
 }
 
+export async function analyzeFilesWithRustSidecarAutoSkip(options: RustAutoSkipOptions): Promise<RustNativeAnalysisResult> {
+  const output = await runRustAnalyzeManyToOutputWithAutoSkip(options);
+  try {
+    let parsed: RustOutput;
+    try {
+      parsed = await parseRustOutputFile(output.outputPath);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const tail = await readFileTailForDiagnostics(output.outputPath);
+      throw new RustSidecarExecutionError(`Rust sidecar output JSON parse failed (${output.outputBytes} bytes): ${reason}. Tail: ${tail}`, {
+        outputPath: output.outputPath,
+        diagnostics: output.diagnostics,
+        cause: error
+      });
+    }
+    output.diagnostics.push(...(parsed.diagnostics ?? []));
+    const phaseDurationsMs = rustPhaseDurations(parsed.metrics, output.analyzedFileCount ?? options.files.length, output.outputBytes, output.nativeBatchSize);
+    phaseDurationsMs.rustSkippedFileCount = output.skippedFiles?.length ?? 0;
+    phaseDurationsMs.rustAnalyzedFileCount = output.analyzedFileCount ?? parsed.files?.length ?? options.files.length;
+    return {
+      files: parsed.files ?? [],
+      workerCount: parsed.workerCount ?? 1,
+      usedWorkers: (parsed.workerCount ?? 1) > 1,
+      diagnostics: output.diagnostics,
+      phaseDurationsMs,
+      skippedFiles: output.skippedFiles ?? []
+    };
+  } finally {
+    await output.cleanup();
+  }
+}
+
 export async function runRustAnalyzeManyToOutput(
   files: string[],
   maxIndexWorkers = 0,
   sourceEncoding: TextEncoding = "auto",
-  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize
+  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
+  progressLogPath?: string
 ): Promise<RustSidecarOutputFile> {
+  return defaultRustAnalyzeManyRunner({
+    files,
+    maxIndexWorkers,
+    sourceEncoding,
+    maxNativeBatchFiles,
+    progressLogPath
+  });
+}
+
+export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
+  files,
+  maxIndexWorkers = 0,
+  sourceEncoding = "auto",
+  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
+  progressLogPath
+}: RustAnalyzeManyArgs): Promise<RustSidecarOutputFile> => {
   const sidecar = await findRustSidecarExecutable();
   if (!sidecar) {
     throw new RustSidecarUnavailableError("Rust sidecar is not built or packaged. Run cargo build --release in native/vc6-impact-rust before building the index.");
@@ -99,7 +221,7 @@ export async function runRustAnalyzeManyToOutput(
     await fs.writeFile(listPath, JSON.stringify(files), "utf8");
     const workerArg = maxIndexWorkers > 0 ? String(Math.floor(maxIndexWorkers)) : "auto";
     const nativeBatchSize = normalizeNativeBatchFiles(maxNativeBatchFiles);
-    await execFileAsync(sidecar, [
+    const args = [
       "analyze-many",
       listPath,
       "--workers",
@@ -110,7 +232,11 @@ export async function runRustAnalyzeManyToOutput(
       sourceEncoding,
       "--batch-size",
       String(nativeBatchSize)
-    ], {
+    ];
+    if (progressLogPath) {
+      args.push("--progress-log", progressLogPath);
+    }
+    await execFileAsync(sidecar, args, {
       windowsHide: true,
       timeout: Math.max(30000, files.length * 250),
       maxBuffer: 16 * 1024 * 1024
@@ -121,6 +247,8 @@ export async function runRustAnalyzeManyToOutput(
       outputBytes,
       nativeBatchSize,
       diagnostics,
+      analyzedFileCount: files.length,
+      diagnosticEventsPath: progressLogPath,
       async cleanup(): Promise<void> {
         await fs.rm(listPath, { force: true }).catch(() => undefined);
         await fs.rm(outputPath, { force: true }).catch(() => undefined);
@@ -133,10 +261,279 @@ export async function runRustAnalyzeManyToOutput(
       message: error instanceof Error ? error.message : String(error)
     });
     await fs.rm(outputPath, { force: true }).catch(() => undefined);
-    throw error;
+    throw rustExecutionError(error, {
+      outputPath,
+      progressLogPath,
+      diagnostics
+    });
   } finally {
     await fs.rm(listPath, { force: true }).catch(() => undefined);
   }
+};
+
+export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSkipOptions): Promise<RustSidecarOutputFile> {
+  const runner = options.runner ?? defaultRustAnalyzeManyRunner;
+  const files = [...options.files];
+  const sourceEncoding = options.sourceEncoding ?? "auto";
+  const maxIndexWorkers = options.maxIndexWorkers ?? 0;
+  const maxNativeBatchFiles = normalizeNativeBatchFiles(options.maxNativeBatchFiles ?? defaultNativeAnalyzeBatchSize);
+  const diagnosticsDir = options.diagnosticsDir ?? path.join(os.tmpdir(), "vc6-impact-native-diagnostics");
+  const maxSkippedFiles = normalizeMaxSkippedFiles(options.maxSkippedFiles);
+  const runStamp = diagnosticStamp();
+  const diagnosticSummaryPath = path.join(diagnosticsDir, `rust-memory-summary-${runStamp}.json`);
+  const diagnostics: ParserDiagnostic[] = [];
+  await fs.mkdir(diagnosticsDir, { recursive: true });
+
+  try {
+    return await runValidatedRustOutput(runner, {
+      files,
+      maxIndexWorkers,
+      sourceEncoding,
+      maxNativeBatchFiles
+    });
+  } catch (error) {
+    if (!isRustMemoryFailure(error)) {
+      throw error;
+    }
+    diagnostics.push({
+      backend: "rust",
+      severity: "warning",
+      message: `Rust sidecar failed with a memory-classified error; retrying with safe auto-skip diagnostics: ${rustErrorMessage(error)}`
+    });
+  }
+
+  const skippedFiles: SkippedSourceFile[] = [];
+  let remainingFiles = [...files];
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    const progressLogPath = path.join(diagnosticsDir, `rust-memory-events-${runStamp}-attempt-${attempt}.jsonl`);
+    try {
+      const output = await runValidatedRustOutput(runner, {
+        files: remainingFiles,
+        maxIndexWorkers: 1,
+        sourceEncoding,
+        maxNativeBatchFiles: 1,
+        progressLogPath
+      });
+      const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {
+        status: "recovered",
+        originalFileCount: files.length,
+        analyzedFileCount: remainingFiles.length,
+        skippedFiles
+      });
+      output.diagnostics = [
+        ...diagnostics,
+        ...output.diagnostics
+      ];
+      output.skippedFiles = skippedFiles.map((file) => ({ ...file, diagnosticSummaryPath: summary }));
+      output.analyzedFileCount = remainingFiles.length;
+      output.diagnosticSummaryPath = summary;
+      output.diagnosticEventsPath = progressLogPath;
+      return output;
+    } catch (error) {
+      if (!isRustMemoryFailure(error)) {
+        throw error;
+      }
+      const failed = await identifyFailedProgressFile(progressLogPath);
+      if (!failed?.file) {
+        const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {
+          status: "failed",
+          originalFileCount: files.length,
+          analyzedFileCount: remainingFiles.length,
+          skippedFiles,
+          failure: rustErrorMessage(error),
+          progressLogPath
+        });
+        throw new RustSidecarExecutionError(`Rust auto-skip could not identify the failing file. Diagnostic summary: ${summary}`, {
+          progressLogPath,
+          diagnostics,
+          cause: error
+        });
+      }
+      if (skippedFiles.length >= maxSkippedFiles) {
+        const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {
+          status: "failed",
+          originalFileCount: files.length,
+          analyzedFileCount: remainingFiles.length,
+          skippedFiles,
+          failure: `auto-skip limit reached before skipping ${failed.file}`,
+          progressLogPath
+        });
+        throw new RustSidecarExecutionError(`Rust auto-skip limit reached (${maxSkippedFiles}). Diagnostic summary: ${summary}`, {
+          progressLogPath,
+          diagnostics,
+          cause: error
+        });
+      }
+      const skipped: SkippedSourceFile = {
+        file: failed.file,
+        phase: normalizeProgressPhase(failed.phase),
+        reason: rustErrorMessage(error),
+        sourceBytes: failed.sourceBytes,
+        rssBeforeBytes: failed.rssBeforeBytes,
+        rssAfterBytes: failed.rssAfterBytes,
+        rssDeltaBytes: failed.rssDeltaBytes,
+        requestedBytes: requestedBytesFromText(rustErrorText(error)),
+        diagnosticLogPath: progressLogPath,
+        diagnosticSummaryPath,
+        skippedAt: new Date().toISOString()
+      };
+      skippedFiles.push(skipped);
+      diagnostics.push({
+        backend: "rust",
+        file: skipped.file,
+        severity: "warning",
+        message: skippedDiagnosticMessage(skipped)
+      });
+      remainingFiles = remainingFiles.filter((file) => file !== skipped.file);
+    }
+  }
+}
+
+async function runValidatedRustOutput(runner: RustAnalyzeManyRunner, args: RustAnalyzeManyArgs): Promise<RustSidecarOutputFile> {
+  const output = await runner(args);
+  try {
+    await parseRustOutputFile(output.outputPath, () => undefined);
+    return output;
+  } catch (error) {
+    const tail = await readFileTailForDiagnostics(output.outputPath);
+    await output.cleanup();
+    throw new RustSidecarExecutionError(`Rust sidecar output JSON is incomplete or truncated: ${error instanceof Error ? error.message : String(error)}. Tail: ${tail}`, {
+      outputPath: output.outputPath,
+      progressLogPath: args.progressLogPath,
+      diagnostics: output.diagnostics,
+      cause: error
+    });
+  }
+}
+
+function rustExecutionError(error: unknown, options: RustSidecarExecutionErrorOptions): RustSidecarExecutionError {
+  if (error instanceof RustSidecarExecutionError) {
+    return error;
+  }
+  const execError = error as Error & {
+    stderr?: string | Buffer;
+    stdout?: string | Buffer;
+    code?: number | string;
+    signal?: string;
+  };
+  return new RustSidecarExecutionError(error instanceof Error ? error.message : String(error), {
+    ...options,
+    stderr: bufferText(execError.stderr),
+    stdout: bufferText(execError.stdout),
+    exitCode: execError.code,
+    signal: execError.signal,
+    cause: error
+  });
+}
+
+export function isRustMemoryFailure(error: unknown): boolean {
+  const text = rustErrorText(error).toLowerCase();
+  return [
+    "memory allocation",
+    "out of memory",
+    "oom",
+    "enomem",
+    "cannot allocate memory",
+    "process abort",
+    "abort",
+    "incomplete or truncated"
+  ].some((pattern) => text.includes(pattern));
+}
+
+function rustErrorText(error: unknown): string {
+  if (error instanceof RustSidecarExecutionError) {
+    return [error.message, error.stderr, error.stdout].filter(Boolean).join("\n");
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function rustErrorMessage(error: unknown): string {
+  const text = rustErrorText(error).replace(/\s+/g, " ").trim();
+  return text.length > 500 ? `${text.slice(0, 500)}...` : text;
+}
+
+function bufferText(value: string | Buffer | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return Buffer.isBuffer(value) ? value.toString("utf8") : value;
+}
+
+async function identifyFailedProgressFile(progressLogPath: string): Promise<RustProgressEvent | undefined> {
+  let text = "";
+  try {
+    text = await fs.readFile(progressLogPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  const events = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as RustProgressEvent;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((event): event is RustProgressEvent => Boolean(event?.file));
+  const completed = new Set<string>();
+  for (const event of events) {
+    if (event.event === "end" || event.event === "error") {
+      completed.add(progressEventKey(event));
+    }
+  }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.event === "start" && !completed.has(progressEventKey(event))) {
+      return event;
+    }
+  }
+  return [...events].reverse().find((event) => event.event === "error") ?? [...events].reverse().find((event) => event.file);
+}
+
+function progressEventKey(event: RustProgressEvent): string {
+  return `${event.phase ?? "unknown"}\0${event.file ?? ""}`;
+}
+
+function normalizeProgressPhase(value: string | undefined): SkippedSourceFile["phase"] {
+  return value === "summary" || value === "access" ? value : "unknown";
+}
+
+function requestedBytesFromText(text: string): number | undefined {
+  const match = /(?:memory allocation of|allocate)\s+(\d+)\s+bytes/i.exec(text);
+  return match ? Number(match[1]) : undefined;
+}
+
+function skippedDiagnosticMessage(file: SkippedSourceFile): string {
+  const requested = typeof file.requestedBytes === "number" ? `, requestedBytes=${file.requestedBytes}` : "";
+  return `Rust auto-skip excluded ${file.file} during ${file.phase ?? "unknown"} phase: ${file.reason}${requested}. Diagnostics: ${file.diagnosticLogPath ?? file.diagnosticSummaryPath ?? "unavailable"}`;
+}
+
+async function writeAutoSkipSummary(summaryPath: string, summary: Record<string, unknown>): Promise<string> {
+  await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+  await fs.writeFile(summaryPath, `${JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    ...summary
+  }, null, 2)}\n`, "utf8");
+  return summaryPath;
+}
+
+function normalizeMaxSkippedFiles(value: number | undefined): number {
+  if (!Number.isFinite(value)) {
+    return 16;
+  }
+  return Math.max(0, Math.min(1000, Math.floor(value ?? 16)));
+}
+
+function diagnosticStamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
 export function rustPhaseDurations(

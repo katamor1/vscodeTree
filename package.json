@@ -85,6 +85,13 @@
           "maximum": 64,
           "description": "Maximum source files retained at once during Rust native access analysis. Lower this to 1 for the smallest memory footprint."
         },
+        "vc6Impact.maxRustAutoSkippedFiles": {
+          "type": "number",
+          "default": 16,
+          "minimum": 0,
+          "maximum": 1000,
+          "description": "Maximum source files the Rust memory fallback may skip during one index build. Skipped files are recorded in diagnostics; 0 disables auto-skip."
+        },
         "vc6Impact.parserEngine": {
           "type": "string",
           "enum": [

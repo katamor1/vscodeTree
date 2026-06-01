@@ -180,6 +180,41 @@ describe("artifact storage policy", () => {
     });
   });
 
+  it("stores skipped build metadata and reads skipped count from the index tail", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.projectFiles = ["C:/tmp/project/src/good.cpp", "C:/tmp/project/src/bad.cpp"];
+    index.fileSignatures = {
+      "C:/tmp/project/src/good.cpp": { size: 10, mtimeMs: 1000 },
+      "C:/tmp/project/src/bad.cpp": { size: 20, mtimeMs: 2000 }
+    };
+    index.build.sourceFileCount = 2;
+    index.build.analyzedFileCount = 1;
+    index.build.skippedFiles = [{
+      file: "C:/tmp/project/src/bad.cpp",
+      phase: "access",
+      reason: "out of memory",
+      sourceBytes: 20,
+      diagnosticLogPath: "C:/tmp/project/.vscode/vc6-impact-review/native-diagnostics/rust-memory-events.jsonl",
+      skippedAt: "2026-06-01T00:00:00.000Z"
+    }];
+
+    await writeIndex(indexPath, index);
+
+    const stored = await readIndex(indexPath);
+    expect(stored?.projectFiles).toEqual(index.projectFiles);
+    expect(stored?.fileSignatures?.["C:/tmp/project/src/bad.cpp"]).toEqual({ size: 20, mtimeMs: 2000 });
+    expect(stored?.build.skippedFiles?.[0]).toEqual(expect.objectContaining({ file: "C:/tmp/project/src/bad.cpp" }));
+    await expect(readIndexBuildSummary(indexPath)).resolves.toEqual({
+      durationMs: 0,
+      workerCount: 0,
+      sourceFileCount: 2,
+      reusedFiles: 0,
+      skippedFileCount: 1
+    });
+  });
+
   it("returns undefined for missing index build summary", async () => {
     const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
 

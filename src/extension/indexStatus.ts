@@ -3,6 +3,7 @@ export interface IndexStatusSummary {
   sourceFileCount?: number;
   changedFileCount?: number;
   reusedFileCount?: number;
+  skippedFileCount?: number;
   durationMs: number;
   workerCount: number;
 }
@@ -30,6 +31,9 @@ export function formatIndexStatusLines(status: IndexStatusSummary): IndexStatusL
   }
   if (typeof status.reusedFileCount === "number") {
     lines.push({ label: "Reused", description: formatInteger(status.reusedFileCount), icon: "history" });
+  }
+  if (typeof status.skippedFileCount === "number" && status.skippedFileCount > 0) {
+    lines.push({ label: "Skipped", description: formatInteger(status.skippedFileCount), icon: "warning" });
   }
 
   lines.push(

@@ -36,4 +36,16 @@ describe("index status formatting", () => {
       ])
     );
   });
+
+  it("shows skipped files as a compact status row", () => {
+    const lines = formatIndexStatusLines({
+      action: "updated",
+      sourceFileCount: 12,
+      skippedFileCount: 2,
+      durationMs: 1000,
+      workerCount: 1
+    });
+
+    expect(lines).toContainEqual({ label: "Skipped", description: "2", icon: "warning" });
+  });
 });

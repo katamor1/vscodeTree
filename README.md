@@ -38,6 +38,7 @@ The extension also activates on `onStartupFinished`, so after reload the command
   "vc6Impact.outputDir": "",
   "vc6Impact.parserEngine": "rust",
   "vc6Impact.maxNativeBatchFiles": 4,
+  "vc6Impact.maxRustAutoSkippedFiles": 16,
   "vc6Impact.projectEncoding": "auto",
   "vc6Impact.sourceEncoding": "auto"
 }
@@ -48,6 +49,8 @@ If `outputDir` is empty, artifacts are written to `.vscode/vc6-impact-review/`. 
 `projectEncoding` applies to `.dsw` / `.dsp`; `sourceEncoding` applies to C/C++ files scanned by the Rust sidecar. Use `auto` unless a project must be forced to `utf8` or `cp932`.
 
 `maxNativeBatchFiles` bounds how many source files the Rust access-analysis pass may retain at once. Lower it to `1` for the smallest memory footprint, or raise it cautiously to trade memory for throughput.
+
+If the Rust sidecar fails with an out-of-memory/allocation-class error, the extension retries in safe mode with one worker and one source file per batch. The safe retry writes per-file RSS progress under `.vscode/vc6-impact-review/native-diagnostics/`, skips only the file identified as failing, records that skip in the index build diagnostics, and continues until `maxRustAutoSkippedFiles` is reached. Set `maxRustAutoSkippedFiles` to `0` to keep memory failures hard-fail only.
 
 ## Development Checks
 

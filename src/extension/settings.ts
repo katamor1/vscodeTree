@@ -16,6 +16,7 @@ export interface ExtensionSettings {
   maxGraphDepth: number;
   maxIndexWorkers: number;
   maxNativeBatchFiles: number;
+  maxRustAutoSkippedFiles: number;
   parserEngine: ParserEngine;
   projectEncoding: TextEncoding;
   sourceEncoding: TextEncoding;
@@ -59,6 +60,7 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     maxGraphDepth: config.get<number>("maxGraphDepth") ?? 4,
     maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
     maxNativeBatchFiles: config.get<number>("maxNativeBatchFiles") ?? 4,
+    maxRustAutoSkippedFiles: config.get<number>("maxRustAutoSkippedFiles") ?? 16,
     parserEngine: normalizeParserEngine(config.get<string>("parserEngine"), "rust"),
     projectEncoding: normalizeTextEncoding(config.get<string>("projectEncoding"), "auto"),
     sourceEncoding: normalizeTextEncoding(config.get<string>("sourceEncoding"), "auto")

@@ -7,7 +7,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
@@ -219,6 +219,7 @@ struct AnalyzeOptions {
     batch_size: usize,
     legacy_in_memory: bool,
     encoding: SourceEncoding,
+    progress_log: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,7 +380,7 @@ fn main() -> Result<(), String> {
         }
         return Ok(());
     }
-    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--encoding <auto|utf8|cp932>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
+    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--progress-log <path>] [--encoding <auto|utf8|cp932>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
 }
 
 fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
@@ -390,6 +391,7 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
         batch_size: 1,
         legacy_in_memory: false,
         encoding: SourceEncoding::Auto,
+        progress_log: None,
     };
     let mut index = 0usize;
     while index < args.len() {
@@ -437,6 +439,14 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--encoding requires a value".to_string())?;
                 options.encoding = parse_source_encoding(value)?;
+                index += 2;
+            }
+            "--progress-log" => {
+                options.progress_log = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--progress-log requires a value".to_string())?
+                        .clone(),
+                );
                 index += 2;
             }
             "--legacy-in-memory" => {
@@ -508,6 +518,7 @@ fn scan_summary_batch_streaming(
     worker_count: usize,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    progress_logger: SharedProgressLogger,
 ) -> Result<Vec<FileSummary>, String> {
     if batch.is_empty() {
         return Ok(Vec::new());
@@ -521,17 +532,15 @@ fn scan_summary_batch_streaming(
         .into_iter()
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
+            let logger = progress_logger.clone();
             thread::spawn(move || -> Result<Vec<(usize, FileSummary)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
-                    results.push((
-                        index,
-                        scan_file_summary(
-                            &normalize_path(&file),
-                            tree_sitter_diagnostics,
-                            encoding,
-                        )?,
-                    ));
+                    let normalized = normalize_path(&file);
+                    let summary = track_file_progress(&logger, "summary", &normalized, || {
+                        scan_file_summary(&normalized, tree_sitter_diagnostics, encoding)
+                    })?;
+                    results.push((index, summary));
                 }
                 Ok(results)
             })
@@ -554,6 +563,7 @@ fn build_native_context_from_summary_stream(
     options: &AnalyzeOptions,
     worker_count: usize,
     batch_size: usize,
+    progress_logger: SharedProgressLogger,
 ) -> Result<NativeContextBuildResult, String> {
     let mut builder = NativeContextBuilder::new();
     let mut max_summary_batch_files = 0usize;
@@ -563,6 +573,7 @@ fn build_native_context_from_summary_stream(
             worker_count,
             options.tree_sitter_diagnostics,
             options.encoding,
+            progress_logger.clone(),
         )?;
         max_summary_batch_files = max_summary_batch_files.max(summaries.len());
         for summary in summaries {
@@ -600,6 +611,157 @@ fn current_rss_bytes() -> Option<u128> {
     let mut system = System::new();
     system.refresh_process(pid);
     system.process(pid).map(|process| process.memory() as u128)
+}
+
+type SharedProgressLogger = Option<Arc<Mutex<ProgressLogger>>>;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressEvent {
+    run_id: String,
+    phase: String,
+    event: String,
+    file: String,
+    source_bytes: Option<u64>,
+    rss_before_bytes: Option<u128>,
+    rss_after_bytes: Option<u128>,
+    rss_delta_bytes: Option<i128>,
+    elapsed_ms: u128,
+    error: Option<String>,
+}
+
+struct ProgressLogger {
+    run_id: String,
+    writer: io::BufWriter<File>,
+}
+
+impl ProgressLogger {
+    fn new(path: &str) -> Result<Self, String> {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+        }
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let file = File::create(path).map_err(|error| error.to_string())?;
+        Ok(Self {
+            run_id: format!("{}-{started_ms}", std::process::id()),
+            writer: io::BufWriter::new(file),
+        })
+    }
+
+    fn write_event(&mut self, mut event: ProgressEvent) -> Result<(), String> {
+        event.run_id = self.run_id.clone();
+        serde_json::to_writer(&mut self.writer, &event).map_err(|error| error.to_string())?;
+        self.writer
+            .write_all(b"\n")
+            .map_err(|error| error.to_string())?;
+        self.writer.flush().map_err(|error| error.to_string())
+    }
+}
+
+fn create_progress_logger(path: Option<&str>) -> Result<SharedProgressLogger, String> {
+    path.map(ProgressLogger::new)
+        .transpose()
+        .map(|logger| logger.map(|item| Arc::new(Mutex::new(item))))
+}
+
+fn track_file_progress<T, F>(
+    logger: &SharedProgressLogger,
+    phase: &str,
+    file: &str,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    if logger.is_none() {
+        return action();
+    }
+    let source_bytes = fs::metadata(file).ok().map(|metadata| metadata.len());
+    let rss_before = current_rss_bytes();
+    let started = Instant::now();
+    write_progress_event(
+        logger,
+        phase,
+        "start",
+        file,
+        source_bytes,
+        rss_before,
+        None,
+        started.elapsed().as_millis(),
+        None,
+    )?;
+    match action() {
+        Ok(value) => {
+            let rss_after = current_rss_bytes();
+            write_progress_event(
+                logger,
+                phase,
+                "end",
+                file,
+                source_bytes,
+                rss_before,
+                rss_after,
+                started.elapsed().as_millis(),
+                None,
+            )?;
+            Ok(value)
+        }
+        Err(error) => {
+            let rss_after = current_rss_bytes();
+            let _ = write_progress_event(
+                logger,
+                phase,
+                "error",
+                file,
+                source_bytes,
+                rss_before,
+                rss_after,
+                started.elapsed().as_millis(),
+                Some(error.clone()),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn write_progress_event(
+    logger: &SharedProgressLogger,
+    phase: &str,
+    event: &str,
+    file: &str,
+    source_bytes: Option<u64>,
+    rss_before: Option<u128>,
+    rss_after: Option<u128>,
+    elapsed_ms: u128,
+    error: Option<String>,
+) -> Result<(), String> {
+    let Some(logger) = logger else {
+        return Ok(());
+    };
+    let rss_delta = match (rss_before, rss_after) {
+        (Some(before), Some(after)) => Some(after as i128 - before as i128),
+        _ => None,
+    };
+    logger
+        .lock()
+        .map_err(|_| "progress log lock poisoned".to_string())?
+        .write_event(ProgressEvent {
+            run_id: String::new(),
+            phase: phase.to_string(),
+            event: event.to_string(),
+            file: file.to_string(),
+            source_bytes,
+            rss_before_bytes: rss_before,
+            rss_after_bytes: rss_after,
+            rss_delta_bytes: rss_delta,
+            elapsed_ms,
+            error,
+        })
 }
 
 fn analyze_many_legacy(
@@ -724,10 +886,16 @@ fn analyze_many_low_memory_to_writer<W: Write>(
     let summary_batch_size = summary_scan_batch_size(batch_size, worker_count);
     metrics.insert("summaryBatchSize".to_string(), summary_batch_size as u128);
     let mut peak_rss = current_rss_bytes().unwrap_or(0);
+    let progress_logger = create_progress_logger(options.progress_log.as_deref())?;
 
     let scan_started = Instant::now();
-    let context_result =
-        build_native_context_from_summary_stream(&files, &options, worker_count, summary_batch_size)?;
+    let context_result = build_native_context_from_summary_stream(
+        &files,
+        &options,
+        worker_count,
+        summary_batch_size,
+        progress_logger.clone(),
+    )?;
     peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
     metrics.insert(
         "readMaskDeclarationScan".to_string(),
@@ -784,7 +952,8 @@ fn analyze_many_low_memory_to_writer<W: Write>(
     let mut streamed_file_count = 0usize;
     let mut max_structure_batch_files = 0usize;
     for batch in files.chunks(batch_size) {
-        let analyses = analyze_file_batch_streaming(batch, &context, &options, worker_count)?;
+        let analyses =
+            analyze_file_batch_streaming(batch, &context, &options, worker_count, progress_logger.clone())?;
         max_structure_batch_files = max_structure_batch_files.max(analyses.len());
         for analysis in analyses {
             if !first_file {
@@ -833,6 +1002,7 @@ fn analyze_file_batch_streaming(
     context: &NativeContext,
     options: &AnalyzeOptions,
     worker_count: usize,
+    progress_logger: SharedProgressLogger,
 ) -> Result<Vec<FileAnalysis>, String> {
     if batch.is_empty() {
         return Ok(Vec::new());
@@ -850,11 +1020,14 @@ fn analyze_file_batch_streaming(
             .into_iter()
             .filter(|chunk| !chunk.is_empty())
             .map(|chunk| {
+                let logger = progress_logger.clone();
                 scope.spawn(move || -> Result<Vec<(usize, FileAnalysis)>, String> {
                     let mut results = Vec::with_capacity(chunk.len());
                     for (index, file) in chunk {
-                        let structure =
-                            scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?;
+                        let normalized = normalize_path(&file);
+                        let structure = track_file_progress(&logger, "access", &normalized, || {
+                            scan_file(&normalized, tree_sitter_diagnostics, encoding)
+                        })?;
                         results.push((index, analyze_file_structure_native(structure, context)));
                     }
                     Ok(results)
@@ -3654,6 +3827,7 @@ mod tests {
                 batch_size: 256,
                 legacy_in_memory: true,
                 encoding: SourceEncoding::Auto,
+                progress_log: None,
             },
         )
         .expect("cp932 source should analyze");
@@ -3722,6 +3896,34 @@ mod tests {
         assert_eq!(low_memory.metrics.get("streamedSummaryFileCount"), Some(&3));
         assert_eq!(low_memory.metrics.get("maxSummaryBatchFiles"), Some(&2));
         assert_eq!(low_memory.metrics.get("summaryRetainedFileCount"), Some(&0));
+    }
+
+    #[test]
+    fn progress_log_records_summary_and_access_file_events() {
+        let source = write_temp_source("progress_log.cpp", &fixture_source());
+        let log_path = write_temp_source("progress_log.jsonl", "");
+        fs::remove_file(&log_path).expect("remove placeholder log");
+        let mut output = Vec::new();
+        analyze_many_low_memory_to_writer(
+            vec![source.clone()],
+            AnalyzeOptions {
+                progress_log: Some(log_path.clone()),
+                ..test_options(1, false)
+            },
+            &mut output,
+        )
+        .expect("low memory analysis");
+
+        let log = fs::read_to_string(&log_path).expect("read progress log");
+        assert!(log.contains("\"phase\":\"summary\""));
+        assert!(log.contains("\"phase\":\"access\""));
+        assert!(log.contains("\"event\":\"start\""));
+        assert!(log.contains("\"event\":\"end\""));
+        assert!(log.contains("\"sourceBytes\""));
+        assert!(log.contains("\"rssBeforeBytes\""));
+        assert!(log.contains("\"rssAfterBytes\""));
+        assert!(log.contains("\"rssDeltaBytes\""));
+        assert!(log.contains(&source));
     }
 
     #[test]
@@ -3819,6 +4021,7 @@ mod tests {
             batch_size,
             legacy_in_memory,
             encoding: SourceEncoding::Auto,
+            progress_log: None,
         }
     }
 

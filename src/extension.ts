@@ -32,10 +32,11 @@ export function activate(context: vscode.ExtensionContext): void {
         treeProvider.setIndexStatus({
           action: "built",
           sourceFileCount: index.build.sourceFileCount,
+          skippedFileCount: index.build.skippedFiles?.length,
           durationMs: index.build.durationMs,
           workerCount: index.build.workerCount
         });
-        vscode.window.showInformationMessage(`VC6 Impact index built: ${settings.indexPath}`);
+        vscode.window.showInformationMessage(`VC6 Impact index built${skippedSuffix(index)}: ${settings.indexPath}`);
       });
     }),
     vscode.commands.registerCommand("vc6Impact.updateIndex", async () => {
@@ -55,10 +56,11 @@ export function activate(context: vscode.ExtensionContext): void {
           sourceFileCount: index.build.sourceFileCount,
           changedFileCount: index.build.changedFiles.length,
           reusedFileCount: index.build.reusedFiles,
+          skippedFileCount: index.build.skippedFiles?.length,
           durationMs: index.build.durationMs,
           workerCount: index.build.workerCount
         });
-        vscode.window.showInformationMessage(`VC6 Impact index updated: ${settings.indexPath}`);
+        vscode.window.showInformationMessage(`VC6 Impact index updated${skippedSuffix(index)}: ${settings.indexPath}`);
       });
     }),
     vscode.commands.registerCommand("vc6Impact.inspectSelectedSymbol", async (symbolArg?: unknown) => {
@@ -133,6 +135,7 @@ async function restoreExistingIndexStatus(context: vscode.ExtensionContext, tree
     treeProvider.setIndexStatus({
       action: "loaded",
       sourceFileCount: summary.sourceFileCount,
+      skippedFileCount: summary.skippedFileCount,
       durationMs: summary.durationMs,
       workerCount: summary.workerCount
     });
@@ -152,6 +155,11 @@ function getSelectedSymbol(): string | undefined {
   }
   const line = editor.document.lineAt(selection.active.line).text;
   return extractSymbolAtTextOffset(line, selection.active.character);
+}
+
+function skippedSuffix(index: AnalysisIndex): string {
+  const count = index.build.skippedFiles?.length ?? 0;
+  return count > 0 ? ` with ${count} skipped file(s)` : "";
 }
 
 async function withErrors(task: () => Promise<void>): Promise<void> {

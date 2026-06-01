@@ -12,6 +12,7 @@ export interface IndexBuildSummary {
   workerCount: number;
   sourceFileCount: number;
   reusedFiles: number;
+  skippedFileCount?: number;
 }
 
 export interface IndexFunctionWriter {
@@ -123,6 +124,7 @@ function parseIndexBuildSummaryTail(tail: string): IndexBuildSummary | undefined
   const workerCount = matchNumberProperty(buildText, "workerCount");
   const sourceFileCount = matchNumberProperty(buildText, "sourceFileCount");
   const reusedFiles = matchNumberProperty(buildText, "reusedFiles");
+  const skippedFileCount = countSkippedFiles(buildText);
   if (
     typeof durationMs !== "number" ||
     typeof workerCount !== "number" ||
@@ -131,7 +133,13 @@ function parseIndexBuildSummaryTail(tail: string): IndexBuildSummary | undefined
   ) {
     return undefined;
   }
-  return { durationMs, workerCount, sourceFileCount, reusedFiles };
+  return {
+    durationMs,
+    workerCount,
+    sourceFileCount,
+    reusedFiles,
+    ...(typeof skippedFileCount === "number" ? { skippedFileCount } : {})
+  };
 }
 
 function matchNumberProperty(text: string, property: string): number | undefined {
@@ -151,6 +159,53 @@ export async function writeIndex(indexPath: string, index: AnalysisIndex): Promi
     await writeFunctionsJsonl(functionsPath, []);
   }
   await writeCompactJsonFile(indexPath, stored);
+}
+
+function countSkippedFiles(text: string): number | undefined {
+  const propertyIndex = text.indexOf('"skippedFiles"');
+  if (propertyIndex < 0) {
+    return undefined;
+  }
+  const arrayStart = text.indexOf("[", propertyIndex);
+  if (arrayStart < 0) {
+    return undefined;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let objects = 0;
+  for (let index = arrayStart; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "[") {
+      depth += 1;
+      continue;
+    }
+    if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return objects;
+      }
+      continue;
+    }
+    if (char === "{" && depth === 1) {
+      objects += 1;
+    }
+  }
+  return undefined;
 }
 
 export async function createIndexFunctionWriter(indexPath: string): Promise<IndexFunctionWriter> {

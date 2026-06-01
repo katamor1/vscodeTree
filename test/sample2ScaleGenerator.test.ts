@@ -9,6 +9,7 @@ const sample2ScaleGenerator = require("../scripts/generate-sample2-scale.js") as
 
 const benchmarkIndex = require("../scripts/benchmark-index.js") as {
   countFunctionAccesses: (index: { functions: Record<string, { accesses?: unknown[] }> }) => number;
+  parseArgs: (argv: string[]) => { sample?: string; workers?: string; batch?: string };
   samples: Record<string, { root: string; project: string; threadMap: string }>;
 };
 
@@ -61,5 +62,13 @@ describe("sample2 scale generator tiers", () => {
         third: { accesses: [{}] }
       }
     })).toBe(3);
+  });
+
+  it("accepts positional batch size after npm normalizes benchmark flags", () => {
+    expect(benchmarkIndex.parseArgs(["small", "1", "1"])).toMatchObject({
+      sample: "small",
+      workers: "1",
+      batch: "1"
+    });
   });
 });

@@ -160,6 +160,20 @@ export interface FileAnalysis {
   unresolved: UnresolvedEvidence[];
 }
 
+export interface SkippedSourceFile {
+  file: string;
+  phase?: "summary" | "access" | "unknown";
+  reason: string;
+  sourceBytes?: number;
+  rssBeforeBytes?: number;
+  rssAfterBytes?: number;
+  rssDeltaBytes?: number;
+  requestedBytes?: number;
+  diagnosticLogPath?: string;
+  diagnosticSummaryPath?: string;
+  skippedAt: string;
+}
+
 export interface ThreadReachability {
   functionName: string;
   threadIds: string[];
@@ -199,6 +213,8 @@ export interface AnalysisIndex {
     reusedFiles: number;
     fullRebuildReason?: string;
     sourceFileCount: number;
+    analyzedFileCount?: number;
+    skippedFiles?: SkippedSourceFile[];
   };
   storage?: {
     layout: "split-v1";
@@ -261,6 +277,8 @@ export interface BuildOptions {
   parserEngine?: ParserEngine;
   projectEncoding?: "auto" | "utf8" | "cp932";
   sourceEncoding?: "auto" | "utf8" | "cp932";
+  outputDir?: string;
+  maxRustAutoSkippedFiles?: number;
 }
 
 export interface BuildResult {

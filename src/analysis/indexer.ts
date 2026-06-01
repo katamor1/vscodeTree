@@ -5,7 +5,7 @@ import { readThreadMap } from "./threadMap";
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature } from "./sourceScanner";
 import { analyzeFilesWithParserBackend } from "./parserBackend";
 import { mapWithConcurrency } from "./limitedConcurrency";
-import { parseRustOutputFile, runRustAnalyzeManyToOutput, rustPhaseDurations } from "./rust/rustSourceScanner";
+import { parseRustOutputFile, runRustAnalyzeManyToOutputWithAutoSkip, rustPhaseDurations } from "./rust/rustSourceScanner";
 import { createIndexFunctionWriter, writeIndex } from "./store";
 import type {
   AnalysisIndex,
@@ -18,6 +18,7 @@ import type {
   MacroDefinition,
   MemberSymbol,
   ParserDiagnostic,
+  SkippedSourceFile,
   StructTypeInfo,
   ThreadDefinition,
   ThreadReachability
@@ -45,7 +46,9 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
     maxNativeBatchFiles: options.maxNativeBatchFiles,
     sourceEncoding: options.sourceEncoding ?? "auto",
     includePaths: project.includePaths,
-    macros: project.macros
+    macros: project.macros,
+    diagnosticsDir: nativeDiagnosticsDir(options),
+    maxRustAutoSkippedFiles: options.maxRustAutoSkippedFiles
   });
   phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   Object.assign(phaseDurationsMs, scanResult.phaseDurationsMs);
@@ -68,7 +71,10 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
     parserEngine,
     phaseDurationsMs,
     workerCount: scanResult.workerCount,
-    parserDiagnostics: scanResult.diagnostics
+    parserDiagnostics: scanResult.diagnostics,
+    skippedFiles: scanResult.skippedFiles ?? [],
+    analyzedFileCount: scanResult.files.length,
+    fileSignatures: await skippedFileSignatures(scanResult.skippedFiles ?? [])
   });
 }
 
@@ -163,7 +169,9 @@ export async function updateIndex(
         workerCount: 0,
         changedFiles,
         reusedFiles: project.sourceFiles.length,
-        sourceFileCount: project.sourceFiles.length
+        sourceFileCount: project.sourceFiles.length,
+        analyzedFileCount: previousIndex.build.analyzedFileCount,
+        skippedFiles: previousIndex.build.skippedFiles
       }
     };
   }
@@ -277,7 +285,9 @@ export async function updateIndexToStorage(
         workerCount: 0,
         changedFiles,
         reusedFiles: project.sourceFiles.length,
-        sourceFileCount: project.sourceFiles.length
+        sourceFileCount: project.sourceFiles.length,
+        analyzedFileCount: previousIndex.build.analyzedFileCount,
+        skippedFiles: previousIndex.build.skippedFiles
       }
     };
     await writeIndex(indexPath, index);
@@ -317,12 +327,14 @@ async function buildRustIndexToStorage(args: {
   fullRebuildReason?: string;
 }): Promise<AnalysisIndex> {
   let phaseStarted = Date.now();
-  const output = await runRustAnalyzeManyToOutput(
-    args.project.sourceFiles,
-    args.options.maxIndexWorkers,
-    args.options.sourceEncoding ?? "auto",
-    args.options.maxNativeBatchFiles
-  );
+  const output = await runRustAnalyzeManyToOutputWithAutoSkip({
+    files: args.project.sourceFiles,
+    maxIndexWorkers: args.options.maxIndexWorkers,
+    sourceEncoding: args.options.sourceEncoding ?? "auto",
+    maxNativeBatchFiles: args.options.maxNativeBatchFiles,
+    diagnosticsDir: nativeDiagnosticsDir(args.options, args.indexPath),
+    maxSkippedFiles: args.options.maxRustAutoSkippedFiles
+  });
   args.phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   const functionWriter = await createIndexFunctionWriter(args.indexPath);
   try {
@@ -330,6 +342,7 @@ async function buildRustIndexToStorage(args: {
     const summaryFiles: SummaryFile[] = [];
     const globals: Record<string, GlobalVariable[]> = {};
     const fileSignatures: Record<string, FileSignature> = {};
+    Object.assign(fileSignatures, await skippedFileSignatures(output.skippedFiles ?? []));
     const fileUnresolved: FileAnalysis["unresolved"] = [];
     const callGraph: Record<string, string[]> = {};
     const calledBy: Record<string, string[]> = {};
@@ -365,8 +378,10 @@ async function buildRustIndexToStorage(args: {
     output.diagnostics.push(...(parsed.diagnostics ?? []));
     Object.assign(
       args.phaseDurationsMs,
-      rustPhaseDurations(parsed.metrics, args.project.sourceFiles.length, output.outputBytes, output.nativeBatchSize)
+      rustPhaseDurations(parsed.metrics, output.analyzedFileCount ?? summaryFiles.length, output.outputBytes, output.nativeBatchSize)
     );
+    args.phaseDurationsMs.rustSkippedFileCount = output.skippedFiles?.length ?? 0;
+    args.phaseDurationsMs.rustAnalyzedFileCount = output.analyzedFileCount ?? summaryFiles.length;
     args.phaseDurationsMs.symbolMap = args.phaseDurationsMs.rustSymbolMap ?? 0;
     args.phaseDurationsMs.accessAnalysis = args.phaseDurationsMs.rustAccessAnalysis ?? 0;
 
@@ -425,7 +440,9 @@ async function buildRustIndexToStorage(args: {
         changedFiles: args.changedFiles,
         reusedFiles: args.reusedFiles,
         fullRebuildReason: args.fullRebuildReason,
-        sourceFileCount: args.project.sourceFiles.length
+        sourceFileCount: args.project.sourceFiles.length,
+        analyzedFileCount: output.analyzedFileCount ?? summaryFiles.length,
+        skippedFiles: output.skippedFiles?.length ? output.skippedFiles : undefined
       },
       storage: {
         layout: "split-v1",
@@ -508,6 +525,9 @@ function composeIndex(args: {
   phaseDurationsMs: Record<string, number>;
   workerCount: number;
   parserDiagnostics: ParserDiagnostic[];
+  skippedFiles?: SkippedSourceFile[];
+  analyzedFileCount?: number;
+  fileSignatures?: Record<string, FileSignature>;
 }): AnalysisIndex {
   const composeStarted = Date.now();
   const globals: Record<string, GlobalVariable[]> = {};
@@ -526,6 +546,7 @@ function composeIndex(args: {
   const functions: Record<string, FunctionInfo> = {};
   const callGraph: Record<string, string[]> = {};
   const calledBy: Record<string, string[]> = {};
+  const fileSignatures = { ...(args.fileSignatures ?? {}) };
 
   for (const [typeName, typeInfo] of memberContext.structTypes) {
     structTypes[typeName] = typeInfo;
@@ -541,6 +562,7 @@ function composeIndex(args: {
   }
 
   for (const file of args.files) {
+    fileSignatures[file.file] = file.signature;
     for (const global of file.globals) {
       globals[global.name] = [...(globals[global.name] ?? []), global];
     }
@@ -564,6 +586,7 @@ function composeIndex(args: {
     includePaths: args.includePaths,
     macros: args.macros,
     files: args.files,
+    fileSignatures,
     globals,
     structTypes,
     memberSymbols,
@@ -586,7 +609,9 @@ function composeIndex(args: {
       workerCount: args.workerCount,
       changedFiles: args.changedFiles,
       reusedFiles: args.reusedFiles,
-      sourceFileCount: args.sourceFileCount
+      sourceFileCount: args.sourceFileCount,
+      analyzedFileCount: args.analyzedFileCount ?? args.files.length,
+      skippedFiles: args.skippedFiles?.length ? args.skippedFiles : undefined
     }
   };
   index.build.durationMs = Date.now() - args.started;
@@ -708,6 +733,23 @@ export async function fileExists(file: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function nativeDiagnosticsDir(options: BuildOptions, indexPath?: string): string | undefined {
+  const outputDir = options.outputDir ?? (indexPath ? path.dirname(indexPath) : undefined);
+  return outputDir ? path.join(outputDir, "native-diagnostics") : undefined;
+}
+
+async function skippedFileSignatures(skippedFiles: SkippedSourceFile[]): Promise<Record<string, FileSignature>> {
+  const signatures: Record<string, FileSignature> = {};
+  await mapWithConcurrency(skippedFiles, SIGNATURE_CHECK_CONCURRENCY, async (skipped) => {
+    try {
+      signatures[skipped.file] = await getFileSignature(skipped.file);
+    } catch {
+      // The skip diagnostic is still useful if the file disappeared before index composition.
+    }
+  });
+  return signatures;
 }
 
 function elapsedSince(started: number): number {
