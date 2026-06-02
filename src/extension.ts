@@ -9,6 +9,7 @@ import { extractSymbolAtTextOffset, normalizeCommandSymbolArg } from "./extensio
 import { ImpactTreeProvider } from "./extension/impactTree";
 import { GraphView } from "./extension/graphView";
 import { readSettings } from "./extension/settings";
+import { updateVc6ProjectContext } from "./extension/workspaceContext";
 
 let currentImpact: ImpactResult | undefined;
 
@@ -16,6 +17,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const treeProvider = new ImpactTreeProvider();
   const graphView = new GraphView();
   context.subscriptions.push(vscode.window.registerTreeDataProvider("vc6Impact.explorer", treeProvider));
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void refreshVc6ProjectContext();
+    }),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("vc6Impact.projectFile")) {
+        void refreshVc6ProjectContext();
+      }
+    })
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("vc6Impact.buildFullIndex", async () => {
@@ -98,6 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  void refreshVc6ProjectContext();
   void restoreExistingIndexStatus(context, treeProvider);
 }
 
@@ -142,6 +154,14 @@ async function restoreExistingIndexStatus(context: vscode.ExtensionContext, tree
   } catch (error) {
     console.warn("VC6 Impact: existing index status was not restored", error);
   }
+}
+
+function refreshVc6ProjectContext(): Promise<void> {
+  return updateVc6ProjectContext({
+    workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+    projectFileSetting: vscode.workspace.getConfiguration("vc6Impact").get<string>("projectFile") ?? "",
+    setContext: (key, value) => vscode.commands.executeCommand("setContext", key, value)
+  });
 }
 
 function getSelectedSymbol(): string | undefined {

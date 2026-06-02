@@ -270,10 +270,12 @@ export interface ImpactResult {
 export interface BuildOptions {
   workspaceRoot: string;
   projectFile: string;
+  projectConfiguration?: string;
   threadMapFile?: string;
   excludeGlobs?: string[];
   maxIndexWorkers?: number;
   maxNativeBatchFiles?: number;
+  rustSidecarTimeoutMs?: number;
   parserEngine?: ParserEngine;
   projectEncoding?: "auto" | "utf8" | "cp932";
   sourceEncoding?: "auto" | "utf8" | "cp932";

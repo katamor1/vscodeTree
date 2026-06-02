@@ -18,6 +18,7 @@ export async function analyzeFilesWithParserBackend(args: {
   files: string[];
   maxIndexWorkers?: number;
   maxNativeBatchFiles?: number;
+  rustSidecarTimeoutMs?: number;
   sourceEncoding?: TextEncoding;
   includePaths?: string[];
   macros?: string[];
@@ -30,8 +31,10 @@ export async function analyzeFilesWithParserBackend(args: {
       maxIndexWorkers: args.maxIndexWorkers,
       sourceEncoding: args.sourceEncoding ?? "auto",
       maxNativeBatchFiles: args.maxNativeBatchFiles,
+      timeoutMs: args.rustSidecarTimeoutMs,
       diagnosticsDir: args.diagnosticsDir,
-      maxSkippedFiles: args.maxRustAutoSkippedFiles
+      maxSkippedFiles: args.maxRustAutoSkippedFiles,
+      macros: args.macros ?? []
     });
   }
   if (args.parserEngine === "clang") {
@@ -48,7 +51,8 @@ export async function analyzeFilesWithParserBackend(args: {
     args.sourceEncoding ?? "auto",
     "typescript",
     [],
-    effectiveFileConcurrency(args.maxIndexWorkers)
+    effectiveFileConcurrency(args.maxIndexWorkers),
+    args.macros ?? []
   );
 }
 

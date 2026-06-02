@@ -44,6 +44,8 @@ export interface RustAnalyzeManyArgs {
   maxIndexWorkers: number;
   sourceEncoding: TextEncoding;
   maxNativeBatchFiles: number;
+  timeoutMs?: number;
+  macros?: string[];
   progressLogPath?: string;
 }
 
@@ -54,6 +56,8 @@ export interface RustAutoSkipOptions {
   maxIndexWorkers?: number;
   sourceEncoding?: TextEncoding;
   maxNativeBatchFiles?: number;
+  timeoutMs?: number;
+  macros?: string[];
   diagnosticsDir?: string;
   maxSkippedFiles?: number;
   runner?: RustAnalyzeManyRunner;
@@ -118,9 +122,11 @@ export async function analyzeFilesWithRustSidecar(
   files: string[],
   maxIndexWorkers = 0,
   sourceEncoding: TextEncoding = "auto",
-  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize
+  maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
+  macros: string[] = [],
+  timeoutMs?: number
 ): Promise<RustNativeAnalysisResult> {
-  const output = await runRustAnalyzeManyToOutput(files, maxIndexWorkers, sourceEncoding, maxNativeBatchFiles);
+  const output = await runRustAnalyzeManyToOutput(files, maxIndexWorkers, sourceEncoding, maxNativeBatchFiles, undefined, macros, timeoutMs);
   try {
     let parsed: RustOutput;
     try {
@@ -187,13 +193,17 @@ export async function runRustAnalyzeManyToOutput(
   maxIndexWorkers = 0,
   sourceEncoding: TextEncoding = "auto",
   maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
-  progressLogPath?: string
+  progressLogPath?: string,
+  macros: string[] = [],
+  timeoutMs?: number
 ): Promise<RustSidecarOutputFile> {
   return defaultRustAnalyzeManyRunner({
     files,
     maxIndexWorkers,
     sourceEncoding,
     maxNativeBatchFiles,
+    timeoutMs,
+    macros,
     progressLogPath
   });
 }
@@ -203,6 +213,8 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
   maxIndexWorkers = 0,
   sourceEncoding = "auto",
   maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
+  timeoutMs,
+  macros = [],
   progressLogPath
 }: RustAnalyzeManyArgs): Promise<RustSidecarOutputFile> => {
   const sidecar = await findRustSidecarExecutable();
@@ -233,12 +245,15 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
       "--batch-size",
       String(nativeBatchSize)
     ];
+    for (const macro of macros) {
+      args.push("--define", macro);
+    }
     if (progressLogPath) {
       args.push("--progress-log", progressLogPath);
     }
     await execFileAsync(sidecar, args, {
       windowsHide: true,
-      timeout: Math.max(30000, files.length * 250),
+      timeout: resolveRustSidecarTimeoutMs(timeoutMs, files.length),
       maxBuffer: 16 * 1024 * 1024
     });
     const outputBytes = (await fs.stat(outputPath)).size;
@@ -277,6 +292,8 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
   const sourceEncoding = options.sourceEncoding ?? "auto";
   const maxIndexWorkers = options.maxIndexWorkers ?? 0;
   const maxNativeBatchFiles = normalizeNativeBatchFiles(options.maxNativeBatchFiles ?? defaultNativeAnalyzeBatchSize);
+  const timeoutMs = options.timeoutMs;
+  const macros = options.macros ?? [];
   const diagnosticsDir = options.diagnosticsDir ?? path.join(os.tmpdir(), "vc6-impact-native-diagnostics");
   const maxSkippedFiles = normalizeMaxSkippedFiles(options.maxSkippedFiles);
   const runStamp = diagnosticStamp();
@@ -289,7 +306,9 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
       files,
       maxIndexWorkers,
       sourceEncoding,
-      maxNativeBatchFiles
+      maxNativeBatchFiles,
+      timeoutMs,
+      macros
     });
   } catch (error) {
     if (!isRustMemoryFailure(error)) {
@@ -314,6 +333,8 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
         maxIndexWorkers: 1,
         sourceEncoding,
         maxNativeBatchFiles: 1,
+        timeoutMs,
+        macros,
         progressLogPath
       });
       const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {
@@ -530,6 +551,13 @@ function normalizeMaxSkippedFiles(value: number | undefined): number {
     return 16;
   }
   return Math.max(0, Math.min(1000, Math.floor(value ?? 16)));
+}
+
+export function resolveRustSidecarTimeoutMs(value: number | undefined, fileCount: number): number {
+  if (value === undefined || value < 0 || !Number.isFinite(value)) {
+    return Math.max(30000, fileCount * 250);
+  }
+  return Math.floor(value);
 }
 
 function diagnosticStamp(): string {

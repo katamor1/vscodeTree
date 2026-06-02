@@ -24,6 +24,15 @@ describe("VC6 project parsing", () => {
     expect(project.includePaths.some((includePath) => includePath.endsWith("/src"))).toBe(true);
     expect(project.macros).toContain("WIN32");
   });
+
+  it("defaults to the Release CFG branch and avoids debug or source-local test macros", async () => {
+    const fixture = await createReleaseConfigurationFixture();
+    const project = await parseVc6Project(fixture.root, fixture.projectFile);
+
+    expect(project.sourceFiles.map((file) => path.basename(file))).toEqual(["main.cpp"]);
+    expect(project.includePaths.some((includePath) => includePath.endsWith("/src"))).toBe(true);
+    expect(project.macros).toEqual(["NDEBUG", "WIN32"]);
+  });
 });
 
 describe("Impact index", () => {
@@ -404,6 +413,22 @@ describe("Impact index", () => {
     );
     expect(accesses.map((access) => access.variableName)).not.toContain("PTR_GBL");
   });
+
+  it("tracks the release side through nested test-code conditionals", async () => {
+    const fixture = await createReleaseConfigurationFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: fixture.root,
+      projectFile: fixture.projectFile,
+      parserEngine: "typescript",
+      projectConfiguration: "Release",
+      maxIndexWorkers: 1
+    });
+
+    expect(index.macros).toEqual(["NDEBUG", "WIN32"]);
+    expect(Object.keys(index.functions).sort()).toEqual(["ReleaseOnly"]);
+    expect(index.globals.g_release?.length).toBe(1);
+    expect(index.globals.g_test).toBeUndefined();
+  });
 });
 
 describe("function impact", () => {
@@ -432,6 +457,74 @@ async function createSingleFileProject(sourceLines: string[]): Promise<{ root: s
   await fs.writeFile(projectFile, 'Project: "sample"="sample.dsp" - Package Owner=<4>\r\n', "utf8");
   await fs.writeFile(path.join(root, "sample.dsp"), "SOURCE=.\\src\\main.cpp\r\n", "utf8");
   await fs.writeFile(path.join(root, "src", "main.cpp"), `${sourceLines.join("\n")}\n`, "utf8");
+  return { root, projectFile };
+}
+
+async function createReleaseConfigurationFixture(): Promise<{ root: string; projectFile: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-release-config-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  const projectFile = path.join(root, "sample.dsw");
+  await fs.writeFile(projectFile, 'Project: "sample"=".\\sample.dsp" - Package Owner=<4>\r\n', "utf8");
+  await fs.writeFile(
+    path.join(root, "sample.dsp"),
+    [
+      '# Microsoft Developer Studio Project File - Name="sample" - Package Owner=<4>',
+      '# Name "sample - Win32 Release"',
+      '# Name "sample - Win32 Debug"',
+      '!IF  "$(CFG)" == "sample - Win32 Release"',
+      '# ADD CPP /nologo /W3 /I ".\\src" /D "WIN32" /D "NDEBUG" /c',
+      '!ELSEIF  "$(CFG)" == "sample - Win32 Debug"',
+      '# ADD CPP /nologo /W3 /I ".\\src" /D "WIN32" /D "_DEBUG" /D "TEST_CODE1" /c',
+      '!ENDIF',
+      '# Begin Source File',
+      'SOURCE=.\\src\\main.cpp',
+      '# End Source File',
+      '# Begin Source File',
+      'SOURCE=.\\src\\test_only.cpp',
+      '!IF  "$(CFG)" == "sample - Win32 Release"',
+      '# PROP Exclude_From_Build 1',
+      '!ELSEIF  "$(CFG)" == "sample - Win32 Debug"',
+      '# ADD CPP /D "TEST_CODE3"',
+      '!ENDIF',
+      '# End Source File',
+      ''
+    ].join("\r\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "main.cpp"),
+    [
+      "int g_release;",
+      "#if defined (TEST_CODE1)",
+      "int g_test;",
+      "void TestOnly(void) { g_test++; }",
+      "#ifndef TEST_CODE2",
+      "#if 1",
+      "void NestedTestOnly(void) { g_test++; }",
+      "#endif",
+      "#else",
+      "void HeaderDefinedTestOnly(void) { g_test++; }",
+      "#endif",
+      "#ifdef TEST_CODE3",
+      "void UnitTestOnly(void) { g_test++; }",
+      "#endif",
+      "#else",
+      "void ReleaseOnly(void) { g_release++; }",
+      "#endif",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "test_only.cpp"),
+    [
+      "#if defined(TEST_CODE1)",
+      "void WholeFileTestOnly(void) {}",
+      "#endif",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
   return { root, projectFile };
 }
 

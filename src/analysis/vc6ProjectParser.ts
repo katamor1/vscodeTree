@@ -12,7 +12,8 @@ export async function parseVc6Project(
   workspaceRoot: string,
   projectFile: string,
   excludeGlobs: string[] = [],
-  projectEncoding: TextEncoding = "auto"
+  projectEncoding: TextEncoding = "auto",
+  projectConfiguration = "Release"
 ): Promise<Vc6ProjectInfo> {
   const resolvedProjectFile = resolveMaybeRelative(workspaceRoot, projectFile);
   const ext = path.extname(resolvedProjectFile).toLowerCase();
@@ -27,7 +28,7 @@ export async function parseVc6Project(
     if (ext === ".dsw" && !(await fileExists(dspFile))) {
       continue;
     }
-    const dsp = await parseDsp(dspFile, workspaceRoot, excludeGlobs, projectEncoding);
+    const dsp = await parseDsp(dspFile, workspaceRoot, excludeGlobs, projectEncoding, projectConfiguration);
     dsp.sourceFiles.forEach((file) => sourceFiles.add(file));
     dsp.includePaths.forEach((includePath) => includePaths.add(includePath));
     dsp.macros.forEach((macro) => macros.add(macro));
@@ -69,16 +70,32 @@ async function parseDsp(
   dspFile: string,
   workspaceRoot: string,
   excludeGlobs: string[],
-  projectEncoding: TextEncoding
+  projectEncoding: TextEncoding,
+  projectConfiguration: string
 ): Promise<Pick<Vc6ProjectInfo, "sourceFiles" | "includePaths" | "macros">> {
   const text = (await readTextFile(dspFile, projectEncoding)).text;
   const baseDir = path.dirname(dspFile);
   const sourceCandidates = new Set<string>();
   const includePaths = new Set<string>();
   const macros = new Set<string>();
+  const lines = text.split(/\r?\n/);
+  const selectedConfiguration = selectVc6Configuration(lines, projectConfiguration);
+  let insideSourceBlock = false;
+  let currentSourceFile: string | undefined;
 
-  for (const rawLine of text.split(/\r?\n/)) {
+  for (const rawLine of filterVc6ConfigurationLines(lines, selectedConfiguration)) {
     const line = rawLine.trim();
+    if (/^#\s*Begin Source File/i.test(line)) {
+      insideSourceBlock = true;
+      currentSourceFile = undefined;
+      continue;
+    }
+    if (/^#\s*End Source File/i.test(line)) {
+      insideSourceBlock = false;
+      currentSourceFile = undefined;
+      continue;
+    }
+
     const sourceMatch = /^SOURCE=(.+)$/i.exec(line);
     if (sourceMatch) {
       const sourcePath = parseVc6PathValue(sourceMatch[1]);
@@ -91,17 +108,25 @@ async function parseDsp(
         !matchesExcluded(sourceFile, excludeGlobs)
       ) {
         sourceCandidates.add(sourceFile);
+        currentSourceFile = insideSourceBlock ? sourceFile : undefined;
       }
       continue;
     }
 
-    const tokens = tokenizeVc6CommandLine(line);
-    for (const includePath of extractSwitchValues(tokens, "I")) {
-      includePaths.add(resolveMaybeRelative(workspaceRoot, includePath));
+    if (currentSourceFile && /^#\s*PROP\s+Exclude_From_Build\s+1\b/i.test(line)) {
+      sourceCandidates.delete(currentSourceFile);
+      continue;
     }
 
-    for (const macro of extractSwitchValues(tokens, "D")) {
-      macros.add(macro);
+    const tokens = tokenizeVc6CommandLine(line);
+    if (!currentSourceFile) {
+      for (const includePath of extractSwitchValues(tokens, "I")) {
+        includePaths.add(resolveMaybeRelative(workspaceRoot, includePath));
+      }
+
+      for (const macro of extractSwitchValues(tokens, "D")) {
+        macros.add(macro);
+      }
     }
   }
 
@@ -111,6 +136,119 @@ async function parseDsp(
     includePaths: [...includePaths].sort(),
     macros: [...macros].sort()
   };
+}
+
+function selectVc6Configuration(lines: string[], requestedConfiguration: string): string | undefined {
+  const configurations = lines.flatMap((line) => {
+    const match = line.match(/^#\s*Name\s+"([^"]+)"/i);
+    return match ? [match[1]] : [];
+  });
+  if (configurations.length === 0) {
+    return undefined;
+  }
+  const requested = requestedConfiguration.trim() || "Release";
+  const exact = configurations.find((configuration) => sameText(configuration, requested));
+  if (exact) {
+    return exact;
+  }
+  const contained = configurations.find((configuration) => configuration.toLowerCase().includes(requested.toLowerCase()));
+  if (contained) {
+    return contained;
+  }
+  return configurations.find((configuration) => /\bRelease\b/i.test(configuration)) ?? configurations[0];
+}
+
+interface Vc6ConditionFrame {
+  parentActive: boolean;
+  branchActive: boolean;
+  branchTaken: boolean;
+}
+
+function filterVc6ConfigurationLines(lines: string[], selectedConfiguration: string | undefined): string[] {
+  if (!selectedConfiguration) {
+    return lines;
+  }
+  const frames: Vc6ConditionFrame[] = [];
+  const output: string[] = [];
+  for (const line of lines) {
+    const directive = parseVc6ConditionDirective(line);
+    const currentActive = frames.every((frame) => frame.branchActive);
+    if (!directive) {
+      if (currentActive) {
+        output.push(line);
+      }
+      continue;
+    }
+
+    if (directive.kind === "if") {
+      const parentActive = currentActive;
+      const condition = evaluateVc6ConfigurationCondition(directive.condition, selectedConfiguration);
+      frames.push({
+        parentActive,
+        branchActive: parentActive && condition,
+        branchTaken: parentActive && condition
+      });
+      continue;
+    }
+
+    if (directive.kind === "elseif") {
+      const frame = frames.at(-1);
+      if (!frame) {
+        continue;
+      }
+      const condition = evaluateVc6ConfigurationCondition(directive.condition, selectedConfiguration);
+      frame.branchActive = frame.parentActive && !frame.branchTaken && condition;
+      frame.branchTaken = frame.branchTaken || frame.branchActive;
+      continue;
+    }
+
+    if (directive.kind === "else") {
+      const frame = frames.at(-1);
+      if (frame) {
+        frame.branchActive = frame.parentActive && !frame.branchTaken;
+        frame.branchTaken = true;
+      }
+      continue;
+    }
+
+    frames.pop();
+  }
+  return output;
+}
+
+function parseVc6ConditionDirective(line: string):
+  | { kind: "if" | "elseif"; condition: string }
+  | { kind: "else" | "endif"; condition?: undefined }
+  | undefined {
+  const trimmed = line.trim();
+  const ifMatch = /^!IF\s+(.+)$/i.exec(trimmed);
+  if (ifMatch) {
+    return { kind: "if", condition: ifMatch[1] };
+  }
+  const elseifMatch = /^!ELSEIF\s+(.+)$/i.exec(trimmed);
+  if (elseifMatch) {
+    return { kind: "elseif", condition: elseifMatch[1] };
+  }
+  if (/^!ELSE$/i.test(trimmed)) {
+    return { kind: "else" };
+  }
+  if (/^!ENDIF$/i.test(trimmed)) {
+    return { kind: "endif" };
+  }
+  return undefined;
+}
+
+function evaluateVc6ConfigurationCondition(condition: string, selectedConfiguration: string): boolean {
+  const match = condition.match(/"?\$\(\s*CFG\s*\)"?\s*(==|!=)\s*"([^"]+)"/i);
+  if (!match) {
+    return true;
+  }
+  const equals = sameText(match[2], selectedConfiguration);
+  return match[1] === "==" ? equals : !equals;
+}
+
+function sameText(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 async function filterExistingFiles(files: string[]): Promise<string[]> {

@@ -33,7 +33,7 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   const phaseDurationsMs: Record<string, number> = {};
   const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -44,6 +44,7 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
     files: project.sourceFiles,
     maxIndexWorkers: options.maxIndexWorkers,
     maxNativeBatchFiles: options.maxNativeBatchFiles,
+    rustSidecarTimeoutMs: options.rustSidecarTimeoutMs,
     sourceEncoding: options.sourceEncoding ?? "auto",
     includePaths: project.includePaths,
     macros: project.macros,
@@ -89,7 +90,7 @@ export async function buildFullIndexToStorage(options: BuildOptions, indexPath: 
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -122,7 +123,7 @@ export async function updateIndex(
   const phaseDurationsMs: Record<string, number> = {};
   const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -208,7 +209,7 @@ export async function updateIndexToStorage(
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -332,8 +333,10 @@ async function buildRustIndexToStorage(args: {
     maxIndexWorkers: args.options.maxIndexWorkers,
     sourceEncoding: args.options.sourceEncoding ?? "auto",
     maxNativeBatchFiles: args.options.maxNativeBatchFiles,
+    timeoutMs: args.options.rustSidecarTimeoutMs,
     diagnosticsDir: nativeDiagnosticsDir(args.options, args.indexPath),
-    maxSkippedFiles: args.options.maxRustAutoSkippedFiles
+    maxSkippedFiles: args.options.maxRustAutoSkippedFiles,
+    macros: args.project.macros
   });
   args.phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   const functionWriter = await createIndexFunctionWriter(args.indexPath);

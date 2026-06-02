@@ -60,6 +60,39 @@ describe("extension manifest", () => {
     expect(activityBarContainer?.icon).toBe("resources/activitybar.svg");
   });
 
+  it("shows the sidebar view only for VC6 project workspaces and editor context commands only for C/C++ source files", async () => {
+    const manifestPath = path.resolve(__dirname, "..", "package.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+      activationEvents?: string[];
+      contributes?: {
+        menus?: {
+          "editor/context"?: Array<{ command: string; when?: string }>;
+          "view/title"?: Array<{ command: string; when?: string }>;
+        };
+        views?: {
+          vc6Impact?: Array<{ id: string; when?: string }>;
+        };
+      };
+    };
+
+    expect(manifest.activationEvents).toContain("workspaceContains:**/*.dsw");
+    expect(manifest.activationEvents).toContain("workspaceContains:**/*.dsp");
+
+    const views = manifest.contributes?.views?.vc6Impact ?? [];
+    expect(views.find((view) => view.id === "vc6Impact.explorer")?.when).toBe("vc6Impact.hasProject");
+
+    for (const menu of manifest.contributes?.menus?.["editor/context"] ?? []) {
+      expect(menu.when).toContain("vc6Impact.hasProject");
+      expect(menu.when).toContain("resourceLangId == c");
+      expect(menu.when).toContain("resourceLangId == cpp");
+      expect(menu.when).not.toContain("markdown");
+    }
+
+    for (const menu of manifest.contributes?.menus?.["view/title"] ?? []) {
+      expect(menu.when).toContain("vc6Impact.hasProject");
+    }
+  });
+
   it("exposes the production command surface with selectable parser engines", async () => {
     const manifestPath = path.resolve(__dirname, "..", "package.json");
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {

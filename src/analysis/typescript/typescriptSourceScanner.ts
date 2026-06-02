@@ -1,5 +1,6 @@
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature, type MacroAnalysisContext, type MemberAnalysisContext } from "../sourceScanner";
 import { mapWithConcurrency, normalizeConcurrency } from "../limitedConcurrency";
+import { applyConditionalCompilation } from "../preprocessor";
 import { readTextFile, type TextEncoding } from "../textEncoding";
 import type {
   FileAnalysis,
@@ -80,7 +81,8 @@ export async function analyzeFilesWithTypeScript(
   sourceEncoding: TextEncoding = "auto",
   backend: "typescript" | "clang" = "typescript",
   extraDiagnostics: ParserDiagnostic[] = [],
-  maxConcurrentFiles = defaultFileConcurrency()
+  maxConcurrentFiles = defaultFileConcurrency(),
+  macros: string[] = []
 ): Promise<TypeScriptAnalysisResult> {
   const started = Date.now();
   const fileConcurrency = normalizeConcurrency(maxConcurrentFiles, files.length);
@@ -98,7 +100,7 @@ export async function analyzeFilesWithTypeScript(
   const structures = await mapWithConcurrency(
     files,
     fileConcurrency,
-    (file) => scanFileStructure(file, sourceEncoding, backend)
+    (file) => scanFileStructure(file, sourceEncoding, backend, macros)
   );
   const structureScan = Date.now() - structureStarted;
   const contextStarted = Date.now();
@@ -129,12 +131,13 @@ function defaultFileConcurrency(): number {
 async function scanFileStructure(
   file: string,
   sourceEncoding: TextEncoding,
-  backend: "typescript" | "clang"
+  backend: "typescript" | "clang",
+  macros: string[]
 ): Promise<FileStructure> {
   const decoded = await readTextFile(file, sourceEncoding);
   const signature = await getFileSignature(file);
   const lines = decoded.text.split(/\r?\n/);
-  const maskedLines = maskLines(lines);
+  const maskedLines = applyConditionalCompilation(lines, maskLines(lines), macros);
   const unresolved: UnresolvedEvidence[] = [];
   if (decoded.lossy) {
     unresolved.push({

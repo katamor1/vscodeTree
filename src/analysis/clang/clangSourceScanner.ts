@@ -23,7 +23,7 @@ export async function analyzeFilesWithClang(
       severity: "warning",
       message: "clang executable was not found; using TypeScript extraction without clang diagnostics."
     });
-    return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles);
+    return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles, macros);
   }
 
   diagnostics.push({
@@ -44,7 +44,7 @@ export async function analyzeFilesWithClang(
       message: `clang diagnostics limited to first 200 files of ${files.length}; TypeScript extraction still processed all files.`
     });
   }
-  return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles);
+  return analyzeFilesWithTypeScript(files, sourceEncoding, "clang", diagnostics, maxConcurrentFiles, macros);
 }
 
 async function runClangSyntaxOnly(

@@ -9,6 +9,7 @@ import type { ParserEngine } from "../analysis/types";
 export interface ExtensionSettings {
   workspaceRoot: string;
   projectFile: string;
+  projectConfiguration: string;
   threadMapFile?: string;
   outputDir: string;
   indexPath: string;
@@ -17,6 +18,7 @@ export interface ExtensionSettings {
   maxIndexWorkers: number;
   maxNativeBatchFiles: number;
   maxRustAutoSkippedFiles: number;
+  rustSidecarTimeoutMs: number;
   parserEngine: ParserEngine;
   projectEncoding: TextEncoding;
   sourceEncoding: TextEncoding;
@@ -53,6 +55,7 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
   return {
     workspaceRoot,
     projectFile: detectedProjectFile,
+    projectConfiguration: config.get<string>("projectConfiguration")?.trim() || "Release",
     threadMapFile: threadMapSetting.trim() ? resolveMaybeRelative(workspaceRoot, threadMapSetting) : undefined,
     outputDir,
     indexPath,
@@ -61,8 +64,16 @@ export async function readSettings(context: vscode.ExtensionContext): Promise<Ex
     maxIndexWorkers: config.get<number>("maxIndexWorkers") ?? 0,
     maxNativeBatchFiles: config.get<number>("maxNativeBatchFiles") ?? 4,
     maxRustAutoSkippedFiles: config.get<number>("maxRustAutoSkippedFiles") ?? 16,
+    rustSidecarTimeoutMs: normalizeRustSidecarTimeoutSetting(config.get<number>("rustSidecarTimeoutMs")),
     parserEngine: normalizeParserEngine(config.get<string>("parserEngine"), "rust"),
     projectEncoding: normalizeTextEncoding(config.get<string>("projectEncoding"), "auto"),
     sourceEncoding: normalizeTextEncoding(config.get<string>("sourceEncoding"), "auto")
   };
+}
+
+function normalizeRustSidecarTimeoutSetting(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return -1;
+  }
+  return Math.max(-1, Math.floor(value ?? -1));
 }

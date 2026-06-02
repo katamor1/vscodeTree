@@ -3,23 +3,32 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   RustSidecarExecutionError,
+  resolveRustSidecarTimeoutMs,
   runRustAnalyzeManyToOutputWithAutoSkip,
   type RustAnalyzeManyRunner,
   type RustSidecarOutputFile
 } from "../src/analysis/rust/rustSourceScanner";
 
 describe("Rust native auto-skip fallback", () => {
+  it("resolves Rust sidecar timeout settings", () => {
+    expect(resolveRustSidecarTimeoutMs(undefined, 10)).toBe(30000);
+    expect(resolveRustSidecarTimeoutMs(-1, 200)).toBe(50000);
+    expect(resolveRustSidecarTimeoutMs(0, 200)).toBe(0);
+    expect(resolveRustSidecarTimeoutMs(1234.9, 200)).toBe(1234);
+  });
+
   it("reruns in safe mode, skips the file identified by the progress log, and continues", async () => {
     const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-autoskip-"));
     const goodA = path.join(tempRoot, "good-a.cpp").replace(/\\/g, "/");
     const bad = path.join(tempRoot, "bad.cpp").replace(/\\/g, "/");
     const goodB = path.join(tempRoot, "good-b.cpp").replace(/\\/g, "/");
-    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; progressLogPath?: string }> = [];
+    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; timeoutMs?: number; progressLogPath?: string }> = [];
     const runner: RustAnalyzeManyRunner = async (args) => {
       calls.push({
         files: args.files,
         maxIndexWorkers: args.maxIndexWorkers,
         maxNativeBatchFiles: args.maxNativeBatchFiles,
+        timeoutMs: args.timeoutMs,
         progressLogPath: args.progressLogPath
       });
       if (!args.progressLogPath) {
@@ -54,14 +63,15 @@ describe("Rust native auto-skip fallback", () => {
       maxIndexWorkers: 8,
       sourceEncoding: "auto",
       maxNativeBatchFiles: 4,
+      timeoutMs: 0,
       diagnosticsDir: path.join(tempRoot, "native-diagnostics"),
       maxSkippedFiles: 2,
       runner
     });
 
-    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4 });
-    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1 });
-    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1 });
+    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4, timeoutMs: 0 });
+    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0 });
+    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0 });
     expect(result.skippedFiles).toEqual([
       expect.objectContaining({
         file: bad,

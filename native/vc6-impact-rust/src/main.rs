@@ -219,6 +219,7 @@ struct AnalyzeOptions {
     batch_size: usize,
     legacy_in_memory: bool,
     encoding: SourceEncoding,
+    defined_macros: Vec<String>,
     progress_log: Option<String>,
 }
 
@@ -352,7 +353,7 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
     if args.len() == 3 && args[1] == "scan-file" {
         let file = normalize_path(&args[2]);
-        let structure = scan_file(&file, true, SourceEncoding::Auto)?;
+        let structure = scan_file(&file, true, SourceEncoding::Auto, &[])?;
         serde_json::to_writer(std::io::stdout().lock(), &structure)
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -361,7 +362,7 @@ fn main() -> Result<(), String> {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
         let files: Vec<String> =
             serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
-        let structures = scan_many(files, None, false, SourceEncoding::Auto)?;
+        let structures = scan_many(files, None, false, SourceEncoding::Auto, &[])?;
         serde_json::to_writer(std::io::stdout().lock(), &structures)
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -380,7 +381,7 @@ fn main() -> Result<(), String> {
         }
         return Ok(());
     }
-    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--progress-log <path>] [--encoding <auto|utf8|cp932>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
+    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--progress-log <path>] [--encoding <auto|utf8|cp932>] [--define <NAME[=VALUE]>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
 }
 
 fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
@@ -391,6 +392,7 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
         batch_size: 1,
         legacy_in_memory: false,
         encoding: SourceEncoding::Auto,
+        defined_macros: Vec::new(),
         progress_log: None,
     };
     let mut index = 0usize;
@@ -449,6 +451,14 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
                 );
                 index += 2;
             }
+            "--define" => {
+                options.defined_macros.push(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--define requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
             "--legacy-in-memory" => {
                 options.legacy_in_memory = true;
                 index += 1;
@@ -473,6 +483,7 @@ fn scan_many(
     requested_workers: Option<usize>,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    defined_macros: &[String],
 ) -> Result<Vec<FileStructure>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
@@ -486,12 +497,18 @@ fn scan_many(
         .into_iter()
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
+            let defined_macros = defined_macros.to_vec();
             thread::spawn(move || -> Result<Vec<(usize, FileStructure)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
                     results.push((
                         index,
-                        scan_file(&normalize_path(&file), tree_sitter_diagnostics, encoding)?,
+                        scan_file(
+                            &normalize_path(&file),
+                            tree_sitter_diagnostics,
+                            encoding,
+                            &defined_macros,
+                        )?,
                     ));
                 }
                 Ok(results)
@@ -518,6 +535,7 @@ fn scan_summary_batch_streaming(
     worker_count: usize,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    defined_macros: &[String],
     progress_logger: SharedProgressLogger,
 ) -> Result<Vec<FileSummary>, String> {
     if batch.is_empty() {
@@ -533,12 +551,18 @@ fn scan_summary_batch_streaming(
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
             let logger = progress_logger.clone();
+            let defined_macros = defined_macros.to_vec();
             thread::spawn(move || -> Result<Vec<(usize, FileSummary)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
                     let normalized = normalize_path(&file);
                     let summary = track_file_progress(&logger, "summary", &normalized, || {
-                        scan_file_summary(&normalized, tree_sitter_diagnostics, encoding)
+                        scan_file_summary(
+                            &normalized,
+                            tree_sitter_diagnostics,
+                            encoding,
+                            &defined_macros,
+                        )
                     })?;
                     results.push((index, summary));
                 }
@@ -573,6 +597,7 @@ fn build_native_context_from_summary_stream(
             worker_count,
             options.tree_sitter_diagnostics,
             options.encoding,
+            &options.defined_macros,
             progress_logger.clone(),
         )?;
         max_summary_batch_files = max_summary_batch_files.max(summaries.len());
@@ -777,6 +802,7 @@ fn analyze_many_legacy(
         Some(worker_count),
         options.tree_sitter_diagnostics,
         options.encoding,
+        &options.defined_macros,
     )?;
     metrics.insert(
         "readMaskDeclarationScan".to_string(),
@@ -919,7 +945,10 @@ fn analyze_many_low_memory_to_writer<W: Write>(
         "symbolMap".to_string(),
         symbol_started.elapsed().as_millis(),
     );
-    metrics.insert("contextGlobalCount".to_string(), context.global_names.len() as u128);
+    metrics.insert(
+        "contextGlobalCount".to_string(),
+        context.global_names.len() as u128,
+    );
     metrics.insert(
         "contextFunctionNameCount".to_string(),
         context.function_name_map.len() as u128,
@@ -952,8 +981,13 @@ fn analyze_many_low_memory_to_writer<W: Write>(
     let mut streamed_file_count = 0usize;
     let mut max_structure_batch_files = 0usize;
     for batch in files.chunks(batch_size) {
-        let analyses =
-            analyze_file_batch_streaming(batch, &context, &options, worker_count, progress_logger.clone())?;
+        let analyses = analyze_file_batch_streaming(
+            batch,
+            &context,
+            &options,
+            worker_count,
+            progress_logger.clone(),
+        )?;
         max_structure_batch_files = max_structure_batch_files.max(analyses.len());
         for analysis in analyses {
             if !first_file {
@@ -1014,6 +1048,7 @@ fn analyze_file_batch_streaming(
     }
     let tree_sitter_diagnostics = options.tree_sitter_diagnostics;
     let encoding = options.encoding;
+    let defined_macros = options.defined_macros.clone();
 
     thread::scope(|scope| -> Result<Vec<FileAnalysis>, String> {
         let handles: Vec<_> = chunks
@@ -1021,13 +1056,20 @@ fn analyze_file_batch_streaming(
             .filter(|chunk| !chunk.is_empty())
             .map(|chunk| {
                 let logger = progress_logger.clone();
+                let defined_macros = defined_macros.clone();
                 scope.spawn(move || -> Result<Vec<(usize, FileAnalysis)>, String> {
                     let mut results = Vec::with_capacity(chunk.len());
                     for (index, file) in chunk {
                         let normalized = normalize_path(&file);
-                        let structure = track_file_progress(&logger, "access", &normalized, || {
-                            scan_file(&normalized, tree_sitter_diagnostics, encoding)
-                        })?;
+                        let structure =
+                            track_file_progress(&logger, "access", &normalized, || {
+                                scan_file(
+                                    &normalized,
+                                    tree_sitter_diagnostics,
+                                    encoding,
+                                    &defined_macros,
+                                )
+                            })?;
                         results.push((index, analyze_file_structure_native(structure, context)));
                     }
                     Ok(results)
@@ -1256,11 +1298,13 @@ impl NativeContextBuilder {
         let mut global_types = HashMap::new();
         for candidate in self.global_type_candidates {
             if self.struct_types.contains_key(&candidate.type_name) {
-                global_types.entry(candidate.name.clone()).or_insert(GlobalTypeInfo {
-                    type_name: candidate.type_name,
-                    is_array: candidate.is_array,
-                    pointer_level: candidate.pointer_level,
-                });
+                global_types
+                    .entry(candidate.name.clone())
+                    .or_insert(GlobalTypeInfo {
+                        type_name: candidate.type_name,
+                        is_array: candidate.is_array,
+                        pointer_level: candidate.pointer_level,
+                    });
             }
         }
 
@@ -1302,7 +1346,12 @@ impl NativeContextBuilder {
         keys.sort();
         let usage = keys
             .into_iter()
-            .map(|key| format!("{key}={}", self.encoding_counts.get(key).copied().unwrap_or(0)))
+            .map(|key| {
+                format!(
+                    "{key}={}",
+                    self.encoding_counts.get(key).copied().unwrap_or(0)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let mut diagnostics = vec![ParserDiagnostic {
@@ -1441,7 +1490,10 @@ fn resolve_macro_alias_native(
         return None;
     }
     if !global_names.contains(replacement)
-        && replacement.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && replacement
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
     {
         return None;
     }
@@ -2260,11 +2312,7 @@ fn resolve_member_expression(
         let target_name =
             canonical_member_name(&owner_name, &expression.connectors, &expression.member_path);
         let type_info = context.struct_types.get(&global_type.type_name)?;
-        if !member_path_exists(
-            type_info,
-            &expression.member_path,
-            &context.struct_types,
-        ) {
+        if !member_path_exists(type_info, &expression.member_path, &context.struct_types) {
             return Some(ResolvedMemberExpression {
                 access_target_name: None,
                 owner_name: Some(owner_name),
@@ -2741,24 +2789,30 @@ fn scan_file(
     file: &str,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    defined_macros: &[String],
 ) -> Result<FileStructure, String> {
-    Ok(scan_file_with_decode(file, tree_sitter_diagnostics, encoding)?.0)
+    Ok(scan_file_with_decode(file, tree_sitter_diagnostics, encoding, defined_macros)?.0)
 }
 
 fn scan_file_summary(
     file: &str,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    defined_macros: &[String],
 ) -> Result<FileSummary, String> {
     let decoded = read_source_text(file, encoding)?;
     let text = decoded.text;
     let signature = file_signature(file)?;
-    let masked_lines = mask_lines(&text);
     let raw_lines: Vec<&str> = text.lines().collect();
+    let masked_lines = apply_conditional_compilation(&raw_lines, mask_lines(&text), defined_macros);
     let mut unresolved = Vec::new();
 
     if tree_sitter_diagnostics {
-        append_tree_sitter_diagnostic(file, &text, &mut unresolved)?;
+        append_tree_sitter_diagnostic(
+            file,
+            &conditional_text(&raw_lines, &masked_lines),
+            &mut unresolved,
+        )?;
     }
 
     let macro_definitions = parse_macros(file, &raw_lines, &masked_lines, &mut unresolved);
@@ -2787,16 +2841,21 @@ fn scan_file_with_decode(
     file: &str,
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
+    defined_macros: &[String],
 ) -> Result<(FileStructure, DecodeInfo), String> {
     let decoded = read_source_text(file, encoding)?;
     let text = decoded.text;
     let signature = file_signature(file)?;
-    let masked_lines = mask_lines(&text);
     let raw_lines: Vec<&str> = text.lines().collect();
+    let masked_lines = apply_conditional_compilation(&raw_lines, mask_lines(&text), defined_macros);
     let mut unresolved = Vec::new();
 
     if tree_sitter_diagnostics {
-        append_tree_sitter_diagnostic(file, &text, &mut unresolved)?;
+        append_tree_sitter_diagnostic(
+            file,
+            &conditional_text(&raw_lines, &masked_lines),
+            &mut unresolved,
+        )?;
     }
 
     let macro_definitions = parse_macros(file, &raw_lines, &masked_lines, &mut unresolved);
@@ -3597,11 +3656,502 @@ fn is_keyword(value: &str) -> bool {
     .contains(&value)
 }
 
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn mask_lines(text: &str) -> Vec<String> {
     let mut in_block = false;
     text.lines()
         .map(|line| mask_comments_and_strings(line, &mut in_block))
         .collect()
+}
+
+fn apply_conditional_compilation(
+    raw_lines: &[&str],
+    masked_lines: Vec<String>,
+    initial_macros: &[String],
+) -> Vec<String> {
+    let mut macros = macro_map_from_definitions(initial_macros);
+    let mut frames: Vec<ConditionalFrame> = Vec::new();
+    masked_lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let current_active = conditional_stack_active(&frames);
+            let Some(directive) = parse_preprocessor_directive(&line) else {
+                return if current_active {
+                    line
+                } else {
+                    blank_like(&line)
+                };
+            };
+
+            match directive.name.as_str() {
+                "if" | "ifdef" | "ifndef" => {
+                    let parent_active = current_active;
+                    let condition = match directive.name.as_str() {
+                        "ifdef" => first_identifier(&directive.args)
+                            .is_some_and(|name| macros.contains_key(&name)),
+                        "ifndef" => match first_identifier(&directive.args) {
+                            Some(name) => !macros.contains_key(&name),
+                            None => true,
+                        },
+                        _ => evaluate_preprocessor_expression(&directive.args, &macros),
+                    };
+                    frames.push(ConditionalFrame {
+                        parent_active,
+                        branch_active: parent_active && condition,
+                        branch_taken: parent_active && condition,
+                    });
+                    if parent_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                "elif" => {
+                    if let Some(frame) = frames.last_mut() {
+                        let condition = evaluate_preprocessor_expression(&directive.args, &macros);
+                        frame.branch_active =
+                            frame.parent_active && !frame.branch_taken && condition;
+                        frame.branch_taken = frame.branch_taken || frame.branch_active;
+                        if frame.parent_active {
+                            line
+                        } else {
+                            blank_like(&line)
+                        }
+                    } else if current_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                "else" => {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.branch_active = frame.parent_active && !frame.branch_taken;
+                        frame.branch_taken = true;
+                        if frame.parent_active {
+                            line
+                        } else {
+                            blank_like(&line)
+                        }
+                    } else if current_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                "endif" => {
+                    let parent_active = frames
+                        .last()
+                        .map(|frame| frame.parent_active)
+                        .unwrap_or(current_active);
+                    frames.pop();
+                    if parent_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                "define" => {
+                    if current_active {
+                        if let Some(captures) = DEFINE_RE.captures(&line) {
+                            let name = captures.get(1).unwrap().as_str().to_string();
+                            let value = captures
+                                .get(3)
+                                .map(|value| value.as_str().trim().to_string())
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or_else(|| "1".to_string());
+                            macros.insert(name, value);
+                        }
+                    }
+                    if current_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                "undef" => {
+                    if current_active {
+                        if let Some(name) = first_identifier(&directive.args) {
+                            macros.remove(&name);
+                        }
+                    }
+                    if current_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    }
+                }
+                _ => {
+                    let raw = raw_lines.get(index).copied().unwrap_or_default();
+                    if current_active {
+                        line
+                    } else {
+                        " ".repeat(raw.chars().count())
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn conditional_text(raw_lines: &[&str], masked_lines: &[String]) -> String {
+    raw_lines
+        .iter()
+        .zip(masked_lines.iter())
+        .map(|(raw, masked)| {
+            if raw.trim().is_empty() || !masked.trim().is_empty() {
+                (*raw).to_string()
+            } else {
+                " ".repeat(raw.chars().count())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Clone)]
+struct ConditionalFrame {
+    parent_active: bool,
+    branch_active: bool,
+    branch_taken: bool,
+}
+
+struct PreprocessorDirective {
+    name: String,
+    args: String,
+}
+
+fn conditional_stack_active(frames: &[ConditionalFrame]) -> bool {
+    frames.iter().all(|frame| frame.branch_active)
+}
+
+fn parse_preprocessor_directive(line: &str) -> Option<PreprocessorDirective> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .collect();
+    match name.as_str() {
+        "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif" | "define" | "undef" => {
+            Some(PreprocessorDirective {
+                args: rest[name.len()..].trim().to_string(),
+                name,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn macro_map_from_definitions(definitions: &[String]) -> HashMap<String, String> {
+    let mut macros = HashMap::new();
+    for definition in definitions {
+        if let Some((name, value)) = normalize_macro_definition(definition) {
+            macros.insert(name, value);
+        }
+    }
+    macros
+}
+
+fn normalize_macro_definition(definition: &str) -> Option<(String, String)> {
+    let trimmed = definition
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, '=');
+    let name = parts.next()?.trim();
+    if !is_identifier(name) {
+        return None;
+    }
+    let value = parts
+        .next()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1".to_string());
+    Some((name.to_string(), value))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PreprocessorToken {
+    Identifier(String),
+    Number(i64),
+    Operator(&'static str),
+}
+
+fn evaluate_preprocessor_expression(expression: &str, macros: &HashMap<String, String>) -> bool {
+    let tokens = tokenize_preprocessor_expression(expression);
+    let mut parser = PreprocessorExpressionParser {
+        tokens: &tokens,
+        macros,
+        index: 0,
+    };
+    parser.parse() != 0
+}
+
+fn tokenize_preprocessor_expression(expression: &str) -> Vec<PreprocessorToken> {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        let two = if index + 1 < chars.len() {
+            Some((ch, chars[index + 1]))
+        } else {
+            None
+        };
+        if matches!(two, Some(('&', '&'))) {
+            tokens.push(PreprocessorToken::Operator("&&"));
+            index += 2;
+            continue;
+        }
+        if matches!(two, Some(('|', '|'))) {
+            tokens.push(PreprocessorToken::Operator("||"));
+            index += 2;
+            continue;
+        }
+        if matches!(two, Some(('=', '='))) {
+            tokens.push(PreprocessorToken::Operator("=="));
+            index += 2;
+            continue;
+        }
+        if matches!(two, Some(('!', '='))) {
+            tokens.push(PreprocessorToken::Operator("!="));
+            index += 2;
+            continue;
+        }
+        if ch == '!' {
+            tokens.push(PreprocessorToken::Operator("!"));
+            index += 1;
+            continue;
+        }
+        if ch == '(' {
+            tokens.push(PreprocessorToken::Operator("("));
+            index += 1;
+            continue;
+        }
+        if ch == ')' {
+            tokens.push(PreprocessorToken::Operator(")"));
+            index += 1;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let start = index;
+            if ch == '0'
+                && index + 1 < chars.len()
+                && (chars[index + 1] == 'x' || chars[index + 1] == 'X')
+            {
+                index += 2;
+                while index < chars.len() && chars[index].is_ascii_hexdigit() {
+                    index += 1;
+                }
+            } else {
+                index += 1;
+                while index < chars.len() && chars[index].is_ascii_digit() {
+                    index += 1;
+                }
+            }
+            let value: String = chars[start..index].iter().collect();
+            tokens.push(PreprocessorToken::Number(parse_preprocessor_integer(
+                &value,
+            )));
+            continue;
+        }
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let start = index;
+            index += 1;
+            while index < chars.len()
+                && (chars[index] == '_' || chars[index].is_ascii_alphanumeric())
+            {
+                index += 1;
+            }
+            tokens.push(PreprocessorToken::Identifier(
+                chars[start..index].iter().collect(),
+            ));
+            continue;
+        }
+        index += 1;
+    }
+    tokens
+}
+
+struct PreprocessorExpressionParser<'a> {
+    tokens: &'a [PreprocessorToken],
+    macros: &'a HashMap<String, String>,
+    index: usize,
+}
+
+impl PreprocessorExpressionParser<'_> {
+    fn parse(&mut self) -> i64 {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> i64 {
+        let mut value = self.parse_and();
+        while self.consume_operator("||") {
+            let right = self.parse_and();
+            value = if value != 0 || right != 0 { 1 } else { 0 };
+        }
+        value
+    }
+
+    fn parse_and(&mut self) -> i64 {
+        let mut value = self.parse_equality();
+        while self.consume_operator("&&") {
+            let right = self.parse_equality();
+            value = if value != 0 && right != 0 { 1 } else { 0 };
+        }
+        value
+    }
+
+    fn parse_equality(&mut self) -> i64 {
+        let mut value = self.parse_unary();
+        loop {
+            if self.consume_operator("==") {
+                value = if value == self.parse_unary() { 1 } else { 0 };
+                continue;
+            }
+            if self.consume_operator("!=") {
+                value = if value != self.parse_unary() { 1 } else { 0 };
+                continue;
+            }
+            return value;
+        }
+    }
+
+    fn parse_unary(&mut self) -> i64 {
+        if self.consume_operator("!") {
+            return if self.parse_unary() == 0 { 1 } else { 0 };
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> i64 {
+        let Some(token) = self.tokens.get(self.index) else {
+            return 0;
+        };
+        match token {
+            PreprocessorToken::Number(value) => {
+                self.index += 1;
+                *value
+            }
+            PreprocessorToken::Identifier(value) if value == "defined" => {
+                self.index += 1;
+                let parenthesized = self.consume_operator("(");
+                let name = self.consume_identifier();
+                if parenthesized {
+                    self.consume_operator(")");
+                }
+                if name.is_some_and(|name| self.macros.contains_key(&name)) {
+                    1
+                } else {
+                    0
+                }
+            }
+            PreprocessorToken::Identifier(value) => {
+                self.index += 1;
+                macro_numeric_value(value, self.macros)
+            }
+            PreprocessorToken::Operator("(") => {
+                self.index += 1;
+                let value = self.parse_or();
+                self.consume_operator(")");
+                value
+            }
+            _ => {
+                self.index += 1;
+                0
+            }
+        }
+    }
+
+    fn consume_identifier(&mut self) -> Option<String> {
+        match self.tokens.get(self.index) {
+            Some(PreprocessorToken::Identifier(value)) => {
+                self.index += 1;
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_operator(&mut self, expected: &str) -> bool {
+        match self.tokens.get(self.index) {
+            Some(PreprocessorToken::Operator(value)) if *value == expected => {
+                self.index += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn macro_numeric_value(name: &str, macros: &HashMap<String, String>) -> i64 {
+    let Some(value) = macros.get(name) else {
+        return 0;
+    };
+    parse_preprocessor_integer(value)
+}
+
+fn parse_preprocessor_integer(value: &str) -> i64 {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(
+            &hex.chars()
+                .take_while(|ch| ch.is_ascii_hexdigit())
+                .collect::<String>(),
+            16,
+        )
+        .unwrap_or(1);
+    }
+    let numeric: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect();
+    if numeric.is_empty() || numeric == "-" {
+        1
+    } else {
+        numeric.parse::<i64>().unwrap_or(1)
+    }
+}
+
+fn first_identifier(value: &str) -> Option<String> {
+    let mut start = None;
+    for (index, ch) in value.char_indices() {
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            start = Some(index);
+            break;
+        }
+    }
+    let start = start?;
+    let rest = &value[start..];
+    let end = rest
+        .char_indices()
+        .find(|(_, ch)| !(*ch == '_' || ch.is_ascii_alphanumeric()))
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn blank_like(line: &str) -> String {
+    " ".repeat(line.chars().count())
 }
 
 fn mask_comments_and_strings(line: &str, in_block: &mut bool) -> String {
@@ -3800,6 +4350,10 @@ mod tests {
             "7".to_string(),
             "--encoding".to_string(),
             "cp932".to_string(),
+            "--define".to_string(),
+            "TEST_CODE1".to_string(),
+            "--define".to_string(),
+            "LEVEL=2".to_string(),
             "--legacy-in-memory".to_string(),
         ];
 
@@ -3809,7 +4363,63 @@ mod tests {
         assert_eq!(options.output.as_deref(), Some("out.json"));
         assert_eq!(options.batch_size, 7);
         assert_eq!(options.encoding, SourceEncoding::Cp932);
+        assert_eq!(options.defined_macros, vec!["TEST_CODE1", "LEVEL=2"]);
         assert!(options.legacy_in_memory);
+    }
+
+    #[test]
+    fn conditional_compilation_uses_defined_macros() {
+        let source = [
+            "int g_release;",
+            "int g_test;",
+            "#if defined(TEST_CODE1)",
+            "void TestOnly(void) { g_test++; }",
+            "#ifndef TEST_CODE2",
+            "#if 1",
+            "void NestedTestOnly(void) { g_test++; }",
+            "#endif",
+            "#else",
+            "void HeaderDefinedTestOnly(void) { g_test++; }",
+            "#endif",
+            "#ifdef TEST_CODE3",
+            "void UnitTestOnly(void) { g_test++; }",
+            "#endif",
+            "#else",
+            "void ReleaseOnly(void) { g_release++; }",
+            "#endif",
+        ]
+        .join("\n");
+        let file = write_temp_source("conditional_release.cpp", &source);
+
+        let release = analyze_many_legacy(vec![file.clone()], test_options(256, true))
+            .expect("release analysis");
+        let release_functions: HashSet<_> = release.files[0]
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert!(release_functions.contains("ReleaseOnly"));
+        assert!(!release_functions.contains("TestOnly"));
+        assert!(!release_functions.contains("NestedTestOnly"));
+        assert!(!release_functions.contains("UnitTestOnly"));
+
+        let test = analyze_many_legacy(
+            vec![file],
+            AnalyzeOptions {
+                defined_macros: vec!["TEST_CODE1".to_string(), "TEST_CODE3".to_string()],
+                ..test_options(256, true)
+            },
+        )
+        .expect("test analysis");
+        let test_functions: HashSet<_> = test.files[0]
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert!(test_functions.contains("TestOnly"));
+        assert!(test_functions.contains("NestedTestOnly"));
+        assert!(test_functions.contains("UnitTestOnly"));
+        assert!(!test_functions.contains("ReleaseOnly"));
     }
 
     #[test]
@@ -3827,6 +4437,7 @@ mod tests {
                 batch_size: 256,
                 legacy_in_memory: true,
                 encoding: SourceEncoding::Auto,
+                defined_macros: Vec::new(),
                 progress_log: None,
             },
         )
@@ -3958,7 +4569,7 @@ mod tests {
         .join("\n");
         let file = write_temp_source("summary_ranges.cpp", &source);
 
-        let summary = scan_file_summary(&file, false, SourceEncoding::Auto)
+        let summary = scan_file_summary(&file, false, SourceEncoding::Auto, &[])
             .expect("summary scan should pass");
         let touch = summary
             .functions
@@ -4021,6 +4632,7 @@ mod tests {
             batch_size,
             legacy_in_memory,
             encoding: SourceEncoding::Auto,
+            defined_macros: Vec::new(),
             progress_log: None,
         }
     }

@@ -1,7 +1,7 @@
 {
   "name": "vc6-impact-review",
-  "displayName": "VC6 Impact Review",
-  "description": "Visualize global-variable and function impact in large VC6 C/C++ projects without writing to the target source tree.",
+  "displayName": "VC6 影響レビュー",
+  "description": "大規模な VC6 C/C++ プロジェクトで、対象ソースツリーを書き換えずにグローバル変数と関数の影響範囲を可視化する拡張機能です。",
   "version": "0.2.1",
   "publisher": "local",
   "license": "UNLICENSED",
@@ -17,6 +17,8 @@
   ],
   "activationEvents": [
     "onStartupFinished",
+    "workspaceContains:**/*.dsw",
+    "workspaceContains:**/*.dsp",
     "onCommand:vc6Impact.buildFullIndex",
     "onCommand:vc6Impact.updateIndex",
     "onCommand:vc6Impact.inspectSelectedSymbol",
@@ -34,22 +36,27 @@
   ],
   "contributes": {
     "configuration": {
-      "title": "VC6 Impact Review",
+      "title": "VC6 影響レビュー",
       "properties": {
         "vc6Impact.projectFile": {
           "type": "string",
           "default": "",
-          "description": "Absolute or workspace-relative path to the VC6 .dsw or .dsp file. Empty means auto-detect the first .dsw, then .dsp."
+          "description": "VC6 の .dsw または .dsp ファイルへの絶対パス、またはワークスペース相対パス。空の場合は最初の .dsw、次に .dsp を自動検出します。"
+        },
+        "vc6Impact.projectConfiguration": {
+          "type": "string",
+          "default": "Release",
+          "description": ".dsp の CFG ブロックから解析する VC6 構成。Release や Debug などの部分一致も指定できます。既定ではリリースビルド側を追跡します。"
         },
         "vc6Impact.threadMapFile": {
           "type": "string",
           "default": "",
-          "description": "Absolute or workspace-relative JSON/YAML file that maps thread IDs to entry functions."
+          "description": "スレッド ID と入口関数の対応を定義する JSON/YAML ファイルへの絶対パス、またはワークスペース相対パス。"
         },
         "vc6Impact.outputDir": {
           "type": "string",
           "default": "",
-          "description": "Directory for index and reports. Empty uses <workspace>/.vscode/vc6-impact-review and adds it to .git/info/exclude when possible."
+          "description": "インデックスとレポートの出力先ディレクトリ。空の場合は <workspace>/.vscode/vc6-impact-review を使い、可能なら .git/info/exclude に追加します。"
         },
         "vc6Impact.excludeGlobs": {
           "type": "array",
@@ -62,35 +69,41 @@
             "**/node_modules/**",
             "**/.git/**"
           ],
-          "description": "Glob-like path fragments to exclude while scanning source files."
+          "description": "ソースファイル走査時に除外する glob 風のパス断片。"
         },
         "vc6Impact.maxGraphDepth": {
           "type": "number",
           "default": 4,
           "minimum": 1,
           "maximum": 20,
-          "description": "Maximum call graph depth shown in graph/report views."
+          "description": "グラフビューとレポートビューに表示する呼び出しグラフの最大深さ。"
         },
         "vc6Impact.maxIndexWorkers": {
           "type": "number",
           "default": 0,
           "minimum": 0,
           "maximum": 64,
-          "description": "Maximum worker threads used while building indexes. 0 means auto (CPU count - 1)."
+          "description": "インデックス作成時に使用するワーカースレッド数の最大値。0 は自動設定 (CPU 数 - 1) を意味します。"
         },
         "vc6Impact.maxNativeBatchFiles": {
           "type": "number",
           "default": 4,
           "minimum": 1,
           "maximum": 64,
-          "description": "Maximum source files retained at once during Rust native access analysis. Lower this to 1 for the smallest memory footprint."
+          "description": "Rust ネイティブのアクセス解析で同時に保持するソースファイル数の最大値。メモリ使用量を最小化する場合は 1 に下げます。"
         },
         "vc6Impact.maxRustAutoSkippedFiles": {
           "type": "number",
           "default": 16,
           "minimum": 0,
           "maximum": 1000,
-          "description": "Maximum source files the Rust memory fallback may skip during one index build. Skipped files are recorded in diagnostics; 0 disables auto-skip."
+          "description": "1 回のインデックス作成で Rust メモリフォールバックがスキップできるソースファイル数の最大値。スキップしたファイルは診断に記録されます。0 は自動スキップを無効化します。"
+        },
+        "vc6Impact.rustSidecarTimeoutMs": {
+          "type": "number",
+          "default": -1,
+          "minimum": -1,
+          "description": "Rust サイドカーの analyze-many プロセスのタイムアウト時間 (ミリ秒)。-1 は自動タイムアウトを維持し、0 はタイムアウトを無効化し、正の値は固定タイムアウトとして使います。"
         },
         "vc6Impact.parserEngine": {
           "type": "string",
@@ -100,12 +113,12 @@
             "clang"
           ],
           "default": "rust",
-          "description": "Parser engine used for index generation. rust is the production default; typescript and clang are fallback engines for troubleshooting."
+          "description": "インデックス生成に使用するパーサーエンジン。rust が本番向けの既定値で、typescript と clang はトラブルシューティング用のフォールバックです。"
         },
         "vc6Impact.indexDbPath": {
           "type": "string",
           "default": "",
-          "description": "Optional explicit path to the JSON index DB. Empty stores vc6-impact-index.json under outputDir."
+          "description": "JSON インデックス DB の明示パス。空の場合は outputDir 配下に vc6-impact-index.json を保存します。"
         },
         "vc6Impact.projectEncoding": {
           "type": "string",
@@ -115,7 +128,7 @@
             "cp932"
           ],
           "default": "auto",
-          "description": "Encoding for VC6 .dsw/.dsp project files. auto tries UTF-8 BOM, UTF-8, then CP932."
+          "description": "VC6 .dsw/.dsp プロジェクトファイルの文字コード。auto は UTF-8 BOM、UTF-8、CP932 の順に試します。"
         },
         "vc6Impact.sourceEncoding": {
           "type": "string",
@@ -125,43 +138,43 @@
             "cp932"
           ],
           "default": "auto",
-          "description": "Encoding for C/C++ source files scanned by the selected parser engine. auto tries UTF-8 BOM, UTF-8, then CP932."
+          "description": "選択したパーサーエンジンが走査する C/C++ ソースファイルの文字コード。auto は UTF-8 BOM、UTF-8、CP932 の順に試します。"
         }
       }
     },
     "commands": [
       {
         "command": "vc6Impact.buildFullIndex",
-        "title": "Build Full Index",
-        "shortTitle": "Build",
+        "title": "フルインデックスを作成",
+        "shortTitle": "作成",
         "category": "VC6 Impact",
         "icon": "$(database)"
       },
       {
         "command": "vc6Impact.updateIndex",
-        "title": "Update Index",
-        "shortTitle": "Update",
+        "title": "インデックスを更新",
+        "shortTitle": "更新",
         "category": "VC6 Impact",
         "icon": "$(refresh)"
       },
       {
         "command": "vc6Impact.inspectSelectedSymbol",
-        "title": "Inspect Selected Symbol",
-        "shortTitle": "Inspect",
+        "title": "選択シンボルを調査",
+        "shortTitle": "調査",
         "category": "VC6 Impact",
         "icon": "$(search)"
       },
       {
         "command": "vc6Impact.generateReviewReport",
-        "title": "Generate Review Report",
-        "shortTitle": "Report",
+        "title": "レビューレポートを生成",
+        "shortTitle": "レポート",
         "category": "VC6 Impact",
         "icon": "$(file-text)"
       },
       {
         "command": "vc6Impact.openGraph",
-        "title": "Open Graph",
-        "shortTitle": "Graph",
+        "title": "グラフを開く",
+        "shortTitle": "グラフ",
         "category": "VC6 Impact",
         "icon": "$(graph)"
       }
@@ -170,22 +183,24 @@
       "editor/context": [
         {
           "command": "vc6Impact.inspectSelectedSymbol",
+          "when": "vc6Impact.hasProject && (resourceLangId == c || resourceLangId == cpp || resourceExtname == .c || resourceExtname == .h || resourceExtname == .cpp || resourceExtname == .cxx || resourceExtname == .cc || resourceExtname == .hpp || resourceExtname == .hh || resourceExtname == .hxx)",
           "group": "navigation@50"
         },
         {
           "command": "vc6Impact.generateReviewReport",
+          "when": "vc6Impact.hasProject && (resourceLangId == c || resourceLangId == cpp || resourceExtname == .c || resourceExtname == .h || resourceExtname == .cpp || resourceExtname == .cxx || resourceExtname == .cc || resourceExtname == .hpp || resourceExtname == .hh || resourceExtname == .hxx)",
           "group": "navigation@51"
         }
       ],
       "view/title": [
         {
           "command": "vc6Impact.buildFullIndex",
-          "when": "view == vc6Impact.explorer",
+          "when": "view == vc6Impact.explorer && vc6Impact.hasProject",
           "group": "navigation@1"
         },
         {
           "command": "vc6Impact.updateIndex",
-          "when": "view == vc6Impact.explorer",
+          "when": "view == vc6Impact.explorer && vc6Impact.hasProject",
           "group": "navigation@2"
         }
       ]
@@ -194,7 +209,7 @@
       "activitybar": [
         {
           "id": "vc6Impact",
-          "title": "VC6 Impact",
+          "title": "VC6 影響",
           "icon": "resources/activitybar.svg"
         }
       ]
@@ -203,7 +218,8 @@
       "vc6Impact": [
         {
           "id": "vc6Impact.explorer",
-          "name": "Impact Review"
+          "name": "影響レビュー",
+          "when": "vc6Impact.hasProject"
         }
       ]
     }
