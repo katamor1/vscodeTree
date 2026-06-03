@@ -336,7 +336,8 @@ async function buildRustIndexToStorage(args: {
     timeoutMs: args.options.rustSidecarTimeoutMs,
     diagnosticsDir: nativeDiagnosticsDir(args.options, args.indexPath),
     maxSkippedFiles: args.options.maxRustAutoSkippedFiles,
-    macros: args.project.macros
+    macros: args.project.macros,
+    includePaths: args.project.includePaths
   });
   args.phaseDurationsMs.structureScan = elapsedSince(phaseStarted);
   const functionWriter = await createIndexFunctionWriter(args.indexPath);

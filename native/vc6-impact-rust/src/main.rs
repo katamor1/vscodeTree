@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -220,6 +220,7 @@ struct AnalyzeOptions {
     legacy_in_memory: bool,
     encoding: SourceEncoding,
     defined_macros: Vec<String>,
+    include_paths: Vec<String>,
     progress_log: Option<String>,
 }
 
@@ -353,7 +354,7 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
     if args.len() == 3 && args[1] == "scan-file" {
         let file = normalize_path(&args[2]);
-        let structure = scan_file(&file, true, SourceEncoding::Auto, &[])?;
+        let structure = scan_file(&file, true, SourceEncoding::Auto, &[], &[])?;
         serde_json::to_writer(std::io::stdout().lock(), &structure)
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -362,7 +363,7 @@ fn main() -> Result<(), String> {
         let list_text = fs::read_to_string(&args[2]).map_err(|error| error.to_string())?;
         let files: Vec<String> =
             serde_json::from_str(&list_text).map_err(|error| error.to_string())?;
-        let structures = scan_many(files, None, false, SourceEncoding::Auto, &[])?;
+        let structures = scan_many(files, None, false, SourceEncoding::Auto, &[], &[])?;
         serde_json::to_writer(std::io::stdout().lock(), &structures)
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -381,7 +382,7 @@ fn main() -> Result<(), String> {
         }
         return Ok(());
     }
-    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--progress-log <path>] [--encoding <auto|utf8|cp932>] [--define <NAME[=VALUE]>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
+    Err("Usage: vc6-impact-rust scan-file <path> | scan-many <file-list-json> | analyze-many <file-list-json> --workers <n|auto> [--output <path>] [--batch-size <n>] [--progress-log <path>] [--encoding <auto|utf8|cp932>] [--define <NAME[=VALUE]>] [--include <path>] [--legacy-in-memory] [--tree-sitter-diagnostics]".to_string())
 }
 
 fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
@@ -393,6 +394,7 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
         legacy_in_memory: false,
         encoding: SourceEncoding::Auto,
         defined_macros: Vec::new(),
+        include_paths: Vec::new(),
         progress_log: None,
     };
     let mut index = 0usize;
@@ -459,6 +461,13 @@ fn parse_analyze_options(args: &[String]) -> Result<AnalyzeOptions, String> {
                 );
                 index += 2;
             }
+            "--include" | "--include-path" => {
+                options.include_paths.push(normalize_path(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--include requires a value".to_string())?,
+                ));
+                index += 2;
+            }
             "--legacy-in-memory" => {
                 options.legacy_in_memory = true;
                 index += 1;
@@ -484,6 +493,7 @@ fn scan_many(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
     defined_macros: &[String],
+    include_paths: &[String],
 ) -> Result<Vec<FileStructure>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
@@ -498,6 +508,7 @@ fn scan_many(
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
             let defined_macros = defined_macros.to_vec();
+            let include_paths = include_paths.to_vec();
             thread::spawn(move || -> Result<Vec<(usize, FileStructure)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
@@ -508,6 +519,7 @@ fn scan_many(
                             tree_sitter_diagnostics,
                             encoding,
                             &defined_macros,
+                            &include_paths,
                         )?,
                     ));
                 }
@@ -536,6 +548,7 @@ fn scan_summary_batch_streaming(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
     defined_macros: &[String],
+    include_paths: &[String],
     progress_logger: SharedProgressLogger,
 ) -> Result<Vec<FileSummary>, String> {
     if batch.is_empty() {
@@ -552,6 +565,7 @@ fn scan_summary_batch_streaming(
         .map(|chunk| {
             let logger = progress_logger.clone();
             let defined_macros = defined_macros.to_vec();
+            let include_paths = include_paths.to_vec();
             thread::spawn(move || -> Result<Vec<(usize, FileSummary)>, String> {
                 let mut results = Vec::with_capacity(chunk.len());
                 for (index, file) in chunk {
@@ -562,6 +576,7 @@ fn scan_summary_batch_streaming(
                             tree_sitter_diagnostics,
                             encoding,
                             &defined_macros,
+                            &include_paths,
                         )
                     })?;
                     results.push((index, summary));
@@ -598,6 +613,7 @@ fn build_native_context_from_summary_stream(
             options.tree_sitter_diagnostics,
             options.encoding,
             &options.defined_macros,
+            &options.include_paths,
             progress_logger.clone(),
         )?;
         max_summary_batch_files = max_summary_batch_files.max(summaries.len());
@@ -803,6 +819,7 @@ fn analyze_many_legacy(
         options.tree_sitter_diagnostics,
         options.encoding,
         &options.defined_macros,
+        &options.include_paths,
     )?;
     metrics.insert(
         "readMaskDeclarationScan".to_string(),
@@ -1049,6 +1066,7 @@ fn analyze_file_batch_streaming(
     let tree_sitter_diagnostics = options.tree_sitter_diagnostics;
     let encoding = options.encoding;
     let defined_macros = options.defined_macros.clone();
+    let include_paths = options.include_paths.clone();
 
     thread::scope(|scope| -> Result<Vec<FileAnalysis>, String> {
         let handles: Vec<_> = chunks
@@ -1057,6 +1075,7 @@ fn analyze_file_batch_streaming(
             .map(|chunk| {
                 let logger = progress_logger.clone();
                 let defined_macros = defined_macros.clone();
+                let include_paths = include_paths.clone();
                 scope.spawn(move || -> Result<Vec<(usize, FileAnalysis)>, String> {
                     let mut results = Vec::with_capacity(chunk.len());
                     for (index, file) in chunk {
@@ -1068,6 +1087,7 @@ fn analyze_file_batch_streaming(
                                     tree_sitter_diagnostics,
                                     encoding,
                                     &defined_macros,
+                                    &include_paths,
                                 )
                             })?;
                         results.push((index, analyze_file_structure_native(structure, context)));
@@ -2790,8 +2810,18 @@ fn scan_file(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
     defined_macros: &[String],
+    include_paths: &[String],
 ) -> Result<FileStructure, String> {
-    Ok(scan_file_with_decode(file, tree_sitter_diagnostics, encoding, defined_macros)?.0)
+    Ok(
+        scan_file_with_decode(
+            file,
+            tree_sitter_diagnostics,
+            encoding,
+            defined_macros,
+            include_paths,
+        )?
+        .0,
+    )
 }
 
 fn scan_file_summary(
@@ -2799,12 +2829,20 @@ fn scan_file_summary(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
     defined_macros: &[String],
+    include_paths: &[String],
 ) -> Result<FileSummary, String> {
     let decoded = read_source_text(file, encoding)?;
     let text = decoded.text;
     let signature = file_signature(file)?;
     let raw_lines: Vec<&str> = text.lines().collect();
-    let masked_lines = apply_conditional_compilation(&raw_lines, mask_lines(&text), defined_macros);
+    let masked_lines = apply_conditional_compilation(
+        file,
+        &raw_lines,
+        mask_lines(&text),
+        defined_macros,
+        include_paths,
+        encoding,
+    );
     let mut unresolved = Vec::new();
 
     if tree_sitter_diagnostics {
@@ -2842,12 +2880,20 @@ fn scan_file_with_decode(
     tree_sitter_diagnostics: bool,
     encoding: SourceEncoding,
     defined_macros: &[String],
+    include_paths: &[String],
 ) -> Result<(FileStructure, DecodeInfo), String> {
     let decoded = read_source_text(file, encoding)?;
     let text = decoded.text;
     let signature = file_signature(file)?;
     let raw_lines: Vec<&str> = text.lines().collect();
-    let masked_lines = apply_conditional_compilation(&raw_lines, mask_lines(&text), defined_macros);
+    let masked_lines = apply_conditional_compilation(
+        file,
+        &raw_lines,
+        mask_lines(&text),
+        defined_macros,
+        include_paths,
+        encoding,
+    );
     let mut unresolved = Vec::new();
 
     if tree_sitter_diagnostics {
@@ -3673,133 +3719,287 @@ fn mask_lines(text: &str) -> Vec<String> {
 }
 
 fn apply_conditional_compilation(
+    file: &str,
     raw_lines: &[&str],
     masked_lines: Vec<String>,
     initial_macros: &[String],
+    include_paths: &[String],
+    encoding: SourceEncoding,
 ) -> Vec<String> {
     let mut macros = macro_map_from_definitions(initial_macros);
+    let mut include_stack = HashSet::new();
+    include_stack.insert(include_stack_key(file));
+    apply_conditional_compilation_with_macros(
+        file,
+        raw_lines,
+        masked_lines,
+        &mut macros,
+        include_paths,
+        encoding,
+        &mut include_stack,
+        0,
+    )
+}
+
+fn apply_conditional_compilation_with_macros(
+    file: &str,
+    raw_lines: &[&str],
+    masked_lines: Vec<String>,
+    macros: &mut HashMap<String, String>,
+    include_paths: &[String],
+    encoding: SourceEncoding,
+    include_stack: &mut HashSet<String>,
+    include_depth: usize,
+) -> Vec<String> {
     let mut frames: Vec<ConditionalFrame> = Vec::new();
-    masked_lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let current_active = conditional_stack_active(&frames);
-            let Some(directive) = parse_preprocessor_directive(&line) else {
-                return if current_active {
+    let mut output = Vec::with_capacity(masked_lines.len());
+    for (index, line) in masked_lines.into_iter().enumerate() {
+        let current_active = conditional_stack_active(&frames);
+        let Some(directive) = parse_preprocessor_directive(&line) else {
+            output.push(if current_active {
+                line
+            } else {
+                blank_like(&line)
+            });
+            continue;
+        };
+
+        match directive.name.as_str() {
+            "if" | "ifdef" | "ifndef" => {
+                let parent_active = current_active;
+                let condition = match directive.name.as_str() {
+                    "ifdef" => first_identifier(&directive.args)
+                        .is_some_and(|name| macros.contains_key(&name)),
+                    "ifndef" => match first_identifier(&directive.args) {
+                        Some(name) => !macros.contains_key(&name),
+                        None => true,
+                    },
+                    _ => evaluate_preprocessor_expression(&directive.args, macros),
+                };
+                frames.push(ConditionalFrame {
+                    parent_active,
+                    branch_active: parent_active && condition,
+                    branch_taken: parent_active && condition,
+                });
+                output.push(if parent_active {
                     line
                 } else {
                     blank_like(&line)
-                };
-            };
-
-            match directive.name.as_str() {
-                "if" | "ifdef" | "ifndef" => {
-                    let parent_active = current_active;
-                    let condition = match directive.name.as_str() {
-                        "ifdef" => first_identifier(&directive.args)
-                            .is_some_and(|name| macros.contains_key(&name)),
-                        "ifndef" => match first_identifier(&directive.args) {
-                            Some(name) => !macros.contains_key(&name),
-                            None => true,
-                        },
-                        _ => evaluate_preprocessor_expression(&directive.args, &macros),
-                    };
-                    frames.push(ConditionalFrame {
-                        parent_active,
-                        branch_active: parent_active && condition,
-                        branch_taken: parent_active && condition,
+                });
+            }
+            "elif" => {
+                if let Some(frame) = frames.last_mut() {
+                    let condition = evaluate_preprocessor_expression(&directive.args, macros);
+                    frame.branch_active = frame.parent_active && !frame.branch_taken && condition;
+                    frame.branch_taken = frame.branch_taken || frame.branch_active;
+                    output.push(if frame.parent_active {
+                        line
+                    } else {
+                        blank_like(&line)
                     });
-                    if parent_active {
+                } else {
+                    output.push(if current_active {
                         line
                     } else {
                         blank_like(&line)
-                    }
-                }
-                "elif" => {
-                    if let Some(frame) = frames.last_mut() {
-                        let condition = evaluate_preprocessor_expression(&directive.args, &macros);
-                        frame.branch_active =
-                            frame.parent_active && !frame.branch_taken && condition;
-                        frame.branch_taken = frame.branch_taken || frame.branch_active;
-                        if frame.parent_active {
-                            line
-                        } else {
-                            blank_like(&line)
-                        }
-                    } else if current_active {
-                        line
-                    } else {
-                        blank_like(&line)
-                    }
-                }
-                "else" => {
-                    if let Some(frame) = frames.last_mut() {
-                        frame.branch_active = frame.parent_active && !frame.branch_taken;
-                        frame.branch_taken = true;
-                        if frame.parent_active {
-                            line
-                        } else {
-                            blank_like(&line)
-                        }
-                    } else if current_active {
-                        line
-                    } else {
-                        blank_like(&line)
-                    }
-                }
-                "endif" => {
-                    let parent_active = frames
-                        .last()
-                        .map(|frame| frame.parent_active)
-                        .unwrap_or(current_active);
-                    frames.pop();
-                    if parent_active {
-                        line
-                    } else {
-                        blank_like(&line)
-                    }
-                }
-                "define" => {
-                    if current_active {
-                        if let Some(captures) = DEFINE_RE.captures(&line) {
-                            let name = captures.get(1).unwrap().as_str().to_string();
-                            let value = captures
-                                .get(3)
-                                .map(|value| value.as_str().trim().to_string())
-                                .filter(|value| !value.is_empty())
-                                .unwrap_or_else(|| "1".to_string());
-                            macros.insert(name, value);
-                        }
-                    }
-                    if current_active {
-                        line
-                    } else {
-                        blank_like(&line)
-                    }
-                }
-                "undef" => {
-                    if current_active {
-                        if let Some(name) = first_identifier(&directive.args) {
-                            macros.remove(&name);
-                        }
-                    }
-                    if current_active {
-                        line
-                    } else {
-                        blank_like(&line)
-                    }
-                }
-                _ => {
-                    let raw = raw_lines.get(index).copied().unwrap_or_default();
-                    if current_active {
-                        line
-                    } else {
-                        " ".repeat(raw.chars().count())
-                    }
+                    });
                 }
             }
-        })
-        .collect()
+            "else" => {
+                if let Some(frame) = frames.last_mut() {
+                    frame.branch_active = frame.parent_active && !frame.branch_taken;
+                    frame.branch_taken = true;
+                    output.push(if frame.parent_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    });
+                } else {
+                    output.push(if current_active {
+                        line
+                    } else {
+                        blank_like(&line)
+                    });
+                }
+            }
+            "endif" => {
+                let parent_active = frames
+                    .last()
+                    .map(|frame| frame.parent_active)
+                    .unwrap_or(current_active);
+                frames.pop();
+                output.push(if parent_active {
+                    line
+                } else {
+                    blank_like(&line)
+                });
+            }
+            "define" => {
+                if current_active {
+                    if let Some(captures) = DEFINE_RE.captures(&line) {
+                        let name = captures.get(1).unwrap().as_str().to_string();
+                        let value = captures
+                            .get(3)
+                            .map(|value| value.as_str().trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| "1".to_string());
+                        macros.insert(name, value);
+                    }
+                }
+                output.push(if current_active {
+                    line
+                } else {
+                    blank_like(&line)
+                });
+            }
+            "undef" => {
+                if current_active {
+                    if let Some(name) = first_identifier(&directive.args) {
+                        macros.remove(&name);
+                    }
+                }
+                output.push(if current_active {
+                    line
+                } else {
+                    blank_like(&line)
+                });
+            }
+            "include" => {
+                if current_active {
+                    apply_include_macro_side_effects(
+                        raw_lines.get(index).copied().unwrap_or(&line),
+                        file,
+                        macros,
+                        include_paths,
+                        encoding,
+                        include_stack,
+                        include_depth,
+                    );
+                }
+                output.push(if current_active {
+                    line
+                } else {
+                    blank_like(&line)
+                });
+            }
+            _ => {
+                let raw = raw_lines.get(index).copied().unwrap_or_default();
+                output.push(if current_active {
+                    line
+                } else {
+                    " ".repeat(raw.chars().count())
+                });
+            }
+        }
+    }
+    output
+}
+
+fn apply_include_macro_side_effects(
+    raw_line: &str,
+    from_file: &str,
+    macros: &mut HashMap<String, String>,
+    include_paths: &[String],
+    encoding: SourceEncoding,
+    include_stack: &mut HashSet<String>,
+    include_depth: usize,
+) {
+    if include_depth >= 64 {
+        return;
+    }
+    let Some(include) = parse_include_directive(raw_line) else {
+        return;
+    };
+    let Some(included_file) = resolve_include_file(&include, from_file, include_paths) else {
+        return;
+    };
+    let key = include_stack_key(&included_file);
+    if include_stack.contains(&key) {
+        return;
+    }
+    include_stack.insert(key.clone());
+    if let Ok(decoded) = read_source_text(&included_file, encoding) {
+        let text = decoded.text;
+        let raw_lines: Vec<&str> = text.lines().collect();
+        let masked_lines = mask_lines(&text);
+        let _ = apply_conditional_compilation_with_macros(
+            &included_file,
+            &raw_lines,
+            masked_lines,
+            macros,
+            include_paths,
+            encoding,
+            include_stack,
+            include_depth + 1,
+        );
+    }
+    include_stack.remove(&key);
+}
+
+#[derive(Clone)]
+struct IncludeDirective {
+    path: String,
+    quoted: bool,
+}
+
+fn parse_include_directive(raw_line: &str) -> Option<IncludeDirective> {
+    let rest = raw_line.trim_start().strip_prefix('#')?.trim_start();
+    let name = "include";
+    if !rest.starts_with(name) {
+        return None;
+    }
+    let after_name = &rest[name.len()..];
+    if after_name
+        .as_bytes()
+        .first()
+        .is_some_and(|value| *value == b'_' || value.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let args = after_name.trim_start();
+    if let Some(rest) = args.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(IncludeDirective {
+            path: rest[..end].trim().to_string(),
+            quoted: true,
+        });
+    }
+    if let Some(rest) = args.strip_prefix('<') {
+        let end = rest.find('>')?;
+        return Some(IncludeDirective {
+            path: rest[..end].trim().to_string(),
+            quoted: false,
+        });
+    }
+    None
+}
+
+fn resolve_include_file(
+    include: &IncludeDirective,
+    from_file: &str,
+    include_paths: &[String],
+) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if include.quoted {
+        if let Some(parent) = Path::new(from_file).parent() {
+            candidates.push(parent.join(&include.path));
+        }
+    }
+    candidates.extend(
+        include_paths
+            .iter()
+            .map(|include_path| Path::new(include_path).join(&include.path)),
+    );
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(normalize_path(candidate.to_string_lossy().as_ref()));
+        }
+    }
+    None
+}
+
+fn include_stack_key(file: &str) -> String {
+    normalize_path(file).to_ascii_lowercase()
 }
 
 fn conditional_text(raw_lines: &[&str], masked_lines: &[String]) -> String {
@@ -3840,7 +4040,8 @@ fn parse_preprocessor_directive(line: &str) -> Option<PreprocessorDirective> {
         .take_while(|ch| ch.is_ascii_alphabetic())
         .collect();
     match name.as_str() {
-        "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif" | "define" | "undef" => {
+        "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif" | "define" | "undef"
+        | "include" => {
             Some(PreprocessorDirective {
                 args: rest[name.len()..].trim().to_string(),
                 name,
@@ -4354,6 +4555,8 @@ mod tests {
             "TEST_CODE1".to_string(),
             "--define".to_string(),
             "LEVEL=2".to_string(),
+            "--include".to_string(),
+            "include".to_string(),
             "--legacy-in-memory".to_string(),
         ];
 
@@ -4364,6 +4567,7 @@ mod tests {
         assert_eq!(options.batch_size, 7);
         assert_eq!(options.encoding, SourceEncoding::Cp932);
         assert_eq!(options.defined_macros, vec!["TEST_CODE1", "LEVEL=2"]);
+        assert_eq!(options.include_paths, vec![normalize_path("include")]);
         assert!(options.legacy_in_memory);
     }
 
@@ -4423,6 +4627,44 @@ mod tests {
     }
 
     #[test]
+    fn conditional_compilation_applies_header_macro_side_effects_in_include_order() {
+        let _macro_on = write_temp_source("macro_on.h", "#define FEATURE_FLAG 1\n");
+        let _macro_off = write_temp_source("macro_off.h", "#undef FEATURE_FLAG\n");
+        let source = [
+            "int g_release;",
+            "#include \"macro_on.h\"",
+            "#include \"macro_off.h\"",
+            "#ifdef FEATURE_FLAG",
+            "int g_wrong;",
+            "void WrongTest(void) { g_wrong++; }",
+            "#else",
+            "void ReleasePath(void) { g_release++; }",
+            "#endif",
+            "#include \"macro_on.h\"",
+            "#ifdef FEATURE_FLAG",
+            "void EnabledAfterSecondInclude(void) { g_release++; }",
+            "#endif",
+        ]
+        .join("\n");
+        let file = write_temp_source("conditional_include_order.cpp", &source);
+        let result =
+            analyze_many_legacy(vec![file], test_options(256, true)).expect("include analysis");
+        let functions: HashSet<_> = result.files[0]
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+
+        assert!(functions.contains("ReleasePath"));
+        assert!(functions.contains("EnabledAfterSecondInclude"));
+        assert!(!functions.contains("WrongTest"));
+        assert!(result.files[0]
+            .globals
+            .iter()
+            .all(|global| global.name != "g_wrong"));
+    }
+
+    #[test]
     fn cp932_source_decodes_and_analyzes_global_access() {
         let source = encode_cp932(
             "// 日本語\r\nint g_cp932_counter;\r\nvoid Worker(void) { g_cp932_counter++; }\r\n",
@@ -4438,6 +4680,7 @@ mod tests {
                 legacy_in_memory: true,
                 encoding: SourceEncoding::Auto,
                 defined_macros: Vec::new(),
+                include_paths: Vec::new(),
                 progress_log: None,
             },
         )
@@ -4569,7 +4812,7 @@ mod tests {
         .join("\n");
         let file = write_temp_source("summary_ranges.cpp", &source);
 
-        let summary = scan_file_summary(&file, false, SourceEncoding::Auto, &[])
+        let summary = scan_file_summary(&file, false, SourceEncoding::Auto, &[], &[])
             .expect("summary scan should pass");
         let touch = summary
             .functions
@@ -4633,6 +4876,7 @@ mod tests {
             legacy_in_memory,
             encoding: SourceEncoding::Auto,
             defined_macros: Vec::new(),
+            include_paths: Vec::new(),
             progress_log: None,
         }
     }

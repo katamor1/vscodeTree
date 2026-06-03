@@ -78,6 +78,40 @@ export function applyConditionalCompilation(
   });
 }
 
+export interface ConditionalIncludeDirective {
+  path: string;
+  quoted: boolean;
+}
+
+export interface ConditionalIncludeFile {
+  file: string;
+  rawLines: string[];
+  maskedLines: string[];
+}
+
+export interface ConditionalCompilationIncludeOptions {
+  file?: string;
+  maxIncludeDepth?: number;
+  readIncludeFile?: (
+    include: ConditionalIncludeDirective,
+    fromFile: string | undefined
+  ) => Promise<ConditionalIncludeFile | undefined>;
+}
+
+export async function applyConditionalCompilationWithIncludes(
+  rawLines: string[],
+  maskedLines: string[],
+  initialMacros: string[] = [],
+  options: ConditionalCompilationIncludeOptions = {}
+): Promise<string[]> {
+  const macros = macroMapFromDefinitions(initialMacros);
+  const includeStack = new Set<string>();
+  if (options.file) {
+    includeStack.add(includeStackKey(options.file));
+  }
+  return processConditionalCompilationWithIncludes(rawLines, maskedLines, macros, options, includeStack, 0);
+}
+
 export function macroMapFromDefinitions(definitions: string[]): Map<string, string> {
   const macros = new Map<string, string>();
   for (const definition of definitions) {
@@ -125,8 +159,167 @@ function conditionalStackActive(frames: ConditionalFrame[]): boolean {
 }
 
 function parseDirective(line: string): Directive | undefined {
-  const match = line.match(/^\s*#\s*(if|ifdef|ifndef|elif|else|endif|define|undef)\b(.*)$/);
+  const match = line.match(/^\s*#\s*(if|ifdef|ifndef|elif|else|endif|define|undef|include)\b(.*)$/);
   return match ? { name: match[1], args: (match[2] ?? "").trim() } : undefined;
+}
+
+async function processConditionalCompilationWithIncludes(
+  rawLines: string[],
+  maskedLines: string[],
+  macros: Map<string, string>,
+  options: ConditionalCompilationIncludeOptions,
+  includeStack: Set<string>,
+  includeDepth: number
+): Promise<string[]> {
+  const frames: ConditionalFrame[] = [];
+  const output: string[] = [];
+  for (let index = 0; index < maskedLines.length; index += 1) {
+    const line = maskedLines[index] ?? "";
+    const currentActive = conditionalStackActive(frames);
+    const directive = parseDirective(line);
+    if (!directive) {
+      output.push(currentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "if" || directive.name === "ifdef" || directive.name === "ifndef") {
+      const parentActive = currentActive;
+      const condition = directive.name === "ifdef"
+        ? macros.has(firstIdentifier(directive.args) ?? "")
+        : directive.name === "ifndef"
+          ? !macros.has(firstIdentifier(directive.args) ?? "")
+          : evaluatePreprocessorExpression(directive.args, macros);
+      frames.push({
+        parentActive,
+        branchActive: parentActive && condition,
+        branchTaken: parentActive && condition
+      });
+      output.push(parentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "elif") {
+      const frame = frames.at(-1);
+      if (!frame) {
+        output.push(currentActive ? line : blankLike(line));
+        continue;
+      }
+      const condition = evaluatePreprocessorExpression(directive.args, macros);
+      frame.branchActive = frame.parentActive && !frame.branchTaken && condition;
+      frame.branchTaken = frame.branchTaken || frame.branchActive;
+      output.push(frame.parentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "else") {
+      const frame = frames.at(-1);
+      if (!frame) {
+        output.push(currentActive ? line : blankLike(line));
+        continue;
+      }
+      frame.branchActive = frame.parentActive && !frame.branchTaken;
+      frame.branchTaken = true;
+      output.push(frame.parentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "endif") {
+      const parentActive = frames.at(-1)?.parentActive ?? currentActive;
+      frames.pop();
+      output.push(parentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "define") {
+      if (currentActive) {
+        const definition = parseDefine(directive.args);
+        if (definition) {
+          macros.set(definition.name, definition.value);
+        }
+      }
+      output.push(currentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "undef") {
+      if (currentActive) {
+        const name = firstIdentifier(directive.args);
+        if (name) {
+          macros.delete(name);
+        }
+      }
+      output.push(currentActive ? line : blankLike(line));
+      continue;
+    }
+
+    if (directive.name === "include") {
+      if (currentActive) {
+        await applyIncludeMacroSideEffects(
+          rawLines[index] ?? line,
+          macros,
+          options,
+          includeStack,
+          includeDepth
+        );
+      }
+      output.push(currentActive ? line : blankLike(line));
+      continue;
+    }
+
+    output.push(currentActive ? line : blankLike(line));
+  }
+  return output;
+}
+
+async function applyIncludeMacroSideEffects(
+  rawLine: string,
+  macros: Map<string, string>,
+  options: ConditionalCompilationIncludeOptions,
+  includeStack: Set<string>,
+  includeDepth: number
+): Promise<void> {
+  const maxIncludeDepth = options.maxIncludeDepth ?? 64;
+  if (!options.readIncludeFile || includeDepth >= maxIncludeDepth) {
+    return;
+  }
+  const include = parseIncludeDirective(rawLine);
+  if (!include) {
+    return;
+  }
+  const included = await options.readIncludeFile(include, options.file);
+  if (!included) {
+    return;
+  }
+  const key = includeStackKey(included.file);
+  if (includeStack.has(key)) {
+    return;
+  }
+  includeStack.add(key);
+  try {
+    await processConditionalCompilationWithIncludes(
+      included.rawLines,
+      included.maskedLines,
+      macros,
+      { ...options, file: included.file },
+      includeStack,
+      includeDepth + 1
+    );
+  } finally {
+    includeStack.delete(key);
+  }
+}
+
+function parseIncludeDirective(rawLine: string): ConditionalIncludeDirective | undefined {
+  const match = rawLine.match(/^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)/);
+  const includePath = match?.[1] ?? match?.[2];
+  if (!includePath) {
+    return undefined;
+  }
+  return { path: includePath.trim(), quoted: Boolean(match?.[1]) };
+}
+
+function includeStackKey(file: string): string {
+  return file.replace(/\\/g, "/").toLowerCase();
 }
 
 function parseDefine(args: string): { name: string; value: string } | undefined {

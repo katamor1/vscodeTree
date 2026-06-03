@@ -46,6 +46,7 @@ export interface RustAnalyzeManyArgs {
   maxNativeBatchFiles: number;
   timeoutMs?: number;
   macros?: string[];
+  includePaths?: string[];
   progressLogPath?: string;
 }
 
@@ -58,6 +59,7 @@ export interface RustAutoSkipOptions {
   maxNativeBatchFiles?: number;
   timeoutMs?: number;
   macros?: string[];
+  includePaths?: string[];
   diagnosticsDir?: string;
   maxSkippedFiles?: number;
   runner?: RustAnalyzeManyRunner;
@@ -124,9 +126,10 @@ export async function analyzeFilesWithRustSidecar(
   sourceEncoding: TextEncoding = "auto",
   maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
   macros: string[] = [],
-  timeoutMs?: number
+  timeoutMs?: number,
+  includePaths: string[] = []
 ): Promise<RustNativeAnalysisResult> {
-  const output = await runRustAnalyzeManyToOutput(files, maxIndexWorkers, sourceEncoding, maxNativeBatchFiles, undefined, macros, timeoutMs);
+  const output = await runRustAnalyzeManyToOutput(files, maxIndexWorkers, sourceEncoding, maxNativeBatchFiles, undefined, macros, timeoutMs, includePaths);
   try {
     let parsed: RustOutput;
     try {
@@ -195,7 +198,8 @@ export async function runRustAnalyzeManyToOutput(
   maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
   progressLogPath?: string,
   macros: string[] = [],
-  timeoutMs?: number
+  timeoutMs?: number,
+  includePaths: string[] = []
 ): Promise<RustSidecarOutputFile> {
   return defaultRustAnalyzeManyRunner({
     files,
@@ -204,6 +208,7 @@ export async function runRustAnalyzeManyToOutput(
     maxNativeBatchFiles,
     timeoutMs,
     macros,
+    includePaths,
     progressLogPath
   });
 }
@@ -215,6 +220,7 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
   maxNativeBatchFiles = defaultNativeAnalyzeBatchSize,
   timeoutMs,
   macros = [],
+  includePaths = [],
   progressLogPath
 }: RustAnalyzeManyArgs): Promise<RustSidecarOutputFile> => {
   const sidecar = await findRustSidecarExecutable();
@@ -247,6 +253,9 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
     ];
     for (const macro of macros) {
       args.push("--define", macro);
+    }
+    for (const includePath of includePaths) {
+      args.push("--include", includePath);
     }
     if (progressLogPath) {
       args.push("--progress-log", progressLogPath);
@@ -294,6 +303,7 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
   const maxNativeBatchFiles = normalizeNativeBatchFiles(options.maxNativeBatchFiles ?? defaultNativeAnalyzeBatchSize);
   const timeoutMs = options.timeoutMs;
   const macros = options.macros ?? [];
+  const includePaths = options.includePaths ?? [];
   const diagnosticsDir = options.diagnosticsDir ?? path.join(os.tmpdir(), "vc6-impact-native-diagnostics");
   const maxSkippedFiles = normalizeMaxSkippedFiles(options.maxSkippedFiles);
   const runStamp = diagnosticStamp();
@@ -308,7 +318,8 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
       sourceEncoding,
       maxNativeBatchFiles,
       timeoutMs,
-      macros
+      macros,
+      includePaths
     });
   } catch (error) {
     if (!isRustMemoryFailure(error)) {
@@ -335,6 +346,7 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
         maxNativeBatchFiles: 1,
         timeoutMs,
         macros,
+        includePaths,
         progressLogPath
       });
       const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {

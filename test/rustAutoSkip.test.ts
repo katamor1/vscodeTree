@@ -22,13 +22,15 @@ describe("Rust native auto-skip fallback", () => {
     const goodA = path.join(tempRoot, "good-a.cpp").replace(/\\/g, "/");
     const bad = path.join(tempRoot, "bad.cpp").replace(/\\/g, "/");
     const goodB = path.join(tempRoot, "good-b.cpp").replace(/\\/g, "/");
-    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; timeoutMs?: number; progressLogPath?: string }> = [];
+    const includePath = path.join(tempRoot, "include").replace(/\\/g, "/");
+    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; timeoutMs?: number; includePaths?: string[]; progressLogPath?: string }> = [];
     const runner: RustAnalyzeManyRunner = async (args) => {
       calls.push({
         files: args.files,
         maxIndexWorkers: args.maxIndexWorkers,
         maxNativeBatchFiles: args.maxNativeBatchFiles,
         timeoutMs: args.timeoutMs,
+        includePaths: args.includePaths,
         progressLogPath: args.progressLogPath
       });
       if (!args.progressLogPath) {
@@ -64,14 +66,15 @@ describe("Rust native auto-skip fallback", () => {
       sourceEncoding: "auto",
       maxNativeBatchFiles: 4,
       timeoutMs: 0,
+      includePaths: [includePath],
       diagnosticsDir: path.join(tempRoot, "native-diagnostics"),
       maxSkippedFiles: 2,
       runner
     });
 
-    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4, timeoutMs: 0 });
-    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0 });
-    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0 });
+    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4, timeoutMs: 0, includePaths: [includePath] });
+    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath] });
+    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath] });
     expect(result.skippedFiles).toEqual([
       expect.objectContaining({
         file: bad,

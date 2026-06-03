@@ -1,6 +1,7 @@
+import * as path from "node:path";
 import { buildMacroAnalysisContext, buildMemberAnalysisContext, getFileSignature, type MacroAnalysisContext, type MemberAnalysisContext } from "../sourceScanner";
 import { mapWithConcurrency, normalizeConcurrency } from "../limitedConcurrency";
-import { applyConditionalCompilation } from "../preprocessor";
+import { applyConditionalCompilationWithIncludes, type ConditionalIncludeDirective, type ConditionalIncludeFile } from "../preprocessor";
 import { readTextFile, type TextEncoding } from "../textEncoding";
 import type {
   FileAnalysis,
@@ -82,7 +83,8 @@ export async function analyzeFilesWithTypeScript(
   backend: "typescript" | "clang" = "typescript",
   extraDiagnostics: ParserDiagnostic[] = [],
   maxConcurrentFiles = defaultFileConcurrency(),
-  macros: string[] = []
+  macros: string[] = [],
+  includePaths: string[] = []
 ): Promise<TypeScriptAnalysisResult> {
   const started = Date.now();
   const fileConcurrency = normalizeConcurrency(maxConcurrentFiles, files.length);
@@ -100,7 +102,7 @@ export async function analyzeFilesWithTypeScript(
   const structures = await mapWithConcurrency(
     files,
     fileConcurrency,
-    (file) => scanFileStructure(file, sourceEncoding, backend, macros)
+    (file) => scanFileStructure(file, sourceEncoding, backend, macros, includePaths)
   );
   const structureScan = Date.now() - structureStarted;
   const contextStarted = Date.now();
@@ -132,12 +134,16 @@ async function scanFileStructure(
   file: string,
   sourceEncoding: TextEncoding,
   backend: "typescript" | "clang",
-  macros: string[]
+  macros: string[],
+  includePaths: string[]
 ): Promise<FileStructure> {
   const decoded = await readTextFile(file, sourceEncoding);
   const signature = await getFileSignature(file);
   const lines = decoded.text.split(/\r?\n/);
-  const maskedLines = applyConditionalCompilation(lines, maskLines(lines), macros);
+  const maskedLines = await applyConditionalCompilationWithIncludes(lines, maskLines(lines), macros, {
+    file,
+    readIncludeFile: (include, fromFile) => readIncludeFile(include, fromFile, includePaths, sourceEncoding)
+  });
   const unresolved: UnresolvedEvidence[] = [];
   if (decoded.lossy) {
     unresolved.push({
@@ -152,6 +158,41 @@ async function scanFileStructure(
   const functions = parseFunctions(file, lines, maskedLines);
   const globals = parseGlobals(file, maskedLines, functions);
   return { file, signature, globals, structTypes, macroDefinitions, functions, unresolved };
+}
+
+async function readIncludeFile(
+  include: ConditionalIncludeDirective,
+  fromFile: string | undefined,
+  includePaths: string[],
+  sourceEncoding: TextEncoding
+): Promise<ConditionalIncludeFile | undefined> {
+  for (const candidate of includeCandidates(include, fromFile, includePaths)) {
+    try {
+      const decoded = await readTextFile(candidate, sourceEncoding);
+      const rawLines = decoded.text.split(/\r?\n/);
+      return {
+        file: candidate,
+        rawLines,
+        maskedLines: maskLines(rawLines)
+      };
+    } catch {
+      // Missing include paths are common in partial VC6 workspaces; skip and keep scanning.
+    }
+  }
+  return undefined;
+}
+
+function includeCandidates(
+  include: ConditionalIncludeDirective,
+  fromFile: string | undefined,
+  includePaths: string[]
+): string[] {
+  const candidates: string[] = [];
+  if (include.quoted && fromFile) {
+    candidates.push(path.resolve(path.dirname(fromFile), include.path));
+  }
+  candidates.push(...includePaths.map((includePath) => path.resolve(includePath, include.path)));
+  return unique(candidates.map((candidate) => candidate.replace(/\\/g, "/")));
 }
 
 function buildTypeScriptContext(files: FileStructure[]): TypeScriptContext {

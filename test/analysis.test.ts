@@ -429,6 +429,22 @@ describe("Impact index", () => {
     expect(index.globals.g_release?.length).toBe(1);
     expect(index.globals.g_test).toBeUndefined();
   });
+
+  it.each(["typescript", "rust"] as const)("applies header macro define/undef in include order with %s backend", async (parserEngine) => {
+    const fixture = await createIncludeOrderFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: fixture.root,
+      projectFile: fixture.projectFile,
+      parserEngine,
+      projectConfiguration: "Release",
+      maxIndexWorkers: 1
+    });
+
+    expect(index.includePaths.some((includePath) => includePath.endsWith("/include"))).toBe(true);
+    expect(Object.keys(index.functions).sort()).toEqual(["EnabledAfterSecondInclude", "ReleasePath"]);
+    expect(index.globals.g_release?.length).toBe(1);
+    expect(index.globals.g_wrong).toBeUndefined();
+  }, 60000);
 });
 
 describe("function impact", () => {
@@ -520,6 +536,50 @@ async function createReleaseConfigurationFixture(): Promise<{ root: string; proj
     [
       "#if defined(TEST_CODE1)",
       "void WholeFileTestOnly(void) {}",
+      "#endif",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  return { root, projectFile };
+}
+
+async function createIncludeOrderFixture(): Promise<{ root: string; projectFile: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-include-order-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  await fs.mkdir(path.join(root, "include"), { recursive: true });
+  const projectFile = path.join(root, "sample.dsw");
+  await fs.writeFile(projectFile, 'Project: "sample"=".\\sample.dsp" - Package Owner=<4>\r\n', "utf8");
+  await fs.writeFile(
+    path.join(root, "sample.dsp"),
+    [
+      '# Microsoft Developer Studio Project File - Name="sample" - Package Owner=<4>',
+      '# Name "sample - Win32 Release"',
+      '# ADD CPP /nologo /W3 /I ".\\include" /D "WIN32" /D "NDEBUG" /c',
+      '# Begin Source File',
+      'SOURCE=.\\src\\main.cpp',
+      '# End Source File',
+      ''
+    ].join("\r\n"),
+    "utf8"
+  );
+  await fs.writeFile(path.join(root, "include", "macro_on.h"), "#define FEATURE_FLAG 1\n", "utf8");
+  await fs.writeFile(path.join(root, "include", "macro_off.h"), "#undef FEATURE_FLAG\n", "utf8");
+  await fs.writeFile(
+    path.join(root, "src", "main.cpp"),
+    [
+      "int g_release;",
+      '#include "macro_on.h"',
+      '#include "macro_off.h"',
+      "#ifdef FEATURE_FLAG",
+      "int g_wrong;",
+      "void WrongTest(void) { g_wrong++; }",
+      "#else",
+      "void ReleasePath(void) { g_release++; }",
+      "#endif",
+      '#include "macro_on.h"',
+      "#ifdef FEATURE_FLAG",
+      "void EnabledAfterSecondInclude(void) { g_release++; }",
       "#endif",
       ""
     ].join("\n"),

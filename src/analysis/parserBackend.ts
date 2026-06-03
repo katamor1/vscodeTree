@@ -34,7 +34,8 @@ export async function analyzeFilesWithParserBackend(args: {
       timeoutMs: args.rustSidecarTimeoutMs,
       diagnosticsDir: args.diagnosticsDir,
       maxSkippedFiles: args.maxRustAutoSkippedFiles,
-      macros: args.macros ?? []
+      macros: args.macros ?? [],
+      includePaths: args.includePaths ?? []
     });
   }
   if (args.parserEngine === "clang") {
@@ -52,7 +53,8 @@ export async function analyzeFilesWithParserBackend(args: {
     "typescript",
     [],
     effectiveFileConcurrency(args.maxIndexWorkers),
-    args.macros ?? []
+    args.macros ?? [],
+    args.includePaths ?? []
   );
 }
 
