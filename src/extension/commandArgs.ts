@@ -1,6 +1,6 @@
 export function normalizeCommandSymbolArg(value: unknown): string | undefined {
   if (typeof value === "string") {
-    return normalizeNonEmpty(value);
+    return normalizeSymbolText(value);
   }
   if (!value || typeof value !== "object") {
     return undefined;
@@ -12,8 +12,8 @@ export function normalizeCommandSymbolArg(value: unknown): string | undefined {
     label?: unknown;
   };
   return (
-    normalizeNonEmpty(candidate.symbolName) ??
-    normalizeNonEmpty(candidate.name) ??
+    normalizeSymbolText(candidate.symbolName) ??
+    normalizeSymbolText(candidate.name) ??
     normalizeLabel(candidate.label)
   );
 }
@@ -44,10 +44,10 @@ export function extractSymbolAtTextOffset(text: string, offset: number): string 
 
 function normalizeLabel(value: unknown): string | undefined {
   if (typeof value === "string") {
-    return normalizeNonEmpty(value);
+    return normalizeSymbolText(value);
   }
   if (value && typeof value === "object" && "label" in value) {
-    return normalizeNonEmpty((value as { label?: unknown }).label);
+    return normalizeSymbolText((value as { label?: unknown }).label);
   }
   return undefined;
 }
@@ -63,6 +63,14 @@ function normalizeNonEmpty(value: unknown): string | undefined {
 function normalizeMemberSymbol(value: string): string | undefined {
   const normalized = value.replace(/\s+/g, "").replace(/\[[^\]]+\]/g, "[]");
   return normalizeNonEmpty(normalized);
+}
+
+function normalizeSymbolText(value: unknown): string | undefined {
+  const trimmed = normalizeNonEmpty(value);
+  if (!trimmed) {
+    return undefined;
+  }
+  return /(?:\.|->)/.test(trimmed) ? normalizeMemberSymbol(trimmed) : trimmed;
 }
 
 function isIdentifierPart(char: string | undefined): boolean {

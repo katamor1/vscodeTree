@@ -6,6 +6,10 @@ describe("normalizeCommandSymbolArg", () => {
     expect(normalizeCommandSymbolArg("  g_counter  ")).toBe("g_counter");
   });
 
+  it("normalizes selected nested array member text", () => {
+    expect(normalizeCommandSymbolArg(" PTR_GBL->sub4.subsub[minor].sample_value1 ")).toBe("PTR_GBL->sub4.subsub[].sample_value1");
+  });
+
   it("extracts explicit symbol fields from command objects", () => {
     expect(normalizeCommandSymbolArg({ symbolName: "g_mode" })).toBe("g_mode");
     expect(normalizeCommandSymbolArg({ name: "CommonUpdate" })).toBe("CommonUpdate");

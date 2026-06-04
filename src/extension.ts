@@ -8,6 +8,7 @@ import type { AnalysisIndex, ImpactResult } from "./analysis/types";
 import { extractSymbolAtTextOffset, normalizeCommandSymbolArg } from "./extension/commandArgs";
 import { ImpactTreeProvider } from "./extension/impactTree";
 import { GraphView } from "./extension/graphView";
+import { commandProgress } from "./extension/progress";
 import { readSettings } from "./extension/settings";
 import { updateVc6ProjectContext } from "./extension/workspaceContext";
 
@@ -76,23 +77,40 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("vc6Impact.inspectSelectedSymbol", async (symbolArg?: unknown) => {
       await withErrors(async () => {
-        const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
-        currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
-        treeProvider.setImpact(currentImpact);
-        graphView.show(context, currentImpact, settings.workspaceRoot);
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: commandProgress.inspectSelectedSymbol.title, cancellable: false },
+          async (progress) => {
+            progress.report({ message: commandProgress.inspectSelectedSymbol.initialMessage });
+            const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
+            progress.report({ message: `Building impact graph for ${symbolName}...` });
+            currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
+            treeProvider.setImpact(currentImpact);
+            progress.report({ message: "Opening graph..." });
+            graphView.show(context, currentImpact, settings.workspaceRoot);
+          }
+        );
       });
     }),
     vscode.commands.registerCommand("vc6Impact.generateReviewReport", async (symbolArg?: unknown) => {
       await withErrors(async () => {
-        const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
-        currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
-        treeProvider.setImpact(currentImpact);
-        const paths = reportPaths(settings.outputDir, symbolName);
-        await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
-        await writeReviewReport(index, currentImpact, paths.markdown, paths.html);
-        const document = await vscode.workspace.openTextDocument(paths.markdown);
-        await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside);
-        vscode.window.showInformationMessage(`Review report generated: ${paths.markdown}`);
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: commandProgress.generateReviewReport.title, cancellable: false },
+          async (progress) => {
+            progress.report({ message: commandProgress.generateReviewReport.initialMessage });
+            const { index, symbolName, settings } = await loadIndexAndSymbol(context, symbolArg);
+            progress.report({ message: `Building impact review for ${symbolName}...` });
+            currentImpact = buildImpact(index, symbolName, settings.maxGraphDepth);
+            treeProvider.setImpact(currentImpact);
+            const paths = reportPaths(settings.outputDir, symbolName);
+            await ensureArtifactIgnored(settings.workspaceRoot, settings.outputDir);
+            progress.report({ message: "Writing Markdown and HTML reports..." });
+            await writeReviewReport(index, currentImpact, paths.markdown, paths.html);
+            progress.report({ message: "Opening report..." });
+            const document = await vscode.workspace.openTextDocument(paths.markdown);
+            await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside);
+            vscode.window.showInformationMessage(`Review report generated: ${paths.markdown}`);
+          }
+        );
       });
     }),
     vscode.commands.registerCommand("vc6Impact.openGraph", async (symbolArg?: unknown) => {
