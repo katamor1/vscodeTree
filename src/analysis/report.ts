@@ -90,7 +90,9 @@ export function renderMarkdownReport(
   lines.push("");
 
   lines.push("## 参照/更新箇所");
-  if (impact.accesses.length === 0) {
+  if (impact.symbolKind === "function") {
+    lines.push("- 関数調査では変数アクセスを展開しません。呼び出し関係とスレッド到達を確認してください。");
+  } else if (impact.accesses.length === 0) {
     lines.push("- 対象に紐づくread/write候補はありません。");
   } else {
     for (const access of impact.accesses) {

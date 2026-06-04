@@ -78,6 +78,8 @@ describe("Impact index", () => {
     expect(hydrated).toBeDefined();
     const impact = buildImpact(hydrated!, "g_counter");
     expect(impact.accesses.some((access) => access.kind === "write" && access.functionName === "WorkerThread")).toBe(true);
+    const hydratedFunction = await readIndexForSymbol(indexPath, "WorkerThread");
+    expect(hydratedFunction?.functions.WorkerThread.accesses).toEqual([]);
   });
 
   it("rebuilds a split production index when the function sidecar is missing", async () => {
@@ -252,6 +254,26 @@ describe("Impact index", () => {
     expect(unresolvedNames).not.toContain("PTR_GBL->sub3.sample_value3");
     expect(unresolvedEvidence).not.toContain("PTR_GBL->sub4.subsub_ptr = &subLocal;");
     expect(unresolvedEvidence).not.toContain("subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;");
+  });
+
+  it("finds nested array member accesses selected from source text", async () => {
+    const sample2 = await createSample2ImpactFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: sample2.root,
+      projectFile: sample2.projectFile,
+      threadMapFile: sample2.threadMapFile,
+      maxIndexWorkers: 1
+    });
+    const impact = buildImpact(index, "PTR_GBL->sub4.subsub[].sample_value1");
+
+    expect(index.memberSymbols["PTR_GBL->sub4.subsub[].sample_value1"]?.length).toBeGreaterThan(0);
+    expect(impact.symbolKind).toBe("member");
+    expect(impact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ functionName: "api_major4_subsub", variableName: "PTR_GBL->sub4.subsub[].sample_value1", kind: "read" }),
+        expect.objectContaining({ functionName: "thread_main_entry", variableName: "PTR_GBL->sub4.subsub[].sample_value1", kind: "write" })
+      ])
+    );
   });
 
   it("exposes nested pointer-global member declarations and accesses with clang fallback", async () => {
@@ -448,15 +470,24 @@ describe("Impact index", () => {
 });
 
 describe("function impact", () => {
-  it("shows variables and callers/callees around a selected function", async () => {
+  it("focuses on call relationships and thread context without expanding variable accesses", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
     const impact = buildImpact(index, "CommonUpdate", 2);
     const report = renderMarkdownReport(index, impact);
 
     expect(impact.symbolKind).toBe("function");
     expect(impact.functions.map((func) => func.name)).toContain("WorkerThread");
-    expect(impact.accesses.map((access) => access.variableName)).toContain("g_counter");
+    expect(impact.functions.every((func) => func.accesses.length === 0)).toBe(true);
+    expect(impact.threadContexts.map((context) => context.functionName)).toContain("WorkerThread");
+    expect(impact.accesses).toEqual([]);
+    expect(impact.graph.edges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ from: "function:WorkerThread", label: "calls", to: "function:CommonUpdate" })
+      ])
+    );
     expect(report).toContain("function `CommonUpdate`");
+    expect(report).toContain("関数調査では変数アクセスを展開しません");
+    expect(report).not.toContain("READ `g_counter`");
   });
 });
 
@@ -648,7 +679,7 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
     path.join(root, "src", "header.h"),
     [
       "typedef struct tagSampleSubSub { int sample_value1; int sample_value2; int sample_value3; } SAMPLE_SUBSUB;",
-      "typedef struct tagSampleSub4 { SAMPLE_SUBSUB *subsub_ptr; } SAMPLE_SUB4;",
+      "typedef struct tagSampleSub4 { SAMPLE_SUBSUB *subsub_ptr; SAMPLE_SUBSUB subsub[4]; } SAMPLE_SUB4;",
       "typedef struct tagSampleMain { SAMPLE_SUBSUB sub1; SAMPLE_SUBSUB sub2; SAMPLE_SUBSUB sub3; SAMPLE_SUB4 sub4; } SAMPLE_MAIN;",
       "typedef struct tagSampleSubPtr { int *sample_value1; int *sample_value2; int *sample_value3; } SAMPLE_SUBPTR;",
       ""
@@ -662,6 +693,7 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
       "extern SAMPLE_MAIN* PTR_GBL;",
       "int api_major1_sub1(int minor) { return PTR_GBL->sub1.sample_value1 + minor; }",
       "int api_major3_sub1(int minor) { return PTR_GBL->sub3.sample_value1 + minor; }",
+      "int api_major4_subsub(int minor) { return PTR_GBL->sub4.subsub[minor].sample_value1; }",
       ""
     ].join("\n"),
     "utf8"
@@ -679,6 +711,7 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
       "    subPtr.sample_value2 = &PTR_GBL->sub2.sample_value2;",
       "    subPtr.sample_value3 = &PTR_GBL->sub3.sample_value3;",
       "    PTR_GBL->sub3.sample_value1++;",
+      "    PTR_GBL->sub4.subsub[0].sample_value1++;",
       "}",
       "void thread1_entry(void) {",
       "    thread_sub1ptr(&PTR_GBL->sub1);",

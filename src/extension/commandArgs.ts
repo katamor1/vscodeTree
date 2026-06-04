@@ -20,7 +20,7 @@ export function normalizeCommandSymbolArg(value: unknown): string | undefined {
 
 export function extractSymbolAtTextOffset(text: string, offset: number): string | undefined {
   const boundedOffset = Math.max(0, Math.min(text.length, offset));
-  for (const match of text.matchAll(/\b[A-Za-z_]\w*(?:\s*\[[^\]]+\])?\s*(?:\.|->)\s*[A-Za-z_]\w*(?:(?:\s*(?:\.|->)\s*)[A-Za-z_]\w*)*/g)) {
+  for (const match of text.matchAll(/\b[A-Za-z_]\w*(?:\s*\[[^\]]+\])?\s*(?:\.|->)\s*[A-Za-z_]\w*(?:\s*\[[^\]]+\])?(?:(?:\s*(?:\.|->)\s*)[A-Za-z_]\w*(?:\s*\[[^\]]+\])?)*/g)) {
     if (match.index === undefined) {
       continue;
     }

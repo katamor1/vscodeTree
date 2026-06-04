@@ -27,6 +27,12 @@ describe("extractSymbolAtTextOffset", () => {
     expect(extractSymbolAtTextOffset(source, source.indexOf("sample_value1") + 2)).toBe("PTR_GBL->sub1.sample_value1");
   });
 
+  it("keeps nested array members in the selected symbol", () => {
+    const source = "return PTR_GBL->sub4.subsub[minor].sample_value1;";
+
+    expect(extractSymbolAtTextOffset(source, source.indexOf("sample_value1") + 2)).toBe("PTR_GBL->sub4.subsub[].sample_value1");
+  });
+
   it("selects dotted members and plain function names", () => {
     expect(extractSymbolAtTextOffset("g_state.mode = 1;", "g_state.mode".length - 1)).toBe("g_state.mode");
     expect(extractSymbolAtTextOffset("CommonUpdate();", 2)).toBe("CommonUpdate");

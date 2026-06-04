@@ -2255,12 +2255,19 @@ fn extract_member_expressions(line: &str) -> Vec<MemberExpression> {
                 break;
             };
             connectors.push(next_connector.clone());
-            member_path.push(member);
             skip_ascii_space(line, &mut index);
-            if index < bytes.len() && bytes[index] == b'[' {
+            let member_indexed = if index < bytes.len() && bytes[index] == b'[' {
                 index = skip_bracket(line, index);
-                skip_ascii_space(line, &mut index);
-            }
+                true
+            } else {
+                false
+            };
+            member_path.push(if member_indexed {
+                format!("{member}[]")
+            } else {
+                member
+            });
+            skip_ascii_space(line, &mut index);
             if line[index..].starts_with("->") {
                 index += 2;
                 next_connector = "->".to_string();
@@ -2500,10 +2507,11 @@ fn member_path_exists(
 ) -> bool {
     let mut current_type: Option<&StructTypeInfo> = Some(type_info);
     for (index, member_name) in member_path.iter().enumerate() {
+        let normalized_member_name = member_name.trim_end_matches("[]");
         let Some(member) = current_type.and_then(|item| {
             item.members
                 .iter()
-                .find(|candidate| &candidate.name == member_name)
+                .find(|candidate| candidate.name == normalized_member_name)
         }) else {
             return false;
         };

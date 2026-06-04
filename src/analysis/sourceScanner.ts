@@ -214,7 +214,8 @@ function appendMemberSymbols(args: {
     return;
   }
   for (const member of args.type.members) {
-    const memberPath = args.pathPrefix ? `${args.pathPrefix}.${member.name}` : member.name;
+    const memberSegment = member.isArray ? `${member.name}[]` : member.name;
+    const memberPath = args.pathPrefix ? `${args.pathPrefix}.${memberSegment}` : memberSegment;
     const name = `${args.ownerName}${args.separator}${memberPath}`;
     args.symbols.push({
       name,

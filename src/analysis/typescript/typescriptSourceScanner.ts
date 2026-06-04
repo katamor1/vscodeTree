@@ -665,7 +665,7 @@ function expandMacroAliases(line: string, macroContext: MacroAnalysisContext): {
 
 function extractMemberExpressions(line: string): MemberExpression[] {
   const result: MemberExpression[] = [];
-  const re = /\b([A-Za-z_]\w*)(?:\s*\[[^\]]+\])?\s*(\.|->)\s*([A-Za-z_]\w*(?:(?:\s*(?:\.|->)\s*)[A-Za-z_]\w*)*)/g;
+  const re = /\b([A-Za-z_]\w*)(?:\s*\[[^\]]+\])?\s*(\.|->)\s*([A-Za-z_]\w*(?:\s*\[[^\]]+\])?(?:(?:\s*(?:\.|->)\s*)[A-Za-z_]\w*(?:\s*\[[^\]]+\])?)*)/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(line))) {
     const sourceExpression = match[0];
@@ -678,10 +678,16 @@ function extractMemberExpressions(line: string): MemberExpression[] {
       end: match.index + sourceExpression.length,
       ownerName,
       connector: match[2] as "." | "->",
-      memberPath: match[3].split(/\.|->/).map((item) => item.trim()).filter(Boolean)
+      memberPath: match[3].split(/\.|->/).map(normalizeMemberPathSegment).filter(Boolean)
     });
   }
   return result;
+}
+
+function normalizeMemberPathSegment(value: string): string {
+  const trimmed = value.trim();
+  const name = trimmed.match(/^[A-Za-z_]\w*/)?.[0] ?? "";
+  return name && /\[[^\]]+\]/.test(trimmed) ? `${name}[]` : name;
 }
 
 function maskMemberExpressions(line: string, expressions: MemberExpression[]): string {

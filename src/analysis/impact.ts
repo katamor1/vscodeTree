@@ -29,20 +29,23 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
           ? "function"
           : "unknown";
   const macroTargets = new Set(macros.map((macro) => macro.targetName));
-  const functions = symbolKind === "function" && selectedFunction
+  const rawFunctions = symbolKind === "function" && selectedFunction
     ? collectFunctionNeighborhood(index, selectedFunction.name, maxDepth)
     : symbolKind === "macro"
       ? functionsTouchingMacro(index, symbolName, macroTargets)
       : functionsTouchingSymbol(index, symbolName);
-  const accesses = symbolKind === "global" || symbolKind === "member" || symbolKind === "unknown"
-    ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
-    : symbolKind === "macro"
-      ? functions.flatMap((func) => func.accesses.filter((access) =>
+  const functions = symbolKind === "function"
+    ? rawFunctions.map((func) => ({ ...func, accesses: [] }))
+    : rawFunctions;
+  const accesses = symbolKind === "function"
+    ? []
+    : symbolKind === "global" || symbolKind === "member" || symbolKind === "unknown"
+      ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
+      : functions.flatMap((func) => func.accesses.filter((access) =>
         access.macroNames?.includes(symbolName) ||
         macroTargets.has(access.targetName ?? access.variableName) ||
         macroTargets.has(access.variableName)
-      ))
-      : functions.flatMap((func) => func.accesses);
+      ));
   const threadContexts = uniqueThreadContexts(
     functions
       .map((func) => index.threadReachability[func.name])
@@ -228,6 +231,23 @@ function buildGraph(
     const functionId = `function:${func.name}`;
     addNode(nodes, { id: functionId, label: func.name, kind: "function" });
     edges.push({ from: `target:${symbolName}`, to: functionId, label: symbolKind === "function" ? "related" : "access" });
+  }
+  if (symbolKind === "function") {
+    const functionNames = new Set(functions.map((func) => func.name));
+    const seenCallEdges = new Set<string>();
+    for (const func of functions) {
+      for (const called of func.calls) {
+        if (!functionNames.has(called)) {
+          continue;
+        }
+        const edgeKey = `${func.name}->${called}`;
+        if (seenCallEdges.has(edgeKey)) {
+          continue;
+        }
+        seenCallEdges.add(edgeKey);
+        edges.push({ from: `function:${func.name}`, to: `function:${called}`, label: "calls" });
+      }
+    }
   }
   for (const access of accesses) {
     edges.push({

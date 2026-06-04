@@ -22,6 +22,10 @@ export interface IndexFunctionWriter {
   dispose(): Promise<void>;
 }
 
+interface ReadFunctionsOptions {
+  stripAccesses?: boolean;
+}
+
 export function resolveArtifactRoot(workspaceRoot: string): string {
   return normalizePath(path.join(workspaceRoot, ".vscode", "vc6-impact-review"));
 }
@@ -330,8 +334,7 @@ function addAccessIndexEntry(index: Map<string, Set<string>>, symbolName: string
 function functionNamesForSymbol(index: AnalysisIndex, symbolName: string, maxDepth: number): Set<string> {
   const names = new Set<string>();
   const macros = index.macroAliases?.[symbolName] ?? [];
-  const isFunction = Boolean(index.callGraph[symbolName] || index.calledBy[symbolName]);
-  if (isFunction) {
+  if (isFunctionSymbol(index, symbolName)) {
     return collectFunctionNeighborhoodNames(index, symbolName, maxDepth);
   }
   for (const name of index.accessIndex?.[symbolName] ?? []) {
@@ -346,6 +349,10 @@ function functionNamesForSymbol(index: AnalysisIndex, symbolName: string, maxDep
     }
   }
   return names;
+}
+
+function isFunctionSymbol(index: AnalysisIndex, symbolName: string): boolean {
+  return Boolean(index.callGraph[symbolName] || index.calledBy[symbolName]);
 }
 
 function collectFunctionNeighborhoodNames(index: AnalysisIndex, functionName: string, maxDepth: number): Set<string> {
@@ -364,7 +371,11 @@ function collectFunctionNeighborhoodNames(index: AnalysisIndex, functionName: st
   return visited;
 }
 
-async function readFunctionsByName(functionsPath: string, names: Set<string>): Promise<Record<string, FunctionInfo>> {
+async function readFunctionsByName(
+  functionsPath: string,
+  names: Set<string>,
+  options: ReadFunctionsOptions = {}
+): Promise<Record<string, FunctionInfo>> {
   const functions: Record<string, FunctionInfo> = {};
   if (names.size === 0) {
     return functions;
@@ -384,24 +395,29 @@ async function readFunctionsByName(functionsPath: string, names: Set<string>): P
     while (newlineIndex >= 0) {
       const line = buffer.slice(0, newlineIndex).trim();
       buffer = buffer.slice(newlineIndex + 1);
-      readFunctionLine(line, names, functions);
+      readFunctionLine(line, names, functions, options);
       if (Object.keys(functions).length === names.size) {
         return functions;
       }
       newlineIndex = buffer.indexOf("\n");
     }
   }
-  readFunctionLine(buffer.trim(), names, functions);
+  readFunctionLine(buffer.trim(), names, functions, options);
   return functions;
 }
 
-function readFunctionLine(line: string, names: Set<string>, functions: Record<string, FunctionInfo>): void {
+function readFunctionLine(
+  line: string,
+  names: Set<string>,
+  functions: Record<string, FunctionInfo>,
+  options: ReadFunctionsOptions
+): void {
   if (!line) {
     return;
   }
   const func = JSON.parse(line) as FunctionInfo;
   if (names.has(func.name)) {
-    functions[func.name] = func;
+    functions[func.name] = options.stripAccesses ? { ...func, accesses: [] } : func;
   }
 }
 
@@ -469,9 +485,10 @@ export async function readIndexForSymbol(indexPath: string, symbolName: string, 
     return index;
   }
   const functionNames = functionNamesForSymbol(index, symbolName, maxDepth);
+  const stripAccesses = isFunctionSymbol(index, symbolName);
   return {
     ...index,
-    functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames),
+    functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames, { stripAccesses }),
     files: unresolvedFilesFromStoredIndex(index)
   };
 }

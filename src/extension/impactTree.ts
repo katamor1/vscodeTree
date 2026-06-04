@@ -75,6 +75,24 @@ export class ImpactTreeProvider implements vscode.TreeDataProvider<ImpactItem> {
           )
         : [new ImpactItem(this.status.message, vscode.TreeItemCollapsibleState.None, "message", [], undefined, undefined, "info")];
     }
+    const accessChildren = this.impact.symbolKind === "function"
+      ? [
+          new ImpactItem(
+            "関数調査では変数アクセスを展開しません。",
+            vscode.TreeItemCollapsibleState.None,
+            "message"
+          )
+        ]
+      : this.impact.accesses.map(
+          (access) =>
+            new ImpactItem(
+              `${access.kind.toUpperCase()} ${access.variableName} in ${access.functionName}`,
+              vscode.TreeItemCollapsibleState.None,
+              "access",
+              [],
+              access.location
+            )
+        );
     return [
       new ImpactItem(`Target: ${this.impact.symbolName} (${this.impact.symbolKind})`, vscode.TreeItemCollapsibleState.None, "message"),
       new ImpactItem(
@@ -99,19 +117,10 @@ export class ImpactTreeProvider implements vscode.TreeDataProvider<ImpactItem> {
         )
       ),
       new ImpactItem(
-        `Accesses (${this.impact.accesses.length})`,
+        this.impact.symbolKind === "function" ? "Accesses (not expanded for function)" : `Accesses (${this.impact.accesses.length})`,
         vscode.TreeItemCollapsibleState.Collapsed,
         "access",
-        this.impact.accesses.map(
-          (access) =>
-            new ImpactItem(
-              `${access.kind.toUpperCase()} ${access.variableName} in ${access.functionName}`,
-              vscode.TreeItemCollapsibleState.None,
-              "access",
-              [],
-              access.location
-            )
-        )
+        accessChildren
       ),
       new ImpactItem(
         `Functions (${this.impact.functions.length})`,

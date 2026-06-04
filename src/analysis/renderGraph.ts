@@ -158,6 +158,9 @@ function renderDeclarations(
 }
 
 function renderAccesses(impact: ImpactResult, options: RenderGraphOptions): string {
+  if (impact.symbolKind === "function") {
+    return `<p class="empty">関数調査では変数アクセスを展開しません。呼び出し関係とスレッド到達を確認してください。</p>`;
+  }
   if (impact.accesses.length === 0) {
     return `<p class="empty">read/write候補はありません。</p>`;
   }
