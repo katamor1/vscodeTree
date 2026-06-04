@@ -10,6 +10,9 @@ import type { FileAnalysis, ParserDiagnostic, SkippedSourceFile } from "../types
 
 const execFileAsync = promisify(execFile);
 const defaultNativeAnalyzeBatchSize = 4;
+const inMemoryAutoMinFiles = 1024;
+const inMemoryAutoMaxSourceBytes = 128 * 1024 * 1024;
+const inMemoryAutoStatConcurrency = 64;
 
 export interface RustNativeAnalysisResult {
   files: FileAnalysis[];
@@ -48,6 +51,7 @@ export interface RustAnalyzeManyArgs {
   macros?: string[];
   includePaths?: string[];
   progressLogPath?: string;
+  preferInMemory?: boolean;
 }
 
 export type RustAnalyzeManyRunner = (args: RustAnalyzeManyArgs) => Promise<RustSidecarOutputFile>;
@@ -62,6 +66,7 @@ export interface RustAutoSkipOptions {
   includePaths?: string[];
   diagnosticsDir?: string;
   maxSkippedFiles?: number;
+  preferInMemory?: boolean;
   runner?: RustAnalyzeManyRunner;
 }
 
@@ -221,7 +226,8 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
   timeoutMs,
   macros = [],
   includePaths = [],
-  progressLogPath
+  progressLogPath,
+  preferInMemory
 }: RustAnalyzeManyArgs): Promise<RustSidecarOutputFile> => {
   const sidecar = await findRustSidecarExecutable();
   if (!sidecar) {
@@ -259,6 +265,9 @@ export const defaultRustAnalyzeManyRunner: RustAnalyzeManyRunner = async ({
     }
     if (progressLogPath) {
       args.push("--progress-log", progressLogPath);
+    }
+    if (preferInMemory ?? await shouldUseInMemoryRustAnalysis(files)) {
+      args.push("--legacy-in-memory");
     }
     await execFileAsync(sidecar, args, {
       windowsHide: true,
@@ -304,6 +313,7 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
   const timeoutMs = options.timeoutMs;
   const macros = options.macros ?? [];
   const includePaths = options.includePaths ?? [];
+  const preferInMemory = options.preferInMemory;
   const diagnosticsDir = options.diagnosticsDir ?? path.join(os.tmpdir(), "vc6-impact-native-diagnostics");
   const maxSkippedFiles = normalizeMaxSkippedFiles(options.maxSkippedFiles);
   const runStamp = diagnosticStamp();
@@ -319,7 +329,8 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
       maxNativeBatchFiles,
       timeoutMs,
       macros,
-      includePaths
+      includePaths,
+      preferInMemory
     });
   } catch (error) {
     if (!isRustMemoryFailure(error)) {
@@ -347,7 +358,8 @@ export async function runRustAnalyzeManyToOutputWithAutoSkip(options: RustAutoSk
         timeoutMs,
         macros,
         includePaths,
-        progressLogPath
+        progressLogPath,
+        preferInMemory: false
       });
       const summary = await writeAutoSkipSummary(diagnosticSummaryPath, {
         status: "recovered",
@@ -563,6 +575,37 @@ function normalizeMaxSkippedFiles(value: number | undefined): number {
     return 16;
   }
   return Math.max(0, Math.min(1000, Math.floor(value ?? 16)));
+}
+
+export async function shouldUseInMemoryRustAnalysis(
+  files: string[],
+  options: { minFiles?: number; maxTotalBytes?: number; statConcurrency?: number } = {}
+): Promise<boolean> {
+  const minFiles = options.minFiles ?? inMemoryAutoMinFiles;
+  if (files.length < minFiles) {
+    return false;
+  }
+  const maxTotalBytes = options.maxTotalBytes ?? inMemoryAutoMaxSourceBytes;
+  const statConcurrency = Math.max(1, Math.floor(options.statConcurrency ?? inMemoryAutoStatConcurrency));
+  let totalBytes = 0;
+  for (let index = 0; index < files.length; index += statConcurrency) {
+    const stats = await Promise.all(
+      files.slice(index, index + statConcurrency).map(async (file) => {
+        try {
+          return await fs.stat(file);
+        } catch {
+          return undefined;
+        }
+      })
+    );
+    for (const stat of stats) {
+      totalBytes += stat?.size ?? maxTotalBytes + 1;
+      if (totalBytes > maxTotalBytes) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 export function resolveRustSidecarTimeoutMs(value: number | undefined, fileCount: number): number {

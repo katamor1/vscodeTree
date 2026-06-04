@@ -66,24 +66,39 @@ describe("artifact storage policy", () => {
     expect(JSON.parse(text).version).toBe(1);
   });
 
-  it("does not stringify the entire top-level index object while writing", async () => {
+  it("stringifies only the split top-level index after moving functions to the sidecar", async () => {
     const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
     const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.functions.TouchCounter = {
+      name: "TouchCounter",
+      file: "C:/tmp/project/main.cpp",
+      startLine: 2,
+      endLine: 4,
+      signature: "void TouchCounter(void)",
+      calls: [],
+      accesses: [],
+      unresolved: []
+    };
+
     const originalStringify = JSON.stringify;
+    let sawSplitTopLevel = false;
     JSON.stringify = ((value: unknown, replacer?: Parameters<typeof JSON.stringify>[1], space?: Parameters<typeof JSON.stringify>[2]) => {
       if (value && typeof value === "object" && (value as Partial<AnalysisIndex>).version === 1 && "files" in value && "build" in value) {
-        throw new Error("top-level index JSON.stringify should not be used");
+        expect(Object.keys((value as AnalysisIndex).functions)).toHaveLength(0);
+        sawSplitTopLevel = true;
       }
       return originalStringify(value, replacer, space);
     }) as typeof JSON.stringify;
     try {
-      await writeIndex(indexPath, minimalIndex());
+      await writeIndex(indexPath, index);
     } finally {
       JSON.stringify = originalStringify;
     }
 
     const text = await fs.readFile(indexPath, "utf8");
     expect(JSON.parse(text).version).toBe(1);
+    expect(sawSplitTopLevel).toBe(true);
   });
 
   it("stores functions in a sidecar and hydrates only functions needed for a symbol", async () => {

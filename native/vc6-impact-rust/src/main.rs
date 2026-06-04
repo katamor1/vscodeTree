@@ -26,6 +26,7 @@ struct FileSignature {
 struct SourceLocation {
     file: String,
     line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
 }
 
@@ -37,8 +38,11 @@ struct GlobalVariable {
     line: usize,
     declaration: String,
     is_extern: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     is_array: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pointer_level: Option<usize>,
 }
 
@@ -58,11 +62,14 @@ struct MacroDefinition {
 #[serde(rename_all = "camelCase")]
 struct StructMemberInfo {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     type_name: Option<String>,
     file: String,
     line: usize,
     declaration: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     is_array: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pointer_level: Option<usize>,
 }
 
@@ -83,8 +90,6 @@ struct BodyLine {
     line: usize,
     raw: String,
     masked: String,
-    identifiers: Vec<String>,
-    call_identifiers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -102,7 +107,9 @@ struct FunctionStructure {
 #[serde(rename_all = "camelCase")]
 struct UnresolvedEvidence {
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     function_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     variable_name: Option<String>,
     location: SourceLocation,
     evidence: String,
@@ -154,17 +161,20 @@ struct DecodeInfo {
 #[serde(rename_all = "camelCase")]
 struct VariableAccess {
     variable_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_kind: Option<String>,
     function_name: String,
     kind: String,
     location: SourceLocation,
     evidence: String,
     reasons: Vec<String>,
-    owner_name: Option<String>,
-    member_name: Option<String>,
+    #[serde(skip_serializing)]
     access_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     macro_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     expanded_evidence: Option<String>,
 }
 
@@ -197,6 +207,7 @@ struct FileAnalysis {
 #[serde(rename_all = "camelCase")]
 struct ParserDiagnostic {
     backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     severity: String,
     message: String,
@@ -247,7 +258,6 @@ struct ParameterMemberAccessTemplate {
     parameter_index: usize,
     member_path: Vec<String>,
     kind: String,
-    member_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -312,8 +322,6 @@ struct MemberExpression {
 
 struct ResolvedMemberExpression {
     access_target_name: Option<String>,
-    owner_name: Option<String>,
-    member_name: Option<String>,
     unresolved_kind: Option<String>,
     unresolved_name: Option<String>,
     unresolved_note: String,
@@ -812,6 +820,10 @@ fn analyze_many_legacy(
     let total_started = Instant::now();
     let worker_count = effective_worker_count(files.len(), options.workers);
     let mut metrics = HashMap::new();
+    metrics.insert("fileCount".to_string(), files.len() as u128);
+    metrics.insert("workerCount".to_string(), worker_count as u128);
+    metrics.insert("batchSize".to_string(), options.batch_size.max(1) as u128);
+    let mut peak_rss = current_rss_bytes().unwrap_or(0);
     let scan_started = Instant::now();
     let structures = scan_many(
         files,
@@ -825,6 +837,7 @@ fn analyze_many_legacy(
         "readMaskDeclarationScan".to_string(),
         scan_started.elapsed().as_millis(),
     );
+    peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
 
     let symbol_started = Instant::now();
     let context = build_native_context(&structures);
@@ -832,6 +845,27 @@ fn analyze_many_legacy(
         "symbolMap".to_string(),
         symbol_started.elapsed().as_millis(),
     );
+    metrics.insert(
+        "contextGlobalCount".to_string(),
+        context.global_names.len() as u128,
+    );
+    metrics.insert(
+        "contextFunctionNameCount".to_string(),
+        context.function_name_map.len() as u128,
+    );
+    metrics.insert(
+        "contextStructTypeCount".to_string(),
+        context.struct_types.len() as u128,
+    );
+    metrics.insert(
+        "contextGlobalTypeCount".to_string(),
+        context.global_types.len() as u128,
+    );
+    metrics.insert(
+        "contextMacroAliasCount".to_string(),
+        context.macro_aliases.len() as u128,
+    );
+    peak_rss = peak_rss.max(current_rss_bytes().unwrap_or(0));
 
     let access_started = Instant::now();
     let files = analyze_structures(structures, &context, worker_count)?;
@@ -843,6 +877,7 @@ fn analyze_many_legacy(
         "totalNative".to_string(),
         total_started.elapsed().as_millis(),
     );
+    metrics.insert("peakRssBytes".to_string(), peak_rss.max(current_rss_bytes().unwrap_or(0)));
 
     Ok(NativeAnalysisResult {
         files,
@@ -1461,7 +1496,6 @@ fn collect_parameter_member_access_templates(
             parameter_index,
             member_path,
             kind,
-            member_name: expression.member_path.last().cloned(),
         });
     }
 }
@@ -1619,7 +1653,7 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                     &mut access_keys,
                     VariableAccess {
                         variable_name: target_name.clone(),
-                        target_name: Some(target_name.clone()),
+                        target_name: None,
                         target_kind: Some("member".to_string()),
                         function_name: func.name.clone(),
                         kind,
@@ -1627,8 +1661,6 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                         evidence: raw.trim().to_string(),
                         expanded_evidence: expanded_evidence(raw, &masked),
                         reasons: reasons.clone(),
-                        owner_name: resolved.owner_name.clone(),
-                        member_name: resolved.member_name.clone(),
                         access_expression: Some(expression.expression.clone()),
                         macro_names: macro_names_option(&macro_names),
                     },
@@ -1672,7 +1704,7 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                 &mut access_keys,
                 VariableAccess {
                     variable_name: variable_name.clone(),
-                    target_name: Some(variable_name.clone()),
+                    target_name: None,
                     target_kind: Some("global".to_string()),
                     function_name: func.name.clone(),
                     kind,
@@ -1680,8 +1712,6 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                     evidence: raw.trim().to_string(),
                     expanded_evidence: expanded_evidence(raw, &masked),
                     reasons: reasons.clone(),
-                    owner_name: None,
-                    member_name: None,
                     access_expression: None,
                     macro_names: macro_names_option(&macro_names),
                 },
@@ -1699,7 +1729,12 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
             }
         }
 
-        for direct_call in direct_calls(&masked) {
+        let direct_calls = if masked.contains('(') {
+            direct_calls(&masked)
+        } else {
+            Vec::new()
+        };
+        for direct_call in &direct_calls {
             let Some(functions) = context.function_name_map.get(&direct_call.name) else {
                 continue;
             };
@@ -1730,7 +1765,7 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                         &mut access_keys,
                         VariableAccess {
                             variable_name: target_name.clone(),
-                            target_name: Some(target_name.clone()),
+                            target_name: None,
                             target_kind: Some("member".to_string()),
                             function_name: func.name.clone(),
                             kind: template.kind.clone(),
@@ -1738,8 +1773,6 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                             evidence: raw.trim().to_string(),
                             expanded_evidence: expanded_evidence(raw, &masked),
                             reasons: vec!["call-argument-alias".to_string()],
-                            owner_name: Some(owner_name),
-                            member_name: template.member_name.clone(),
                             access_expression: Some(argument.trim().to_string()),
                             macro_names: macro_names_option(&macro_names),
                         },
@@ -1748,8 +1781,8 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
             }
         }
 
-        for simple_name in call_identifiers(&masked) {
-            if let Some(functions) = context.function_name_map.get(&simple_name) {
+        for direct_call in direct_calls {
+            if let Some(functions) = context.function_name_map.get(&direct_call.name) {
                 for function_name in functions {
                     if function_name != &func.name {
                         calls.insert(function_name.clone());
@@ -2342,8 +2375,6 @@ fn resolve_member_expression(
         if !member_path_exists(type_info, &expression.member_path, &context.struct_types) {
             return Some(ResolvedMemberExpression {
                 access_target_name: None,
-                owner_name: Some(owner_name),
-                member_name,
                 unresolved_kind: Some("unknown-member-access".to_string()),
                 unresolved_name: Some(target_name),
                 unresolved_note: "global構造体のメンバ名を型表から確認できません。".to_string(),
@@ -2351,8 +2382,6 @@ fn resolve_member_expression(
         }
         return Some(ResolvedMemberExpression {
             access_target_name: Some(target_name),
-            owner_name: Some(owner_name),
-            member_name,
             unresolved_kind: None,
             unresolved_name: None,
             unresolved_note: String::new(),
@@ -2362,8 +2391,6 @@ fn resolve_member_expression(
     if ambiguous_aliases.contains(&expression.owner_name) {
         return Some(ResolvedMemberExpression {
             access_target_name: None,
-            owner_name: Some(expression.owner_name.clone()),
-            member_name,
             unresolved_kind: Some("ambiguous-member-alias".to_string()),
             unresolved_name: Some(canonical_member_name(
                 &expression.owner_name,
@@ -2384,8 +2411,6 @@ fn resolve_member_expression(
                 separator,
                 expression,
             )),
-            owner_name: Some(alias.owner_name.clone()),
-            member_name,
             unresolved_kind: None,
             unresolved_name: None,
             unresolved_note: String::new(),
@@ -2405,8 +2430,6 @@ fn resolve_member_expression(
                     &expression.connectors,
                     &expression.member_path,
                 )),
-                owner_name: Some(owner_name),
-                member_name,
                 unresolved_kind: None,
                 unresolved_name: None,
                 unresolved_note: String::new(),
@@ -2418,8 +2441,6 @@ fn resolve_member_expression(
         let target = canonical_type_member_name(&local_type.type_name, &expression.member_path);
         return Some(ResolvedMemberExpression {
             access_target_name: Some(target.clone()),
-            owner_name: Some(expression.owner_name.clone()),
-            member_name,
             unresolved_kind: Some("unknown-member-access".to_string()),
             unresolved_name: Some(target),
             unresolved_note: "型は推定できましたが、ポインタ引数または局所ポインタの参照先globalを一意に断定していません。".to_string(),
@@ -2432,8 +2453,6 @@ fn resolve_member_expression(
     {
         return Some(ResolvedMemberExpression {
             access_target_name: None,
-            owner_name: Some(expression.owner_name.clone()),
-            member_name,
             unresolved_kind: Some("unknown-member-access".to_string()),
             unresolved_name: Some(canonical_member_name(
                 &expression.owner_name,
@@ -2669,11 +2688,11 @@ fn word_positions(line: &str, word: &str) -> Vec<usize> {
     positions
 }
 
-fn location(file: &str, line: usize, raw: &str) -> SourceLocation {
+fn location(file: &str, line: usize, _raw: &str) -> SourceLocation {
     SourceLocation {
         file: file.to_string(),
         line,
-        text: Some(raw.trim().to_string()),
+        text: None,
     }
 }
 
@@ -3081,7 +3100,7 @@ fn parse_macros(
                     location: SourceLocation {
                         file: file.to_string(),
                         line: index + 1,
-                        text: Some(raw.clone()),
+                        text: None,
                     },
                     evidence: raw,
                     note: "function-like macro is not expanded by the Rust sidecar.".to_string(),
@@ -3533,8 +3552,6 @@ fn body_line(line: usize, raw: &str, masked: &str) -> BodyLine {
         line,
         raw: raw.to_string(),
         masked: masked.to_string(),
-        identifiers: identifiers(masked),
-        call_identifiers: call_identifiers(masked),
     }
 }
 
@@ -3563,36 +3580,6 @@ fn identifiers(line: &str) -> Vec<String> {
             let value = line[start..index].to_string();
             if seen.insert(value.clone()) {
                 result.push(value);
-            }
-        } else {
-            index += 1;
-        }
-    }
-    result
-}
-
-fn call_identifiers(line: &str) -> Vec<String> {
-    let control = ["if", "for", "while", "switch", "catch", "return", "sizeof"];
-    let bytes = line.as_bytes();
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if is_ident_start(bytes[index]) {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && is_ident_continue(bytes[index]) {
-                index += 1;
-            }
-            let value = &line[start..index];
-            let mut lookahead = index;
-            skip_ascii_space(line, &mut lookahead);
-            if lookahead < bytes.len()
-                && bytes[lookahead] == b'('
-                && !control.contains(&value)
-                && seen.insert(value.to_string())
-            {
-                result.push(value.to_string());
             }
         } else {
             index += 1;
@@ -4847,7 +4834,13 @@ mod tests {
         let mut in_block = false;
         let masked =
             mask_comments_and_strings("CallMe(g_counter); // OtherCall(g_counter)", &mut in_block);
-        assert_eq!(call_identifiers(&masked), vec!["CallMe".to_string()]);
+        assert_eq!(
+            direct_calls(&masked)
+                .into_iter()
+                .map(|call| call.name)
+                .collect::<Vec<_>>(),
+            vec!["CallMe".to_string()]
+        );
         let masked = mask_comments_and_strings("\"g_counter\" g_counter++;", &mut in_block);
         assert_eq!(identifiers(&masked), vec!["g_counter".to_string()]);
         let classified = classify_access("g_counter++;", "g_counter");

@@ -224,8 +224,7 @@ export async function createIndexFunctionWriter(indexPath: string): Promise<Inde
       if (closed) {
         throw new Error("function sidecar writer is already closed");
       }
-      await writeJsonValue(stream, func);
-      await writeChunk(stream, "\n");
+      await writeChunk(stream, `${JSON.stringify(func)}\n`);
     },
     async commit(): Promise<void> {
       if (!closed) {
@@ -448,8 +447,7 @@ async function writeFunctionsJsonl(file: string, functions: FunctionInfo[]): Pro
   const stream = nodeFs.createWriteStream(tempPath, { encoding: "utf8" });
   try {
     for (const func of functions.sort((left, right) => left.name.localeCompare(right.name))) {
-      await writeJsonValue(stream, func);
-      await writeChunk(stream, "\n");
+      await writeChunk(stream, `${JSON.stringify(func)}\n`);
     }
     await endStream(stream);
     await fs.rename(tempPath, file);
@@ -462,14 +460,10 @@ async function writeFunctionsJsonl(file: string, functions: FunctionInfo[]): Pro
 
 async function writeCompactJsonFile(file: string, value: unknown): Promise<void> {
   const tempPath = tempWritePath(file);
-  const stream = nodeFs.createWriteStream(tempPath, { encoding: "utf8" });
   try {
-    await writeJsonValue(stream, value);
-    await writeChunk(stream, "\n");
-    await endStream(stream);
+    await fs.writeFile(tempPath, `${JSON.stringify(value)}\n`, "utf8");
     await fs.rename(tempPath, file);
   } catch (error) {
-    stream.destroy();
     await fs.rm(tempPath, { force: true }).catch(() => undefined);
     throw error;
   }
@@ -491,43 +485,6 @@ export async function readIndexForSymbol(indexPath: string, symbolName: string, 
     functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames, { stripAccesses }),
     files: unresolvedFilesFromStoredIndex(index)
   };
-}
-
-async function writeJsonValue(stream: nodeFs.WriteStream, value: unknown): Promise<void> {
-  if (value === undefined) {
-    await writeChunk(stream, "null");
-    return;
-  }
-  if (value === null || typeof value !== "object") {
-    await writeChunk(stream, JSON.stringify(value));
-    return;
-  }
-  if (Array.isArray(value)) {
-    await writeChunk(stream, "[");
-    for (let index = 0; index < value.length; index += 1) {
-      if (index > 0) {
-        await writeChunk(stream, ",");
-      }
-      await writeJsonValue(stream, value[index]);
-    }
-    await writeChunk(stream, "]");
-    return;
-  }
-  await writeChunk(stream, "{");
-  let first = true;
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (child === undefined) {
-      continue;
-    }
-    if (!first) {
-      await writeChunk(stream, ",");
-    }
-    await writeChunk(stream, JSON.stringify(key));
-    await writeChunk(stream, ":");
-    await writeJsonValue(stream, child);
-    first = false;
-  }
-  await writeChunk(stream, "}");
 }
 
 async function writeChunk(stream: nodeFs.WriteStream, chunk: string): Promise<void> {

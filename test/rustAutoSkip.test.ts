@@ -5,6 +5,7 @@ import {
   RustSidecarExecutionError,
   resolveRustSidecarTimeoutMs,
   runRustAnalyzeManyToOutputWithAutoSkip,
+  shouldUseInMemoryRustAnalysis,
   type RustAnalyzeManyRunner,
   type RustSidecarOutputFile
 } from "../src/analysis/rust/rustSourceScanner";
@@ -17,13 +18,25 @@ describe("Rust native auto-skip fallback", () => {
     expect(resolveRustSidecarTimeoutMs(1234.9, 200)).toBe(1234);
   });
 
+  it("uses one-pass in-memory analysis only for many small source files", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-inmemory-"));
+    const first = path.join(tempRoot, "one.cpp");
+    const second = path.join(tempRoot, "two.cpp");
+    await fs.writeFile(first, "int a;\n", "utf8");
+    await fs.writeFile(second, "int b;\n", "utf8");
+
+    await expect(shouldUseInMemoryRustAnalysis([first, second], { minFiles: 2, maxTotalBytes: 32 })).resolves.toBe(true);
+    await expect(shouldUseInMemoryRustAnalysis([first, second], { minFiles: 3, maxTotalBytes: 32 })).resolves.toBe(false);
+    await expect(shouldUseInMemoryRustAnalysis([first, second], { minFiles: 2, maxTotalBytes: 4 })).resolves.toBe(false);
+  });
+
   it("reruns in safe mode, skips the file identified by the progress log, and continues", async () => {
     const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-autoskip-"));
     const goodA = path.join(tempRoot, "good-a.cpp").replace(/\\/g, "/");
     const bad = path.join(tempRoot, "bad.cpp").replace(/\\/g, "/");
     const goodB = path.join(tempRoot, "good-b.cpp").replace(/\\/g, "/");
     const includePath = path.join(tempRoot, "include").replace(/\\/g, "/");
-    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; timeoutMs?: number; includePaths?: string[]; progressLogPath?: string }> = [];
+    const calls: Array<{ files: string[]; maxIndexWorkers: number; maxNativeBatchFiles: number; timeoutMs?: number; includePaths?: string[]; progressLogPath?: string; preferInMemory?: boolean }> = [];
     const runner: RustAnalyzeManyRunner = async (args) => {
       calls.push({
         files: args.files,
@@ -31,7 +44,8 @@ describe("Rust native auto-skip fallback", () => {
         maxNativeBatchFiles: args.maxNativeBatchFiles,
         timeoutMs: args.timeoutMs,
         includePaths: args.includePaths,
-        progressLogPath: args.progressLogPath
+        progressLogPath: args.progressLogPath,
+        preferInMemory: args.preferInMemory
       });
       if (!args.progressLogPath) {
         throw new RustSidecarExecutionError("memory allocation of 10737418240 bytes failed", {
@@ -69,12 +83,13 @@ describe("Rust native auto-skip fallback", () => {
       includePaths: [includePath],
       diagnosticsDir: path.join(tempRoot, "native-diagnostics"),
       maxSkippedFiles: 2,
+      preferInMemory: true,
       runner
     });
 
-    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4, timeoutMs: 0, includePaths: [includePath] });
-    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath] });
-    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath] });
+    expect(calls[0]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 8, maxNativeBatchFiles: 4, timeoutMs: 0, includePaths: [includePath], preferInMemory: true });
+    expect(calls[1]).toMatchObject({ files: [goodA, bad, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath], preferInMemory: false });
+    expect(calls[2]).toMatchObject({ files: [goodA, goodB], maxIndexWorkers: 1, maxNativeBatchFiles: 1, timeoutMs: 0, includePaths: [includePath], preferInMemory: false });
     expect(result.skippedFiles).toEqual([
       expect.objectContaining({
         file: bad,
