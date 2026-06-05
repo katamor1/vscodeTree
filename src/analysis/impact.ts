@@ -13,6 +13,7 @@ import type {
   UnresolvedEvidence,
   VariableAccess
 } from "./types";
+import { isFunctionTopologyUnresolved } from "./functionImpactPolicy";
 
 export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth = 4): ImpactResult {
   const globals = index.globals[symbolName] ?? [];
@@ -282,6 +283,9 @@ function unresolvedRelevant(
   functions: FunctionInfo[],
   macroTargets: Set<string>
 ): boolean {
+  if (symbolKind === "function") {
+    return isFunctionTopologyUnresolved(item.kind) && functions.some((func) => func.name === item.functionName);
+  }
   if (item.variableName === symbolName) {
     return true;
   }
@@ -290,12 +294,6 @@ function unresolvedRelevant(
   }
   if (symbolKind === "macro") {
     return macroTargets.has(item.variableName ?? "");
-  }
-  if (symbolKind === "function" && item.functionName === symbolName) {
-    return true;
-  }
-  if (symbolKind === "function") {
-    return functions.some((func) => func.name === item.functionName);
   }
   return false;
 }

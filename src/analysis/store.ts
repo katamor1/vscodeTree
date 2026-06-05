@@ -2,6 +2,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AnalysisIndex, FileAnalysis, FunctionInfo } from "./types";
+import { isFunctionTopologyUnresolved } from "./functionImpactPolicy";
 import { normalizePath, sanitizeFileName } from "./pathUtils";
 
 const ARTIFACT_RELATIVE_ROOT = ".vscode/vc6-impact-review";
@@ -23,7 +24,7 @@ export interface IndexFunctionWriter {
 }
 
 interface ReadFunctionsOptions {
-  stripAccesses?: boolean;
+  stripDataFlow?: boolean;
 }
 
 export function resolveArtifactRoot(workspaceRoot: string): string {
@@ -416,7 +417,9 @@ function readFunctionLine(
   }
   const func = JSON.parse(line) as FunctionInfo;
   if (names.has(func.name)) {
-    functions[func.name] = options.stripAccesses ? { ...func, accesses: [] } : func;
+    functions[func.name] = options.stripDataFlow
+      ? { ...func, accesses: [], unresolved: func.unresolved.filter((item) => isFunctionTopologyUnresolved(item.kind)) }
+      : func;
   }
 }
 
@@ -479,10 +482,10 @@ export async function readIndexForSymbol(indexPath: string, symbolName: string, 
     return index;
   }
   const functionNames = functionNamesForSymbol(index, symbolName, maxDepth);
-  const stripAccesses = isFunctionSymbol(index, symbolName);
+  const stripDataFlow = isFunctionSymbol(index, symbolName);
   return {
     ...index,
-    functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames, { stripAccesses }),
+    functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames, { stripDataFlow }),
     files: unresolvedFilesFromStoredIndex(index)
   };
 }

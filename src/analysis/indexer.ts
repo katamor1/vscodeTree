@@ -33,7 +33,7 @@ export async function buildFullIndex(options: BuildOptions): Promise<AnalysisInd
   const phaseDurationsMs: Record<string, number> = {};
   const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release", options.sourceEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -90,7 +90,7 @@ export async function buildFullIndexToStorage(options: BuildOptions, indexPath: 
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release", options.sourceEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -123,7 +123,7 @@ export async function updateIndex(
   const phaseDurationsMs: Record<string, number> = {};
   const parserEngine = options.parserEngine ?? "rust";
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release", options.sourceEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);
@@ -209,7 +209,7 @@ export async function updateIndexToStorage(
   const started = Date.now();
   const phaseDurationsMs: Record<string, number> = {};
   let phaseStarted = Date.now();
-  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release");
+  const project = await parseVc6Project(options.workspaceRoot, options.projectFile, options.excludeGlobs, options.projectEncoding ?? "auto", options.projectConfiguration ?? "Release", options.sourceEncoding ?? "auto");
   phaseDurationsMs.projectParse = elapsedSince(phaseStarted);
   phaseStarted = Date.now();
   const threadMap = await readThreadMap(options.workspaceRoot, options.threadMapFile);

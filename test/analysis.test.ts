@@ -80,6 +80,11 @@ describe("Impact index", () => {
     expect(impact.accesses.some((access) => access.kind === "write" && access.functionName === "WorkerThread")).toBe(true);
     const hydratedFunction = await readIndexForSymbol(indexPath, "WorkerThread");
     expect(hydratedFunction?.functions.WorkerThread.accesses).toEqual([]);
+    expect(
+      Object.values(hydratedFunction?.functions ?? {}).flatMap((func) => func.unresolved.map((item) => item.kind))
+    ).toEqual([]);
+    const hydratedFunctionPointer = await readIndexForSymbol(indexPath, "DevicePump");
+    expect(hydratedFunctionPointer?.functions.DevicePump.unresolved.map((item) => item.kind)).toEqual(["function-pointer"]);
   });
 
   it("rebuilds a split production index when the function sidecar is missing", async () => {
@@ -467,6 +472,35 @@ describe("Impact index", () => {
     expect(index.globals.g_release?.length).toBe(1);
     expect(index.globals.g_wrong).toBeUndefined();
   }, 60000);
+
+  it.each(["typescript", "rust"] as const)("indexes EXTERN macro globals from included headers omitted from the DSP with %s backend", async (parserEngine) => {
+    const fixture = await createExternHeaderFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: fixture.root,
+      projectFile: fixture.projectFile,
+      parserEngine,
+      projectConfiguration: "Release",
+      maxIndexWorkers: 1
+    });
+    const impact = buildImpact(index, "g_numptr");
+
+    expect(index.projectFiles.map((file) => path.basename(file)).sort()).toEqual(["gbl_val001.h", "main.c", "worker.c"]);
+    expect(index.globals.g_numptr).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "g_numptr",
+          file: path.join(fixture.root, "src", "gbl_val001.h").replace(/\\/g, "/")
+        })
+      ])
+    );
+    expect(impact.symbolKind).toBe("global");
+    expect(impact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ functionName: "MainEntry", kind: "write", variableName: "g_numptr" }),
+        expect.objectContaining({ functionName: "WorkerEntry", kind: "read", variableName: "g_numptr" })
+      ])
+    );
+  }, 60000);
 });
 
 describe("function impact", () => {
@@ -480,6 +514,7 @@ describe("function impact", () => {
     expect(impact.functions.every((func) => func.accesses.length === 0)).toBe(true);
     expect(impact.threadContexts.map((context) => context.functionName)).toContain("WorkerThread");
     expect(impact.accesses).toEqual([]);
+    expect(impact.unresolved).toEqual([]);
     expect(impact.graph.edges).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ from: "function:WorkerThread", label: "calls", to: "function:CommonUpdate" })
@@ -488,6 +523,19 @@ describe("function impact", () => {
     expect(report).toContain("function `CommonUpdate`");
     expect(report).toContain("関数調査では変数アクセスを展開しません");
     expect(report).not.toContain("READ `g_counter`");
+    expect(report).not.toContain("address-taken");
+  });
+
+  it("keeps function-pointer unresolved evidence but not variable-chain unresolved evidence for function impact", async () => {
+    const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
+    const impact = buildImpact(index, "DevicePump", 1);
+    const report = renderMarkdownReport(index, impact);
+
+    expect(impact.symbolKind).toBe("function");
+    expect(impact.accesses).toEqual([]);
+    expect(impact.unresolved.map((item) => item.kind)).toEqual(["function-pointer"]);
+    expect(report).toContain("function-pointer");
+    expect(report).not.toContain("address-taken");
   });
 });
 
@@ -612,6 +660,68 @@ async function createIncludeOrderFixture(): Promise<{ root: string; projectFile:
       "#ifdef FEATURE_FLAG",
       "void EnabledAfterSecondInclude(void) { g_release++; }",
       "#endif",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  return { root, projectFile };
+}
+
+async function createExternHeaderFixture(): Promise<{ root: string; projectFile: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-extern-header-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  const projectFile = path.join(root, "sample.dsw");
+  await fs.writeFile(projectFile, 'Project: "sample"=".\\sample.dsp" - Package Owner=<4>\r\n', "utf8");
+  await fs.writeFile(
+    path.join(root, "sample.dsp"),
+    [
+      '# Microsoft Developer Studio Project File - Name="sample" - Package Owner=<4>',
+      '# Name "sample - Win32 Release"',
+      '# ADD CPP /nologo /W3 /I ".\\src" /D "WIN32" /D "NDEBUG" /c',
+      '# Begin Source File',
+      'SOURCE=.\\src\\main.c',
+      '# End Source File',
+      '# Begin Source File',
+      'SOURCE=.\\src\\worker.c',
+      '# End Source File',
+      ''
+    ].join("\r\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "gbl_val001.h"),
+    [
+      "#undef EXTERN",
+      "#ifndef MAIN",
+      "#define EXTERN extern",
+      "#else",
+      "#define EXTERN",
+      "#endif",
+      "",
+      "EXTERN int *g_numptr;",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "main.c"),
+    [
+      "#define MAIN",
+      '#include "gbl_val001.h"',
+      "void MainEntry(void) {",
+      "  g_numptr = 0;",
+      "}",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "worker.c"),
+    [
+      '#include "gbl_val001.h"',
+      "int WorkerEntry(void) {",
+      "  return g_numptr ? 1 : 0;",
+      "}",
       ""
     ].join("\n"),
     "utf8"

@@ -2,10 +2,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { mapWithConcurrency } from "./limitedConcurrency";
 import { matchesExcluded, normalizePath, resolveMaybeRelative } from "./pathUtils";
+import { applyConditionalCompilationWithIncludes, type ConditionalIncludeDirective, type ConditionalIncludeFile } from "./preprocessor";
 import { readTextFile, type TextEncoding } from "./textEncoding";
 import type { Vc6ProjectInfo } from "./types";
 
-const SOURCE_EXTENSIONS = new Set([".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".inl"]);
+const SOURCE_EXTENSIONS = new Set([".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl"]);
 const FILE_EXISTS_CONCURRENCY = 64;
 
 export async function parseVc6Project(
@@ -13,7 +14,8 @@ export async function parseVc6Project(
   projectFile: string,
   excludeGlobs: string[] = [],
   projectEncoding: TextEncoding = "auto",
-  projectConfiguration = "Release"
+  projectConfiguration = "Release",
+  sourceEncoding: TextEncoding = "auto"
 ): Promise<Vc6ProjectInfo> {
   const resolvedProjectFile = resolveMaybeRelative(workspaceRoot, projectFile);
   const ext = path.extname(resolvedProjectFile).toLowerCase();
@@ -33,6 +35,14 @@ export async function parseVc6Project(
     dsp.includePaths.forEach((includePath) => includePaths.add(includePath));
     dsp.macros.forEach((macro) => macros.add(macro));
   }
+  const expandedSourceFiles = await discoverIncludedSourceFiles(
+    [...sourceFiles],
+    [...includePaths],
+    [...macros],
+    excludeGlobs,
+    sourceEncoding
+  );
+  expandedSourceFiles.forEach((file) => sourceFiles.add(file));
 
   return {
     projectFile: resolvedProjectFile,
@@ -41,6 +51,188 @@ export async function parseVc6Project(
     includePaths: [...includePaths].sort(),
     macros: [...macros].sort()
   };
+}
+
+async function discoverIncludedSourceFiles(
+  initialFiles: string[],
+  includePaths: string[],
+  macros: string[],
+  excludeGlobs: string[],
+  sourceEncoding: TextEncoding
+): Promise<string[]> {
+  const discovered = new Set(initialFiles.map((file) => normalizePath(file)));
+  let queue = [...discovered];
+  while (queue.length > 0) {
+    const batch = queue.splice(0, FILE_EXISTS_CONCURRENCY);
+    const nested = await mapWithConcurrency(batch, FILE_EXISTS_CONCURRENCY, async (file) => {
+      const includes = await readActiveIncludeDirectives(file, includePaths, macros, sourceEncoding);
+      const resolved: string[] = [];
+      for (const include of includes) {
+        const candidate = await resolveIncludedSource(file, include, includePaths, excludeGlobs);
+        if (candidate && !discovered.has(candidate)) {
+          discovered.add(candidate);
+          resolved.push(candidate);
+        }
+      }
+      return resolved;
+    });
+    queue.push(...nested.flat());
+  }
+  return [...discovered].sort();
+}
+
+interface IncludeDirective {
+  path: string;
+  quoted: boolean;
+}
+
+async function readActiveIncludeDirectives(
+  file: string,
+  includePaths: string[],
+  macros: string[],
+  sourceEncoding: TextEncoding
+): Promise<IncludeDirective[]> {
+  try {
+    const text = (await readTextFile(file, sourceEncoding)).text;
+    const rawLines = text.split(/\r?\n/);
+    const maskedLines = maskLines(rawLines);
+    if (!hasConditionalDirectives(maskedLines)) {
+      return includeDirectivesFromActiveLines(rawLines, maskedLines);
+    }
+    const activeLines = await applyConditionalCompilationWithIncludes(rawLines, maskedLines, macros, {
+      file,
+      readIncludeFile: (include, fromFile) => readConditionalIncludeFile(include, fromFile, includePaths, sourceEncoding)
+    });
+    return includeDirectivesFromActiveLines(rawLines, activeLines);
+  } catch {
+    return [];
+  }
+}
+
+function includeDirectivesFromActiveLines(rawLines: string[], activeLines: string[]): IncludeDirective[] {
+  return rawLines.flatMap((line, index) => {
+    if (!isIncludeDirectiveLine(activeLines[index] ?? "")) {
+      return [];
+    }
+    const include = parseIncludeDirective(line);
+    return include ? [include] : [];
+  });
+}
+
+function hasConditionalDirectives(maskedLines: string[]): boolean {
+  return maskedLines.some((line) => /^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b/i.test(line));
+}
+
+function isIncludeDirectiveLine(maskedLine: string): boolean {
+  return /^\s*#\s*include\b/i.test(maskedLine);
+}
+
+async function readConditionalIncludeFile(
+  include: ConditionalIncludeDirective,
+  fromFile: string | undefined,
+  includePaths: string[],
+  sourceEncoding: TextEncoding
+): Promise<ConditionalIncludeFile | undefined> {
+  for (const candidate of includeCandidates(include, fromFile, includePaths)) {
+    try {
+      const text = (await readTextFile(candidate, sourceEncoding)).text;
+      const rawLines = text.split(/\r?\n/);
+      return { file: candidate, rawLines, maskedLines: maskLines(rawLines) };
+    } catch {
+      // Partial VC6 workspaces often miss SDK or generated include files.
+    }
+  }
+  return undefined;
+}
+
+async function resolveIncludedSource(
+  fromFile: string,
+  include: IncludeDirective,
+  includePaths: string[],
+  excludeGlobs: string[]
+): Promise<string | undefined> {
+  const candidates: string[] = [];
+  if (include.quoted) {
+    candidates.push(resolveMaybeRelative(path.dirname(fromFile), include.path));
+  }
+  candidates.push(...includePaths.map((includePath) => resolveMaybeRelative(includePath, include.path)));
+  for (const candidate of candidates) {
+    if (!SOURCE_EXTENSIONS.has(path.extname(candidate).toLowerCase()) || matchesExcluded(candidate, excludeGlobs)) {
+      continue;
+    }
+    if (await fileExists(candidate)) {
+      return normalizePath(candidate);
+    }
+  }
+  return undefined;
+}
+
+function includeCandidates(
+  include: IncludeDirective | ConditionalIncludeDirective,
+  fromFile: string | undefined,
+  includePaths: string[]
+): string[] {
+  const candidates: string[] = [];
+  if (include.quoted && fromFile) {
+    candidates.push(resolveMaybeRelative(path.dirname(fromFile), include.path));
+  }
+  candidates.push(...includePaths.map((includePath) => resolveMaybeRelative(includePath, include.path)));
+  return [...new Set(candidates)];
+}
+
+function parseIncludeDirective(line: string): IncludeDirective | undefined {
+  const match = line.match(/^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)/);
+  const includePath = match?.[1] ?? match?.[2];
+  return includePath ? { path: includePath.trim(), quoted: Boolean(match?.[1]) } : undefined;
+}
+
+function maskLines(lines: string[]): string[] {
+  let inBlock = false;
+  return lines.map((line) => {
+    let output = "";
+    let index = 0;
+    let inString: string | undefined;
+    while (index < line.length) {
+      const two = line.slice(index, index + 2);
+      if (inBlock) {
+        if (two === "*/") {
+          inBlock = false;
+          output += "  ";
+          index += 2;
+        } else {
+          output += " ";
+          index += 1;
+        }
+      } else if (inString) {
+        if (line[index] === "\\" && index + 1 < line.length) {
+          output += "  ";
+          index += 2;
+        } else if (line[index] === inString) {
+          inString = undefined;
+          output += " ";
+          index += 1;
+        } else {
+          output += " ";
+          index += 1;
+        }
+      } else if (two === "/*") {
+        inBlock = true;
+        output += "  ";
+        index += 2;
+      } else if (two === "//") {
+        output += " ".repeat(line.length - index);
+        break;
+      } else if (line[index] === "\"" || line[index] === "'") {
+        inString = line[index];
+        output += " ";
+        index += 1;
+      } else {
+        output += line[index];
+        index += 1;
+      }
+    }
+    return output;
+  });
 }
 
 export async function findDefaultProjectFile(workspaceRoot: string): Promise<string | undefined> {
