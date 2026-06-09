@@ -13,7 +13,7 @@ import type {
   UnresolvedEvidence,
   VariableAccess
 } from "./types";
-import { isFunctionTopologyUnresolved } from "./functionImpactPolicy";
+import { collectDirectionalFunctionNeighborhood, functionCallEdgeKey, isFunctionTopologyUnresolved, type FunctionNeighborhood } from "./functionImpactPolicy";
 
 export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth = 4): ImpactResult {
   const globals = index.globals[symbolName] ?? [];
@@ -30,8 +30,11 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
           ? "function"
           : "unknown";
   const macroTargets = new Set(macros.map((macro) => macro.targetName));
+  const functionNeighborhood = symbolKind === "function" && selectedFunction
+    ? collectDirectionalFunctionNeighborhood(index, selectedFunction.name, maxDepth)
+    : undefined;
   const rawFunctions = symbolKind === "function" && selectedFunction
-    ? collectFunctionNeighborhood(index, selectedFunction.name, maxDepth)
+    ? functionsFromNeighborhood(index, functionNeighborhood!)
     : symbolKind === "macro"
       ? functionsTouchingMacro(index, symbolName, macroTargets)
       : functionsTouchingSymbol(index, symbolName);
@@ -59,7 +62,7 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions, macroTargets))
   );
   const risks = buildRisks(symbolName, symbolKind, accesses, threadContexts, unresolved);
-  const graph = buildGraph(symbolName, symbolKind, globals, members, macros, functions, accesses, threadContexts, risks, unresolved);
+  const graph = buildGraph(symbolName, symbolKind, globals, members, macros, functions, accesses, threadContexts, risks, unresolved, functionNeighborhood?.callEdges);
 
   return {
     symbolName,
@@ -92,20 +95,8 @@ function functionsTouchingMacro(index: AnalysisIndex, macroName: string, targetN
     .sort(byFunctionName);
 }
 
-function collectFunctionNeighborhood(index: AnalysisIndex, functionName: string, maxDepth: number): FunctionInfo[] {
-  const visited = new Set<string>();
-  const queue: Array<{ name: string; depth: number }> = [{ name: functionName, depth: 0 }];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (visited.has(current.name) || current.depth > maxDepth) {
-      continue;
-    }
-    visited.add(current.name);
-    for (const next of [...(index.callGraph[current.name] ?? []), ...(index.calledBy[current.name] ?? [])]) {
-      queue.push({ name: next, depth: current.depth + 1 });
-    }
-  }
-  return [...visited]
+function functionsFromNeighborhood(index: AnalysisIndex, neighborhood: FunctionNeighborhood): FunctionInfo[] {
+  return [...neighborhood.names]
     .map((name) => index.functions[name])
     .filter((func): func is FunctionInfo => Boolean(func))
     .sort(byFunctionName);
@@ -195,7 +186,8 @@ function buildGraph(
   accesses: VariableAccess[],
   threadContexts: ThreadReachability[],
   risks: RiskCandidate[],
-  unresolved: UnresolvedEvidence[]
+  unresolved: UnresolvedEvidence[],
+  allowedFunctionCallEdges?: Set<string>
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
@@ -241,7 +233,10 @@ function buildGraph(
         if (!functionNames.has(called)) {
           continue;
         }
-        const edgeKey = `${func.name}->${called}`;
+        const edgeKey = functionCallEdgeKey(func.name, called);
+        if (allowedFunctionCallEdges && !allowedFunctionCallEdges.has(edgeKey)) {
+          continue;
+        }
         if (seenCallEdges.has(edgeKey)) {
           continue;
         }

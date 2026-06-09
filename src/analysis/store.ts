@@ -2,7 +2,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AnalysisIndex, FileAnalysis, FunctionInfo } from "./types";
-import { isFunctionTopologyUnresolved } from "./functionImpactPolicy";
+import { collectDirectionalFunctionNeighborhood, isFunctionTopologyUnresolved } from "./functionImpactPolicy";
 import { normalizePath, sanitizeFileName } from "./pathUtils";
 
 const ARTIFACT_RELATIVE_ROOT = ".vscode/vc6-impact-review";
@@ -335,7 +335,7 @@ function functionNamesForSymbol(index: AnalysisIndex, symbolName: string, maxDep
   const names = new Set<string>();
   const macros = index.macroAliases?.[symbolName] ?? [];
   if (isFunctionSymbol(index, symbolName)) {
-    return collectFunctionNeighborhoodNames(index, symbolName, maxDepth);
+    return collectDirectionalFunctionNeighborhood(index, symbolName, maxDepth).names;
   }
   for (const name of index.accessIndex?.[symbolName] ?? []) {
     names.add(name);
@@ -353,22 +353,6 @@ function functionNamesForSymbol(index: AnalysisIndex, symbolName: string, maxDep
 
 function isFunctionSymbol(index: AnalysisIndex, symbolName: string): boolean {
   return Boolean(index.callGraph[symbolName] || index.calledBy[symbolName]);
-}
-
-function collectFunctionNeighborhoodNames(index: AnalysisIndex, functionName: string, maxDepth: number): Set<string> {
-  const visited = new Set<string>();
-  const queue: Array<{ name: string; depth: number }> = [{ name: functionName, depth: 0 }];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (visited.has(current.name) || current.depth > maxDepth) {
-      continue;
-    }
-    visited.add(current.name);
-    for (const next of [...(index.callGraph[current.name] ?? []), ...(index.calledBy[current.name] ?? [])]) {
-      queue.push({ name: next, depth: current.depth + 1 });
-    }
-  }
-  return visited;
 }
 
 async function readFunctionsByName(

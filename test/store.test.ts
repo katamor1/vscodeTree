@@ -155,6 +155,68 @@ describe("artifact storage policy", () => {
     expect(Object.keys(hydrated?.functions ?? {})).toEqual(["TouchCounter"]);
   });
 
+  it("hydrates function symbols without reversing caller and callee traversal directions", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    const functionNames = [
+      "Target",
+      "Caller",
+      "GrandCaller",
+      "CallerOnlyCallee",
+      "Callee",
+      "GrandCallee",
+      "CalleeOtherCaller"
+    ];
+    for (const name of functionNames) {
+      index.functions[name] = {
+        name,
+        file: "C:/tmp/project/main.cpp",
+        startLine: 1,
+        endLine: 1,
+        signature: `void ${name}(void)`,
+        calls: [],
+        accesses: [],
+        unresolved: []
+      };
+    }
+    index.functions.Target.calls = ["Callee"];
+    index.functions.Caller.calls = ["Target", "CallerOnlyCallee"];
+    index.functions.GrandCaller.calls = ["Caller"];
+    index.functions.Callee.calls = ["GrandCallee"];
+    index.functions.CalleeOtherCaller.calls = ["Callee"];
+    index.callGraph = {
+      Target: ["Callee"],
+      Caller: ["Target", "CallerOnlyCallee"],
+      GrandCaller: ["Caller"],
+      CallerOnlyCallee: [],
+      Callee: ["GrandCallee"],
+      GrandCallee: [],
+      CalleeOtherCaller: ["Callee"]
+    };
+    index.calledBy = {
+      Target: ["Caller"],
+      Caller: ["GrandCaller"],
+      GrandCaller: [],
+      CallerOnlyCallee: ["Caller"],
+      Callee: ["Target", "CalleeOtherCaller"],
+      GrandCallee: ["Callee"],
+      CalleeOtherCaller: []
+    };
+
+    await writeIndex(indexPath, index);
+
+    const hydrated = await readIndexForSymbol(indexPath, "Target", 3);
+
+    expect(Object.keys(hydrated?.functions ?? {}).sort()).toEqual([
+      "Callee",
+      "Caller",
+      "GrandCallee",
+      "GrandCaller",
+      "Target"
+    ]);
+  });
+
   it("does not preserve a stale sidecar when writing a fresh empty-function index", async () => {
     const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
     const indexPath = path.join(tempRoot, "vc6-impact-index.json");

@@ -6,6 +6,7 @@ import { buildImpact } from "../src/analysis/impact";
 import { assertReadableTargetUnchanged, buildFullIndex, buildFullIndexToStorage, updateIndex, updateIndexToStorage, verifySignaturesUnchanged } from "../src/analysis/indexer";
 import { renderMarkdownReport, writeReviewReport } from "../src/analysis/report";
 import { readIndex, readIndexForSymbol } from "../src/analysis/store";
+import type { AnalysisIndex, FunctionInfo } from "../src/analysis/types";
 import { parseVc6Project } from "../src/analysis/vc6ProjectParser";
 
 const fixtureRoot = path.resolve(__dirname, "fixtures", "vc6-sample");
@@ -504,6 +505,44 @@ describe("Impact index", () => {
 });
 
 describe("function impact", () => {
+  it("does not reverse traversal direction for related functions, threads, or edges", () => {
+    const index = createDirectionalFunctionIndex();
+    const impact = buildImpact(index, "Target", 3);
+
+    expect(impact.functions.map((func) => func.name)).toEqual([
+      "Callee",
+      "Caller",
+      "GrandCallee",
+      "GrandCaller",
+      "Target"
+    ]);
+    expect(impact.threadContexts.map((context) => context.functionName)).toEqual([
+      "Callee",
+      "Caller",
+      "GrandCallee",
+      "GrandCaller",
+      "Target"
+    ]);
+    expect(impact.graph.edges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ from: "function:GrandCaller", label: "calls", to: "function:Caller" }),
+        expect.objectContaining({ from: "function:Caller", label: "calls", to: "function:Target" }),
+        expect.objectContaining({ from: "function:Target", label: "calls", to: "function:Callee" }),
+        expect.objectContaining({ from: "function:Callee", label: "calls", to: "function:GrandCallee" })
+      ])
+    );
+    expect(impact.functions.map((func) => func.name)).not.toContain("CallerOnlyCallee");
+    expect(impact.functions.map((func) => func.name)).not.toContain("CalleeOtherCaller");
+    expect(impact.threadContexts.map((context) => context.functionName)).not.toContain("CallerOnlyCallee");
+    expect(impact.threadContexts.map((context) => context.functionName)).not.toContain("CalleeOtherCaller");
+    expect(impact.graph.edges).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ from: "function:Caller", label: "calls", to: "function:CallerOnlyCallee" }),
+        expect.objectContaining({ from: "function:CalleeOtherCaller", label: "calls", to: "function:Callee" })
+      ])
+    );
+  });
+
   it("focuses on call relationships and thread context without expanding variable accesses", async () => {
     const index = await buildFullIndex({ workspaceRoot: fixtureRoot, projectFile, threadMapFile });
     const impact = buildImpact(index, "CommonUpdate", 2);
@@ -543,6 +582,87 @@ async function copyFixtureToTemp(): Promise<string> {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vc6-impact-fixture-"));
   await fs.cp(fixtureRoot, tempRoot, { recursive: true });
   return tempRoot;
+}
+
+function createDirectionalFunctionIndex(): AnalysisIndex {
+  const functionNames = [
+    "Target",
+    "Caller",
+    "GrandCaller",
+    "CallerOnlyCallee",
+    "Callee",
+    "GrandCallee",
+    "CalleeOtherCaller"
+  ];
+  const functions = Object.fromEntries(functionNames.map((name) => [name, createFunctionInfo(name)]));
+  functions.Target.calls = ["Callee"];
+  functions.Caller.calls = ["Target", "CallerOnlyCallee"];
+  functions.GrandCaller.calls = ["Caller"];
+  functions.Callee.calls = ["GrandCallee"];
+  functions.CalleeOtherCaller.calls = ["Callee"];
+  return {
+    version: 1,
+    generatedAt: "2026-06-09T00:00:00.000Z",
+    workspaceRoot: "C:/tmp/project",
+    projectFile: "C:/tmp/project/sample.dsw",
+    projectFiles: [],
+    includePaths: [],
+    macros: [],
+    files: [],
+    globals: {},
+    structTypes: {},
+    memberSymbols: {},
+    macroDefinitions: {},
+    macroAliases: {},
+    parserDiagnostics: [],
+    functions,
+    callGraph: {
+      Target: ["Callee"],
+      Caller: ["Target", "CallerOnlyCallee"],
+      GrandCaller: ["Caller"],
+      CallerOnlyCallee: [],
+      Callee: ["GrandCallee"],
+      GrandCallee: [],
+      CalleeOtherCaller: ["Callee"]
+    },
+    calledBy: {
+      Target: ["Caller"],
+      Caller: ["GrandCaller"],
+      GrandCaller: [],
+      CallerOnlyCallee: ["Caller"],
+      Callee: ["Target", "CalleeOtherCaller"],
+      GrandCallee: ["Callee"],
+      CalleeOtherCaller: []
+    },
+    threads: functionNames.map((name) => ({ threadId: `thread-${name}`, entryFunction: name })),
+    threadReachability: Object.fromEntries(functionNames.map((name) => [
+      name,
+      { functionName: name, threadIds: [`thread-${name}`], interruptLikeThreadIds: [] }
+    ])),
+    build: {
+      mode: "full",
+      parserMode: "rust",
+      durationMs: 0,
+      phaseDurationsMs: {},
+      workerCount: 0,
+      changedFiles: [],
+      reusedFiles: 0,
+      sourceFileCount: 0
+    }
+  };
+}
+
+function createFunctionInfo(name: string): FunctionInfo {
+  return {
+    name,
+    file: "C:/tmp/project/main.cpp",
+    startLine: 1,
+    endLine: 1,
+    signature: `void ${name}(void)`,
+    calls: [],
+    accesses: [],
+    unresolved: []
+  };
 }
 
 async function createSingleFileProject(sourceLines: string[]): Promise<{ root: string; projectFile: string }> {
