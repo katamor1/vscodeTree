@@ -282,6 +282,88 @@ describe("Impact index", () => {
     );
   });
 
+  it.each(["typescript", "rust"] as const)("resolves typed pointer parameter member selections through caller arguments with %s backend", async (parserEngine) => {
+    const sample2 = await createSample2ImpactFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: sample2.root,
+      projectFile: sample2.projectFile,
+      threadMapFile: sample2.threadMapFile,
+      parserEngine,
+      maxIndexWorkers: 1
+    });
+    const impact = buildImpact(index, "ptr->sample_value1");
+
+    expect(impact.symbolKind).toBe("member");
+    expect(impact.members.map((member) => member.name)).toEqual(
+      expect.arrayContaining(["PTR_GBL->sub1.sample_value1", "PTR_GBL->sub3.sample_value1"])
+    );
+    expect(impact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          functionName: "thread_sub1ptr",
+          variableName: "SAMPLE_SUBSUB::sample_value1",
+          kind: "write"
+        }),
+        expect.objectContaining({
+          functionName: "thread1_entry",
+          variableName: "PTR_GBL->sub1.sample_value1",
+          targetName: "SAMPLE_SUBSUB::sample_value1",
+          kind: "write",
+          reasons: expect.arrayContaining(["call-argument-alias"])
+        }),
+        expect.objectContaining({
+          functionName: "thread3_entry",
+          variableName: "PTR_GBL->sub3.sample_value1",
+          targetName: "SAMPLE_SUBSUB::sample_value1",
+          kind: "write",
+          reasons: expect.arrayContaining(["call-argument-alias"])
+        })
+      ])
+    );
+  }, 60000);
+
+  it.each(["typescript", "rust"] as const)("tracks function-like define macros as member impact targets with %s backend", async (parserEngine) => {
+    const sample2 = await createSample2ImpactFixture();
+    const index = await buildFullIndex({
+      workspaceRoot: sample2.root,
+      projectFile: sample2.projectFile,
+      threadMapFile: sample2.threadMapFile,
+      parserEngine,
+      maxIndexWorkers: 1
+    });
+    const macroImpact = buildImpact(index, "SUB4_ARRAY");
+    const memberImpact = buildImpact(index, "PTR_GBL->sub4.subsub[].sample_value[]");
+
+    expect(index.macroAliases.SUB4_ARRAY?.[0]).toEqual(
+      expect.objectContaining({
+        targetName: "PTR_GBL->sub4.subsub[].sample_value[]",
+        targetKind: "member",
+        isFunctionLike: true
+      })
+    );
+    expect(macroImpact.symbolKind).toBe("macro");
+    expect(macroImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          functionName: "thread_main_entry",
+          variableName: "PTR_GBL->sub4.subsub[].sample_value[]",
+          kind: "write",
+          macroNames: expect.arrayContaining(["SUB4_ARRAY"])
+        })
+      ])
+    );
+    expect(memberImpact.accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          functionName: "thread_main_entry",
+          variableName: "PTR_GBL->sub4.subsub[].sample_value[]",
+          kind: "write",
+          macroNames: expect.arrayContaining(["SUB4_ARRAY"])
+        })
+      ])
+    );
+  }, 60000);
+
   it("exposes nested pointer-global member declarations and accesses with clang fallback", async () => {
     const sample2 = await createSample2ImpactFixture();
     const index = await buildFullIndex({
@@ -908,10 +990,11 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
   await fs.writeFile(
     path.join(root, "src", "header.h"),
     [
-      "typedef struct tagSampleSubSub { int sample_value1; int sample_value2; int sample_value3; } SAMPLE_SUBSUB;",
+      "typedef struct tagSampleSubSub { int sample_value1; int sample_value2; int sample_value3; int sample_value[4]; } SAMPLE_SUBSUB;",
       "typedef struct tagSampleSub4 { SAMPLE_SUBSUB *subsub_ptr; SAMPLE_SUBSUB subsub[4]; } SAMPLE_SUB4;",
       "typedef struct tagSampleMain { SAMPLE_SUBSUB sub1; SAMPLE_SUBSUB sub2; SAMPLE_SUBSUB sub3; SAMPLE_SUB4 sub4; } SAMPLE_MAIN;",
       "typedef struct tagSampleSubPtr { int *sample_value1; int *sample_value2; int *sample_value3; } SAMPLE_SUBPTR;",
+      "#define SUB4_ARRAY(i, j) PTR_GBL->sub4.subsub[i].sample_value[j]++;",
       ""
     ].join("\n"),
     "utf8"
@@ -942,6 +1025,7 @@ async function createSample2ImpactFixture(): Promise<{ root: string; projectFile
       "    subPtr.sample_value3 = &PTR_GBL->sub3.sample_value3;",
       "    PTR_GBL->sub3.sample_value1++;",
       "    PTR_GBL->sub4.subsub[0].sample_value1++;",
+      "    SUB4_ARRAY(0, 1);",
       "}",
       "void thread1_entry(void) {",
       "    thread_sub1ptr(&PTR_GBL->sub1);",

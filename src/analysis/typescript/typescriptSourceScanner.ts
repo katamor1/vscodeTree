@@ -52,6 +52,7 @@ interface ParameterTemplate {
   memberPath: string[];
   kind: "read" | "write" | "unknown";
   memberName?: string;
+  typeMemberName?: string;
 }
 
 interface MemberExpression {
@@ -276,7 +277,8 @@ function analyzeFunction(func: FunctionStructure, context: TypeScriptContext): F
           accessExpression: expression.expression,
           macroNames: expansion.macroNames.length ? expansion.macroNames : undefined
         });
-      } else if (resolved.unresolvedName) {
+      }
+      if (resolved.unresolvedName) {
         unresolved.push(unresolvedEvidence("unknown-member-access", func, bodyLine, resolved.unresolvedName, "構造体メンバ参照の実体globalを断定できません。"));
       }
     }
@@ -323,7 +325,7 @@ function analyzeFunction(func: FunctionStructure, context: TypeScriptContext): F
           const targetName = `${owner.ownerName}${owner.connector}${template.memberPath.join(".")}`;
           pushAccess(accesses, seenAccesses, {
             variableName: targetName,
-            targetName,
+            targetName: template.typeMemberName ?? targetName,
             targetKind: "member",
             functionName: func.name,
             kind: template.kind,
@@ -363,6 +365,7 @@ function parseMacros(file: string, rawLines: string[], maskedLines: string[]): M
     result.push({
       name: match[1],
       replacement: (match[4] ?? "").trim(),
+      parameters: match[3] ? splitArguments(match[3]).filter(isIdentifier) : undefined,
       file,
       line: index + 1,
       declaration: rawLines[index].trim(),
@@ -558,8 +561,8 @@ function parseGlobals(file: string, maskedLines: string[], functions: FunctionSt
 }
 
 function buildParameterTemplates(func: FunctionStructure, macroContext: MacroAnalysisContext): ParameterTemplate[] {
-  const parameterNames = parseParameterNames(func.signature);
-  const indexes = new Map(parameterNames.map((name, index) => [name, index]));
+  const parameterTypes = parseParameterTypes(func.signature);
+  const indexes = new Map(Array.from(parameterTypes.keys()).map((name, index) => [name, index]));
   const result: ParameterTemplate[] = [];
   const seen = new Set<string>();
   for (const line of func.bodyLines) {
@@ -578,7 +581,8 @@ function buildParameterTemplates(func: FunctionStructure, macroContext: MacroAna
         parameterIndex: index,
         memberPath: expression.memberPath,
         kind: classifyAccess(masked, expression.sourceExpression),
-        memberName: expression.memberPath.at(-1)
+        memberName: expression.memberPath.at(-1),
+        typeMemberName: typeMemberName(parameterTypes.get(expression.ownerName), expression.memberPath)
       });
     }
   }
@@ -618,7 +622,8 @@ function resolveMemberExpression(
   }
   const typeName = parameterTypes.get(expression.ownerName);
   if (typeName) {
-    return { unresolvedName: `${typeName}::${expression.memberPath.join(".")}` };
+    const targetName = `${typeName}::${expression.memberPath.join(".")}`;
+    return { targetName, ownerName: expression.ownerName, unresolvedName: targetName };
   }
   return {};
 }
@@ -652,7 +657,13 @@ function expandMacroAliases(line: string, macroContext: MacroAnalysisContext): {
       if (!alias || !containsWord(expanded, name)) {
         continue;
       }
-      expanded = replaceWord(expanded, name, alias.replacement);
+      const next = alias.isFunctionLike
+        ? expandFunctionLikeMacroCalls(expanded, alias.name, alias.parameters ?? [], alias.replacement)
+        : replaceWord(expanded, name, alias.replacement);
+      if (next === expanded) {
+        continue;
+      }
+      expanded = next;
       macroNames.push(name);
       changed = true;
     }
@@ -661,6 +672,69 @@ function expandMacroAliases(line: string, macroContext: MacroAnalysisContext): {
     }
   }
   return { line: expanded, macroNames: unique(macroNames) };
+}
+
+function expandFunctionLikeMacroCalls(line: string, macroName: string, parameters: string[], replacement: string): string {
+  let output = "";
+  let index = 0;
+  while (index < line.length) {
+    const found = findWordAtOrAfter(line, macroName, index);
+    if (found < 0) {
+      output += line.slice(index);
+      break;
+    }
+    let cursor = found + macroName.length;
+    while (cursor < line.length && /\s/.test(line[cursor])) {
+      cursor += 1;
+    }
+    if (line[cursor] !== "(") {
+      output += line.slice(index, cursor);
+      index = cursor;
+      continue;
+    }
+    const close = findClosingParen(line, cursor);
+    if (close < 0) {
+      output += line.slice(index);
+      break;
+    }
+    output += line.slice(index, found);
+    output += substituteMacroParameters(replacement, parameters, splitArguments(line.slice(cursor + 1, close)));
+    index = close + 1;
+  }
+  return output;
+}
+
+function substituteMacroParameters(replacement: string, parameters: string[], args: string[]): string {
+  let expanded = replacement;
+  for (let index = 0; index < parameters.length; index += 1) {
+    const parameter = parameters[index];
+    if (parameter) {
+      expanded = replaceWord(expanded, parameter, args[index] ?? "");
+    }
+  }
+  return expanded;
+}
+
+function findWordAtOrAfter(line: string, word: string, start: number): number {
+  const re = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(word)}(?=[^A-Za-z0-9_]|$)`, "g");
+  re.lastIndex = start;
+  const match = re.exec(line);
+  return match ? match.index + (match[1]?.length ?? 0) : -1;
+}
+
+function findClosingParen(line: string, open: number): number {
+  let depth = 0;
+  for (let index = open; index < line.length; index += 1) {
+    if (line[index] === "(") {
+      depth += 1;
+    } else if (line[index] === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
 }
 
 function extractMemberExpressions(line: string): MemberExpression[] {
@@ -825,6 +899,10 @@ function parseParameterTypes(signature: string): Map<string, string> {
 
 function parseParameterNames(signature: string): string[] {
   return Array.from(parseParameterTypes(signature).keys());
+}
+
+function typeMemberName(typeName: string | undefined, memberPath: string[]): string | undefined {
+  return typeName ? `${typeName}::${memberPath.join(".")}` : undefined;
 }
 
 function functionName(signature: string): string | undefined {

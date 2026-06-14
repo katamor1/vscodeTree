@@ -16,8 +16,13 @@ import type {
 import { collectDirectionalFunctionNeighborhood, functionCallEdgeKey, isFunctionTopologyUnresolved, type FunctionNeighborhood } from "./functionImpactPolicy";
 
 export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth = 4): ImpactResult {
+  const inferred = inferMemberSelection(index, symbolName);
+  const lookupSymbols = new Set([symbolName, ...inferred.typeMemberNames, ...inferred.actualMemberNames]);
   const globals = index.globals[symbolName] ?? [];
-  const members = index.memberSymbols?.[symbolName] ?? [];
+  const members = uniqueMembers([
+    ...(index.memberSymbols?.[symbolName] ?? []),
+    ...inferred.actualMemberNames.flatMap((name) => index.memberSymbols?.[name] ?? [])
+  ]);
   const macros = index.macroAliases?.[symbolName] ?? [];
   const selectedFunction = index.functions[symbolName];
   const symbolKind = globals.length > 0
@@ -37,14 +42,14 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     ? functionsFromNeighborhood(index, functionNeighborhood!)
     : symbolKind === "macro"
       ? functionsTouchingMacro(index, symbolName, macroTargets)
-      : functionsTouchingSymbol(index, symbolName);
+      : functionsTouchingSymbols(index, lookupSymbols);
   const functions = symbolKind === "function"
     ? rawFunctions.map((func) => ({ ...func, accesses: [] }))
     : rawFunctions;
   const accesses = symbolKind === "function"
     ? []
     : symbolKind === "global" || symbolKind === "member" || symbolKind === "unknown"
-      ? functions.flatMap((func) => func.accesses.filter((access) => access.targetName === symbolName || access.variableName === symbolName))
+      ? functions.flatMap((func) => func.accesses.filter((access) => accessMatchesAny(access, lookupSymbols)))
       : functions.flatMap((func) => func.accesses.filter((access) =>
         access.macroNames?.includes(symbolName) ||
         macroTargets.has(access.targetName ?? access.variableName) ||
@@ -59,7 +64,7 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
     [
       ...functions.flatMap((func) => func.unresolved),
       ...index.files.flatMap((file) => file.unresolved)
-    ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions, macroTargets))
+    ].filter((item) => unresolvedRelevant(item, symbolKind, symbolName, functions, macroTargets, lookupSymbols))
   );
   const risks = buildRisks(symbolName, symbolKind, accesses, threadContexts, unresolved);
   const graph = buildGraph(symbolName, symbolKind, globals, members, macros, functions, accesses, threadContexts, risks, unresolved, functionNeighborhood?.callEdges);
@@ -79,9 +84,9 @@ export function buildImpact(index: AnalysisIndex, symbolName: string, maxDepth =
   };
 }
 
-function functionsTouchingSymbol(index: AnalysisIndex, variableName: string): FunctionInfo[] {
+function functionsTouchingSymbols(index: AnalysisIndex, variableNames: Set<string>): FunctionInfo[] {
   return Object.values(index.functions)
-    .filter((func) => func.accesses.some((access) => access.variableName === variableName || access.targetName === variableName))
+    .filter((func) => func.accesses.some((access) => accessMatchesAny(access, variableNames)))
     .sort(byFunctionName);
 }
 
@@ -276,12 +281,13 @@ function unresolvedRelevant(
   symbolKind: ImpactResult["symbolKind"],
   symbolName: string,
   functions: FunctionInfo[],
-  macroTargets: Set<string>
+  macroTargets: Set<string>,
+  lookupSymbols: Set<string>
 ): boolean {
   if (symbolKind === "function") {
     return isFunctionTopologyUnresolved(item.kind) && functions.some((func) => func.name === item.functionName);
   }
-  if (item.variableName === symbolName) {
+  if (item.variableName && lookupSymbols.has(item.variableName)) {
     return true;
   }
   if (symbolKind === "global" || symbolKind === "member") {
@@ -291,6 +297,95 @@ function unresolvedRelevant(
     return macroTargets.has(item.variableName ?? "");
   }
   return false;
+}
+
+function inferMemberSelection(index: AnalysisIndex, symbolName: string): { typeMemberNames: string[]; actualMemberNames: string[] } {
+  const typeMemberNames = new Set<string>();
+  const actualMemberNames = new Set<string>();
+  if (symbolName.includes("::")) {
+    typeMemberNames.add(symbolName);
+  } else if (!isDirectDataSymbol(index, symbolName)) {
+    const normalizedSelection = normalizeMemberLookupText(symbolName);
+    const memberPath = memberPathFromLookup(normalizedSelection);
+    if (memberPath) {
+      for (const func of Object.values(index.functions)) {
+        for (const access of func.accesses) {
+          if (
+            access.variableName.includes("::") &&
+            memberPathFromLookup(access.variableName) === memberPath &&
+            normalizeMemberLookupText(access.accessExpression ?? access.evidence).includes(normalizedSelection)
+          ) {
+            typeMemberNames.add(access.variableName);
+          }
+        }
+        for (const item of func.unresolved) {
+          if (
+            item.kind === "unknown-member-access" &&
+            item.variableName?.includes("::") &&
+            memberPathFromLookup(item.variableName) === memberPath &&
+            normalizeMemberLookupText(item.evidence).includes(normalizedSelection)
+          ) {
+            typeMemberNames.add(item.variableName);
+          }
+        }
+      }
+    }
+  }
+
+  if (typeMemberNames.size > 0) {
+    for (const func of Object.values(index.functions)) {
+      for (const access of func.accesses) {
+        if (access.targetName && typeMemberNames.has(access.targetName) && index.memberSymbols?.[access.variableName]) {
+          actualMemberNames.add(access.variableName);
+        }
+      }
+    }
+  }
+  return {
+    typeMemberNames: [...typeMemberNames].sort(),
+    actualMemberNames: [...actualMemberNames].sort()
+  };
+}
+
+function isDirectDataSymbol(index: AnalysisIndex, symbolName: string): boolean {
+  return Boolean(index.globals[symbolName]?.length || index.memberSymbols?.[symbolName]?.length || index.macroAliases?.[symbolName]?.length);
+}
+
+function accessMatchesAny(access: VariableAccess, symbols: Set<string>): boolean {
+  return symbols.has(access.variableName) || Boolean(access.targetName && symbols.has(access.targetName));
+}
+
+function memberPathFromLookup(symbolName: string): string | undefined {
+  const normalized = normalizeMemberLookupText(symbolName);
+  const typeIndex = normalized.indexOf("::");
+  if (typeIndex >= 0) {
+    return normalized.slice(typeIndex + 2);
+  }
+  const arrowIndex = normalized.indexOf("->");
+  const dotIndex = normalized.indexOf(".");
+  const separatorIndex = arrowIndex >= 0 && dotIndex >= 0
+    ? Math.min(arrowIndex, dotIndex)
+    : Math.max(arrowIndex, dotIndex);
+  if (separatorIndex < 0) {
+    return undefined;
+  }
+  return normalized.slice(separatorIndex + (normalized.startsWith("->", separatorIndex) ? 2 : 1));
+}
+
+function normalizeMemberLookupText(value: string): string {
+  return value.replace(/\s+/g, "").replace(/\[[^\]]+\]/g, "[]");
+}
+
+function uniqueMembers(members: MemberSymbol[]): MemberSymbol[] {
+  const seen = new Set<string>();
+  return members.filter((member) => {
+    const key = `${member.name}:${member.file}:${member.line}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function directParentSymbolName(symbolName: string): string | undefined {

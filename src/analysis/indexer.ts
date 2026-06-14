@@ -469,6 +469,9 @@ function addAccessIndexEntries(index: Map<string, Set<string>>, func: FunctionIn
     if (access.targetName) {
       addAccessIndexEntry(index, access.targetName, func.name);
     }
+    if (access.accessExpression) {
+      addAccessIndexEntry(index, normalizeAccessIndexSymbol(access.accessExpression), func.name);
+    }
     for (const macroName of access.macroNames ?? []) {
       addAccessIndexEntry(index, macroName, func.name);
     }
@@ -480,6 +483,10 @@ function addAccessIndexEntry(index: Map<string, Set<string>>, symbolName: string
     return;
   }
   (index.get(symbolName) ?? index.set(symbolName, new Set()).get(symbolName)!).add(functionName);
+}
+
+function normalizeAccessIndexSymbol(symbolName: string): string {
+  return symbolName.replace(/\s+/g, "").replace(/\[[^\]]+\]/g, "[]");
 }
 
 function objectFromSetMap(values: Map<string, Set<string>>): Record<string, string[]> {

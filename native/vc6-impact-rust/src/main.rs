@@ -51,6 +51,8 @@ struct GlobalVariable {
 struct MacroDefinition {
     name: String,
     replacement: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    parameters: Vec<String>,
     file: String,
     line: usize,
     declaration: String,
@@ -170,7 +172,7 @@ struct VariableAccess {
     location: SourceLocation,
     evidence: String,
     reasons: Vec<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     access_expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     macro_names: Option<Vec<String>>,
@@ -258,6 +260,7 @@ struct ParameterMemberAccessTemplate {
     parameter_index: usize,
     member_path: Vec<String>,
     kind: String,
+    type_member_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -279,12 +282,15 @@ struct GlobalTypeCandidate {
 struct MacroAliasInfo {
     name: String,
     replacement: String,
+    parameters: Vec<String>,
+    is_function_like: bool,
 }
 
 #[derive(Clone)]
 struct MacroAliasCandidate {
     name: String,
     replacement: String,
+    parameters: Vec<String>,
     is_function_like: bool,
 }
 
@@ -1285,6 +1291,7 @@ impl NativeContextBuilder {
             self.ingest_macro_candidate(MacroAliasCandidate {
                 name: definition.name,
                 replacement: definition.replacement,
+                parameters: definition.parameters,
                 is_function_like: definition.is_function_like,
             });
         }
@@ -1335,6 +1342,7 @@ impl NativeContextBuilder {
         self.ingest_macro_candidate(MacroAliasCandidate {
             name: definition.name.clone(),
             replacement: definition.replacement.clone(),
+            parameters: definition.parameters.clone(),
             is_function_like: definition.is_function_like,
         });
     }
@@ -1446,14 +1454,14 @@ fn build_parameter_member_access_templates_from_functions(
 ) -> HashMap<String, Vec<ParameterMemberAccessTemplate>> {
     let mut result = HashMap::new();
     for function in functions {
-        let parameter_names = parameter_names_from_signature(&function.signature);
-        if parameter_names.is_empty() {
+        let parameter_bindings = parameter_bindings_from_signature(&function.signature);
+        if parameter_bindings.is_empty() {
             continue;
         }
-        let parameter_index_by_name: HashMap<String, usize> = parameter_names
+        let parameter_index_by_name: HashMap<String, ParameterBinding> = parameter_bindings
             .iter()
-            .enumerate()
-            .map(|(index, name)| (name.clone(), index))
+            .cloned()
+            .map(|binding| (binding.name.clone(), binding))
             .collect();
         let mut function_templates = Vec::new();
         let mut seen_templates = HashSet::new();
@@ -1474,7 +1482,7 @@ fn build_parameter_member_access_templates_from_functions(
 
 fn collect_parameter_member_access_templates(
     masked: &str,
-    parameter_index_by_name: &HashMap<String, usize>,
+    parameter_index_by_name: &HashMap<String, ParameterBinding>,
     templates: &mut Vec<ParameterMemberAccessTemplate>,
     seen_templates: &mut HashSet<String>,
 ) {
@@ -1482,25 +1490,36 @@ fn collect_parameter_member_access_templates(
         return;
     }
     for expression in extract_member_expressions(masked) {
-        let Some(parameter_index) = parameter_index_by_name.get(&expression.owner_name).copied()
+        let Some(parameter) = parameter_index_by_name.get(&expression.owner_name)
         else {
             continue;
         };
         let (kind, _) = classify_access(masked, &expression.expression);
         let member_path = expression.member_path.clone();
-        let key = format!("{}:{}:{}", parameter_index, member_path.join("."), kind);
+        let key = format!("{}:{}:{}", parameter.index, member_path.join("."), kind);
         if !seen_templates.insert(key) {
             continue;
         }
         templates.push(ParameterMemberAccessTemplate {
-            parameter_index,
+            parameter_index: parameter.index,
+            type_member_name: parameter
+                .type_name
+                .as_ref()
+                .map(|type_name| canonical_type_member_name(type_name, &member_path)),
             member_path,
             kind,
         });
     }
 }
 
-fn parameter_names_from_signature(signature: &str) -> Vec<String> {
+#[derive(Clone)]
+struct ParameterBinding {
+    name: String,
+    index: usize,
+    type_name: Option<String>,
+}
+
+fn parameter_bindings_from_signature(signature: &str) -> Vec<ParameterBinding> {
     let Some(start) = signature.find('(') else {
         return Vec::new();
     };
@@ -1516,15 +1535,21 @@ fn parameter_names_from_signature(signature: &str) -> Vec<String> {
     }
     split_top_level_commas(params)
         .into_iter()
-        .filter_map(|param| {
+        .enumerate()
+        .filter_map(|(index, param)| {
             let declarator = param.split('=').next().unwrap_or("").trim();
-            identifiers(declarator)
+            let name = identifiers(declarator)
                 .into_iter()
                 .filter(|name| {
                     !is_keyword(name)
                         && !matches!(name.as_str(), "const" | "volatile" | "register" | "static")
                 })
-                .last()
+                .last()?;
+            Some(ParameterBinding {
+                name,
+                index,
+                type_name: type_name_from_declarator(declarator),
+            })
         })
         .collect()
 }
@@ -1533,27 +1558,38 @@ fn resolve_macro_alias_native(
     definition: &MacroAliasCandidate,
     global_names: &HashSet<String>,
 ) -> Option<MacroAliasInfo> {
-    if definition.is_function_like
-        || definition.replacement.is_empty()
-        || is_header_guard_macro_candidate(definition)
-    {
+    if definition.replacement.is_empty() || is_header_guard_macro_candidate(definition) {
         return None;
     }
     let replacement = definition.replacement.trim();
-    if !is_simple_macro_replacement(replacement) {
+    let target = if definition.is_function_like {
+        normalize_function_like_macro_target(replacement, &definition.parameters)?
+    } else if is_simple_macro_replacement(replacement) {
+        replacement.to_string()
+    } else {
         return None;
-    }
-    if !global_names.contains(replacement)
-        && replacement
+    };
+    if !global_names.contains(&target)
+        && target
             .chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_digit())
     {
         return None;
     }
+    if definition.is_function_like
+        && !global_names.contains(&target)
+        && !target.contains('.')
+        && !target.contains("->")
+        && !target.contains("::")
+    {
+        return None;
+    }
     Some(MacroAliasInfo {
         name: definition.name.clone(),
         replacement: replacement.to_string(),
+        parameters: definition.parameters.clone(),
+        is_function_like: definition.is_function_like,
     })
 }
 
@@ -1765,7 +1801,7 @@ fn analyze_function_native(func: &FunctionStructure, context: &NativeContext) ->
                         &mut access_keys,
                         VariableAccess {
                             variable_name: target_name.clone(),
-                            target_name: None,
+                            target_name: template.type_member_name.clone(),
                             target_kind: Some("member".to_string()),
                             function_name: func.name.clone(),
                             kind: template.kind.clone(),
@@ -1972,6 +2008,23 @@ fn is_simple_macro_replacement(value: &str) -> bool {
     }
 }
 
+fn normalize_function_like_macro_target(replacement: &str, parameters: &[String]) -> Option<String> {
+    if let Some(expression) = extract_member_expressions(replacement).into_iter().next() {
+        return Some(
+            expression
+                .expression
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .replace_bracket_indices(),
+        );
+    }
+    let parameter_names: HashSet<&str> = parameters.iter().map(String::as_str).collect();
+    identifiers(replacement)
+        .into_iter()
+        .find(|name| !parameter_names.contains(name.as_str()))
+}
+
 fn expand_macro_line(line: &str, context: &NativeContext) -> (String, Vec<String>) {
     let mut expanded = line.to_string();
     let mut used = HashSet::new();
@@ -1985,7 +2038,16 @@ fn expand_macro_line(line: &str, context: &NativeContext) -> (String, Vec<String
             if visiting.contains(name) {
                 continue;
             }
-            let next = replace_word(&expanded, name, &alias.replacement);
+            let next = if alias.is_function_like {
+                expand_function_like_macro_calls(
+                    &expanded,
+                    name,
+                    &alias.parameters,
+                    &alias.replacement,
+                )
+            } else {
+                replace_word(&expanded, name, &alias.replacement)
+            };
             if next != expanded {
                 visiting.insert(name.clone());
                 expanded = next;
@@ -2001,6 +2063,91 @@ fn expand_macro_line(line: &str, context: &NativeContext) -> (String, Vec<String
     let mut used: Vec<String> = used.into_iter().collect();
     used.sort();
     (expanded, used)
+}
+
+trait ReplaceBracketIndices {
+    fn replace_bracket_indices(self) -> String;
+}
+
+impl ReplaceBracketIndices for String {
+    fn replace_bracket_indices(self) -> String {
+        let mut output = String::with_capacity(self.len());
+        let bytes = self.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == b'[' {
+                let close = skip_bracket(&self, index);
+                if close > index && close <= self.len() {
+                    output.push_str("[]");
+                    index = close;
+                    continue;
+                }
+            }
+            output.push(bytes[index] as char);
+            index += 1;
+        }
+        output
+    }
+}
+
+fn expand_function_like_macro_calls(
+    line: &str,
+    macro_name: &str,
+    parameters: &[String],
+    replacement: &str,
+) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0usize;
+    while index < line.len() {
+        let Some(found) = find_word_at_or_after(line, macro_name, index) else {
+            output.push_str(&line[index..]);
+            break;
+        };
+        let mut cursor = found + macro_name.len();
+        skip_ascii_space(line, &mut cursor);
+        if cursor >= line.len() || line.as_bytes()[cursor] != b'(' {
+            output.push_str(&line[index..cursor]);
+            index = cursor;
+            continue;
+        }
+        let close = skip_bracket(line, cursor);
+        if close <= cursor + 1 || close > line.len() {
+            output.push_str(&line[index..]);
+            break;
+        }
+        output.push_str(&line[index..found]);
+        output.push_str(&substitute_macro_parameters(
+            replacement,
+            parameters,
+            &split_top_level_commas(&line[cursor + 1..close - 1]),
+        ));
+        index = close;
+    }
+    output
+}
+
+fn substitute_macro_parameters(replacement: &str, parameters: &[String], args: &[String]) -> String {
+    let mut expanded = replacement.to_string();
+    for (index, parameter) in parameters.iter().enumerate() {
+        expanded = replace_word(&expanded, parameter, args.get(index).map(String::as_str).unwrap_or(""));
+    }
+    expanded
+}
+
+fn find_word_at_or_after(line: &str, word: &str, start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let word_bytes = word.as_bytes();
+    let mut index = start;
+    while index + word_bytes.len() <= bytes.len() {
+        if &bytes[index..index + word_bytes.len()] == word_bytes
+            && is_word_boundary(bytes, index)
+            && is_word_boundary(bytes, index + word_bytes.len())
+        {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn replace_word(line: &str, word: &str, replacement: &str) -> String {
@@ -3074,6 +3221,10 @@ fn parse_macros(
         if let Some(captures) = DEFINE_RE.captures(masked) {
             let name = captures.get(1).unwrap().as_str().to_string();
             let is_function_like = captures.get(2).is_some();
+            let parameters = captures
+                .get(2)
+                .map(|item| parse_macro_parameters(item.as_str()))
+                .unwrap_or_default();
             let raw = raw_lines
                 .get(index)
                 .copied()
@@ -3086,6 +3237,7 @@ fn parse_macros(
                     .get(3)
                     .map(|item| item.as_str().trim().to_string())
                     .unwrap_or_default(),
+                parameters,
                 file: file.to_string(),
                 line: index + 1,
                 declaration: raw.clone(),
@@ -3109,6 +3261,17 @@ fn parse_macros(
         }
     }
     macros
+}
+
+fn parse_macro_parameters(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return Vec::new();
+    }
+    split_top_level_commas(&trimmed[1..trimmed.len() - 1])
+        .into_iter()
+        .filter(|item| is_identifier(item))
+        .collect()
 }
 
 fn parse_struct_types(
@@ -3332,7 +3495,7 @@ fn parse_functions(
 
 struct ActiveFunctionSummary {
     summary: FunctionSummary,
-    parameter_index_by_name: HashMap<String, usize>,
+    parameter_index_by_name: HashMap<String, ParameterBinding>,
     templates: Vec<ParameterMemberAccessTemplate>,
     seen_templates: HashSet<String>,
 }
@@ -3384,11 +3547,11 @@ fn parse_function_summaries(
                 .trim()
                 .to_string();
             if let Some(name) = function_name(&signature) {
-                let parameter_names = parameter_names_from_signature(&signature);
-                let parameter_index_by_name: HashMap<String, usize> = parameter_names
+                let parameter_bindings = parameter_bindings_from_signature(&signature);
+                let parameter_index_by_name: HashMap<String, ParameterBinding> = parameter_bindings
                     .iter()
-                    .enumerate()
-                    .map(|(index, name)| (name.clone(), index))
+                    .cloned()
+                    .map(|binding| (binding.name.clone(), binding))
                     .collect();
                 let mut active_function = ActiveFunctionSummary {
                     summary: FunctionSummary {

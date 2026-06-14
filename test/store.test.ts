@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import { buildImpact } from "../src/analysis/impact";
 import { ensureArtifactIgnored, readIndex, readIndexBuildSummary, readIndexForSymbol, reportPaths, resolveArtifactRoot, reportRelativeLink, writeIndex } from "../src/analysis/store";
 import type { AnalysisIndex } from "../src/analysis/types";
 
@@ -153,6 +154,81 @@ describe("artifact storage policy", () => {
 
     const hydrated = await readIndexForSymbol(indexPath, "g_counter");
     expect(Object.keys(hydrated?.functions ?? {})).toEqual(["TouchCounter"]);
+  });
+
+  it("hydrates caller aliases for selected typed pointer member expressions", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(process.env.TEMP ?? "C:/tmp", "vc6-impact-store-"));
+    const indexPath = path.join(tempRoot, "vc6-impact-index.json");
+    const index = minimalIndex();
+    index.memberSymbols["PTR_GBL->sub1.sample_value1"] = [{
+      name: "PTR_GBL->sub1.sample_value1",
+      ownerName: "PTR_GBL",
+      ownerTypeName: "SAMPLE_MAIN",
+      memberName: "sample_value1",
+      memberPath: ["sub1", "sample_value1"],
+      file: "C:/tmp/project/src/header.h",
+      line: 1,
+      declaration: "SAMPLE_MAIN* PTR_GBL :: int sample_value1",
+      pointerOwner: true
+    }];
+    index.functions.thread_sub1ptr = {
+      name: "thread_sub1ptr",
+      file: "C:/tmp/project/src/main.c",
+      startLine: 10,
+      endLine: 12,
+      signature: "void thread_sub1ptr(SAMPLE_SUBSUB *ptr)",
+      calls: [],
+      accesses: [{
+        variableName: "SAMPLE_SUBSUB::sample_value1",
+        targetKind: "member",
+        functionName: "thread_sub1ptr",
+        kind: "write",
+        location: { file: "C:/tmp/project/src/main.c", line: 11 },
+        evidence: "ptr->sample_value1++;",
+        reasons: ["increment-decrement"],
+        accessExpression: "ptr->sample_value1"
+      }],
+      unresolved: [{
+        kind: "unknown-member-access",
+        functionName: "thread_sub1ptr",
+        variableName: "SAMPLE_SUBSUB::sample_value1",
+        location: { file: "C:/tmp/project/src/main.c", line: 11 },
+        evidence: "ptr->sample_value1++;",
+        note: "typed pointer target"
+      }]
+    };
+    index.functions.thread1_entry = {
+      name: "thread1_entry",
+      file: "C:/tmp/project/src/main.c",
+      startLine: 20,
+      endLine: 22,
+      signature: "void thread1_entry(void)",
+      calls: ["thread_sub1ptr"],
+      accesses: [{
+        variableName: "PTR_GBL->sub1.sample_value1",
+        targetName: "SAMPLE_SUBSUB::sample_value1",
+        targetKind: "member",
+        functionName: "thread1_entry",
+        kind: "write",
+        location: { file: "C:/tmp/project/src/main.c", line: 21 },
+        evidence: "thread_sub1ptr(&PTR_GBL->sub1);",
+        reasons: ["call-argument-alias"],
+        accessExpression: "&PTR_GBL->sub1"
+      }],
+      unresolved: []
+    };
+    index.callGraph = { thread_sub1ptr: [], thread1_entry: ["thread_sub1ptr"] };
+    index.calledBy = { thread_sub1ptr: ["thread1_entry"], thread1_entry: [] };
+
+    await writeIndex(indexPath, index);
+
+    const hydrated = await readIndexForSymbol(indexPath, "ptr->sample_value1");
+    expect(Object.keys(hydrated?.functions ?? {}).sort()).toEqual(["thread1_entry", "thread_sub1ptr"]);
+    expect(buildImpact(hydrated!, "ptr->sample_value1").accesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ functionName: "thread1_entry", variableName: "PTR_GBL->sub1.sample_value1" })
+      ])
+    );
   });
 
   it("hydrates function symbols without reversing caller and callee traversal directions", async () => {

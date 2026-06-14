@@ -79,6 +79,7 @@ export interface MemberSymbol {
 export interface MacroDefinition {
   name: string;
   replacement: string;
+  parameters?: string[];
   file: string;
   line: number;
   declaration: string;
@@ -89,6 +90,8 @@ export interface MacroDefinition {
 export interface MacroAlias {
   name: string;
   replacement: string;
+  parameters?: string[];
+  isFunctionLike?: boolean;
   targetName: string;
   targetKind: "global" | "member" | "unknown";
   file: string;

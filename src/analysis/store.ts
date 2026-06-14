@@ -312,6 +312,9 @@ function buildAccessIndex(functions: Record<string, FunctionInfo>): Record<strin
       if (access.targetName) {
         addAccessIndexEntry(bySymbol, access.targetName, func.name);
       }
+      if (access.accessExpression) {
+        addAccessIndexEntry(bySymbol, normalizeAccessIndexSymbol(access.accessExpression), func.name);
+      }
       for (const macroName of access.macroNames ?? []) {
         addAccessIndexEntry(bySymbol, macroName, func.name);
       }
@@ -329,6 +332,10 @@ function addAccessIndexEntry(index: Map<string, Set<string>>, symbolName: string
     return;
   }
   (index.get(symbolName) ?? index.set(symbolName, new Set()).get(symbolName)!).add(functionName);
+}
+
+function normalizeAccessIndexSymbol(symbolName: string): string {
+  return symbolName.replace(/\s+/g, "").replace(/\[[^\]]+\]/g, "[]");
 }
 
 function functionNamesForSymbol(index: AnalysisIndex, symbolName: string, maxDepth: number): Set<string> {
@@ -467,11 +474,73 @@ export async function readIndexForSymbol(indexPath: string, symbolName: string, 
   }
   const functionNames = functionNamesForSymbol(index, symbolName, maxDepth);
   const stripDataFlow = isFunctionSymbol(index, symbolName);
+  const functionsPath = resolveStoredFunctionsPath(indexPath, index);
+  const functions = await readFunctionsByName(functionsPath, functionNames, { stripDataFlow });
+  if (!stripDataFlow) {
+    const extraNames = functionNamesForInferredTypeMembers(index, symbolName, functions);
+    for (const name of extraNames) {
+      functionNames.add(name);
+    }
+    Object.assign(functions, await readFunctionsByName(functionsPath, functionNames, { stripDataFlow }));
+  }
   return {
     ...index,
-    functions: await readFunctionsByName(resolveStoredFunctionsPath(indexPath, index), functionNames, { stripDataFlow }),
+    functions,
     files: unresolvedFilesFromStoredIndex(index)
   };
+}
+
+function functionNamesForInferredTypeMembers(index: AnalysisIndex, symbolName: string, functions: Record<string, FunctionInfo>): Set<string> {
+  const names = new Set<string>();
+  const normalizedSelection = normalizeAccessIndexSymbol(symbolName);
+  const memberPath = memberPathFromLookup(normalizedSelection);
+  if (!memberPath) {
+    return names;
+  }
+  const typeMemberNames = new Set<string>();
+  for (const func of Object.values(functions)) {
+    for (const access of func.accesses) {
+      if (
+        access.variableName.includes("::") &&
+        memberPathFromLookup(access.variableName) === memberPath &&
+        normalizeAccessIndexSymbol(access.accessExpression ?? access.evidence).includes(normalizedSelection)
+      ) {
+        typeMemberNames.add(access.variableName);
+      }
+    }
+    for (const item of func.unresolved) {
+      if (
+        item.kind === "unknown-member-access" &&
+        item.variableName?.includes("::") &&
+        memberPathFromLookup(item.variableName) === memberPath &&
+        normalizeAccessIndexSymbol(item.evidence).includes(normalizedSelection)
+      ) {
+        typeMemberNames.add(item.variableName);
+      }
+    }
+  }
+  for (const typeMemberName of typeMemberNames) {
+    for (const name of index.accessIndex?.[typeMemberName] ?? []) {
+      names.add(name);
+    }
+  }
+  return names;
+}
+
+function memberPathFromLookup(symbolName: string): string | undefined {
+  const typeIndex = symbolName.indexOf("::");
+  if (typeIndex >= 0) {
+    return symbolName.slice(typeIndex + 2);
+  }
+  const arrowIndex = symbolName.indexOf("->");
+  const dotIndex = symbolName.indexOf(".");
+  const separatorIndex = arrowIndex >= 0 && dotIndex >= 0
+    ? Math.min(arrowIndex, dotIndex)
+    : Math.max(arrowIndex, dotIndex);
+  if (separatorIndex < 0) {
+    return undefined;
+  }
+  return symbolName.slice(separatorIndex + (symbolName.startsWith("->", separatorIndex) ? 2 : 1));
 }
 
 async function writeChunk(stream: nodeFs.WriteStream, chunk: string): Promise<void> {

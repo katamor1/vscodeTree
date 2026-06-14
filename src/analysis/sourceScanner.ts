@@ -111,25 +111,35 @@ function resolveMacroAlias(
   globalNames: Set<string>,
   memberContext: MemberAnalysisContext
 ): MacroAlias | undefined {
-  if (definition.isFunctionLike || !definition.replacement || isHeaderGuardMacro(definition)) {
+  if (!definition.replacement || isHeaderGuardMacro(definition)) {
     return undefined;
   }
   const replacement = definition.replacement.trim();
-  if (!isSimpleMacroReplacement(replacement)) {
+  const targetName = definition.isFunctionLike
+    ? normalizeFunctionLikeMacroTarget(replacement, definition.parameters ?? [])
+    : isSimpleMacroReplacement(replacement)
+      ? replacement
+      : undefined;
+  if (!targetName) {
     return undefined;
   }
-  const targetKind = globalNames.has(replacement)
+  const targetKind = globalNames.has(targetName)
     ? "global"
-    : memberContext.memberSymbols.has(replacement)
+    : memberContext.memberSymbols.has(targetName)
       ? "member"
       : "unknown";
-  if (targetKind === "unknown" && /\d/.test(replacement[0] ?? "")) {
+  if (definition.isFunctionLike && targetKind === "unknown") {
+    return undefined;
+  }
+  if (targetKind === "unknown" && /\d/.test(targetName[0] ?? "")) {
     return undefined;
   }
   return {
     name: definition.name,
     replacement,
-    targetName: replacement,
+    parameters: definition.parameters?.length ? definition.parameters : undefined,
+    isFunctionLike: definition.isFunctionLike || undefined,
+    targetName,
     targetKind,
     file: definition.file,
     line: definition.line,
@@ -143,6 +153,25 @@ function isHeaderGuardMacro(definition: MacroDefinition): boolean {
 
 function isSimpleMacroReplacement(value: string): boolean {
   return /^[A-Za-z_]\w*(?:(?:\.|->|::)[A-Za-z_]\w*)*$/.test(value);
+}
+
+function normalizeFunctionLikeMacroTarget(replacement: string, parameters: string[]): string | undefined {
+  const memberMatch = replacement.match(/\b[A-Za-z_]\w*(?:\s*\[[^\]]+\])?\s*(?:\.|->|::)\s*[A-Za-z_]\w*(?:\s*\[[^\]]+\])?(?:(?:\s*(?:\.|->|::)\s*)[A-Za-z_]\w*(?:\s*\[[^\]]+\])?)*/);
+  if (memberMatch) {
+    return normalizeMacroTargetText(memberMatch[0]);
+  }
+  const parameterNames = new Set(parameters);
+  for (const match of replacement.matchAll(/\b[A-Za-z_]\w*\b/g)) {
+    const name = match[0];
+    if (!parameterNames.has(name)) {
+      return name;
+    }
+  }
+  return undefined;
+}
+
+function normalizeMacroTargetText(value: string): string {
+  return value.replace(/\s+/g, "").replace(/\[[^\]]+\]/g, "[]");
 }
 
 function buildMemberSymbolsForGlobal(
